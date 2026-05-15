@@ -64,5 +64,12 @@ namespace runtime {
   enum CUDA_RUNTIME_API_SECTIONS {
     DEVICE = 1,
     MEMORY = 10,
+    STREAM = 20,
+    EVENT = 30,
+    EXECUTION = 40,
+    ERROR_HANDLING = 50,
+    VERSION = 60,
+    OCCUPANCY = 70,
+    DEVICE_MGMT = 80,
   };
 }

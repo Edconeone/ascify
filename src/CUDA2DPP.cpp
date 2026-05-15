@@ -24,9 +24,13 @@ THE SOFTWARE.
 
 // Maps CUDA header names to DPP header names
 const std::map <llvm::StringRef, dppCounter> CUDA_INCLUDE_MAP {
-  // CUDA includes
-  {"cuda.h",                                                {"acl/acl.h",                                                                                                    CONV_INCLUDE_CUDA_MAIN_H,    API_DRIVER, 0}},
-  {"cuda_runtime.h",                                        {"acl/acl.h",                                                                                                 CONV_INCLUDE_CUDA_MAIN_H,    API_RUNTIME, 0}},
+  // CUDA includes -> Ascend ACL headers
+  {"cuda.h",                                                {"acl/acl_runtime.h",                                                                                          CONV_INCLUDE_CUDA_MAIN_H,    API_DRIVER, 0}},
+  {"cuda_runtime.h",                                        {"acl/acl_runtime.h",                                                                                          CONV_INCLUDE_CUDA_MAIN_H,    API_RUNTIME, 0}},
+  {"cub/cub.cuh",                                          {"acl_cub/aclcub.hpp",                                                                                         CONV_INCLUDE,                API_CUB, 0}},
+  {"cuda_bf16.h",                                          {"acl/acl_bf16.h",                                                                                            CONV_INCLUDE,                API_RUNTIME, 0}},
+  // Keep math_constants.h as-is (device math header, no ACL equivalent)
+  // Keep assert.h as-is (standard C header)
 };
 
 const std::map<llvm::StringRef, dppCounter> &CUDA_RENAMES_MAP() {
@@ -34,7 +38,11 @@ const std::map<llvm::StringRef, dppCounter> &CUDA_RENAMES_MAP() {
   if (!ret.empty())
     return ret;
   // First run, so compute the union map.
-  // TODO: We will keep on adding to this union map
   ret.insert(CUDA_RUNTIME_FUNCTION_MAP.begin(), CUDA_RUNTIME_FUNCTION_MAP.end());
+  ret.insert(CUDA_RUNTIME_TYPE_NAME_MAP.begin(), CUDA_RUNTIME_TYPE_NAME_MAP.end());
+  ret.insert(CUDA_DEVICE_TYPE_NAME_MAP.begin(), CUDA_DEVICE_TYPE_NAME_MAP.end());
+  ret.insert(CUDA_DEVICE_FUNCTION_MAP.begin(), CUDA_DEVICE_FUNCTION_MAP.end());
+  ret.insert(CUDA_DRIVER_TYPE_NAME_MAP.begin(), CUDA_DRIVER_TYPE_NAME_MAP.end());
+  ret.insert(CUDA_DRIVER_FUNCTION_MAP.begin(), CUDA_DRIVER_FUNCTION_MAP.end());
   return ret;
 };

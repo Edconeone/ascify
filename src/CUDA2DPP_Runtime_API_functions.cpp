@@ -27,10 +27,38 @@ using SEC = runtime::CUDA_RUNTIME_API_SECTIONS;
 // Map of all CUDA Runtime API functions
 const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   std::map<llvm::StringRef,  dppCounter> m;
+  // Memory management
   m["cudaMalloc"]                                              = {"aclrtMalloc",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaFree"]                                              = {"aclrtFree",                                               CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMemcpy"]                                              = {"aclrtMemcpy",                                              CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["free"] = {"aclrtFreeHost", CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  // TODO: Add cuda runtime API functions here  
+  m["cudaFree"]                                                = {"aclrtFree",                                              CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemcpy"]                                              = {"aclrtMemcpy",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemcpyAsync"]                                         = {"aclrtMemcpyAsync",                                       CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemset"]                                              = {"aclrtMemset",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemsetAsync"]                                         = {"aclrtMemsetAsync",                                       CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMallocHost"]                                         = {"aclrtMallocHost",                                        CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaFreeHost"]                                            = {"aclrtFreeHost",                                          CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["free"]                                                    = {"aclrtFreeHost",                                          CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  // Device management
+  m["cudaGetDevice"]                                           = {"aclrtGetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaSetDevice"]                                           = {"aclrtSetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaGetDeviceCount"]                                      = {"aclrtGetDeviceCount",                                    CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceGetAttribute"]                                  = {"aclDeviceGetAttribute",                                  CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceSynchronize"]                                   = {"aclrtSynchronizeDevice",                                 CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceReset"]                                         = {"aclrtResetDevice",                                       CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // Stream management
+  m["cudaStreamCreate"]                                        = {"aclrtCreateStream",                                      CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamDestroy"]                                       = {"aclrtDestroyStream",                                     CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamSynchronize"]                                   = {"aclrtSynchronizeStream",                                 CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  // Event management
+  m["cudaEventCreate"]                                         = {"aclrtCreateEvent",                                       CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventDestroy"]                                        = {"aclrtDestroyEvent",                                      CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventRecord"]                                         = {"aclrtRecordEvent",                                       CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventSynchronize"]                                    = {"aclrtSynchronizeEvent",                                  CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventElapsedTime"]                                    = {"aclrtEventElapsedTime",                                  CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  // Error handling
+  m["cudaGetLastError"]                                        = {"aclrtGetLastError",                                      CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  m["cudaPeekAtLastError"]                                     = {"aclrtPeekAtLastError",                                   CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  m["cudaGetErrorString"]                                      = {"aclGetRecentErrMsg",                                     CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  // Occupancy (kept as-is, needs manual review on Ascend)
+  m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"cudaOccupancyMaxActiveBlocksPerMultiprocessor",          CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY | UNSUPPORTED};
   return m;
 }();
