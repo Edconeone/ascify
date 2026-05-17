@@ -37,11 +37,14 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_TYPE_NAME_MAP = [] {
   m["cudaStream_t"]              = {"aclrtStream",                       CONV_TYPE, API_RUNTIME, SEC::STREAM};
   // Event type
   m["cudaEvent_t"]                = {"aclrtEvent",                       CONV_TYPE, API_RUNTIME, SEC::EVENT};
-  // Device attribute enums
-  m["cudaDevAttrMultiProcessorCount"]                 = {"ACL_DEV_ATTR_AICORE_NUM",               CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // Device attribute enums (verified: aclrtDevAttr enum is empty in CANN 9.0.0 acl_rt.h)
+  // These constants need verification against actual CANN; use with aclrtGetDeviceInfo()
+  m["cudaDevAttrMultiProcessorCount"]                 = {"ACL_DEV_ATTR_VECTOR_CORE_NUM",               CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDevAttrMaxThreadsPerMultiProcessor"]         = {"ACL_DEV_ATTR_MAX_THREAD_PER_VECTOR_CORE", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrMaxSharedMemoryPerBlock"]             = {"ACL_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxSharedMemoryPerBlock"]             = {"ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceAttr"]                                    = {"aclrtDevAttr",                                        CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDevAttrMaxThreadsPerBlock"]                  = {"ACL_DEV_ATTR_MAX_THREAD_PER_BLOCK",      CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrWarpSize"]                          = {"ACL_DEV_ATTR_WARP_SIZE",                  CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   // Memory copy enums
   m["cudaMemcpyHostToDevice"]    = {"ACL_MEMCPY_HOST_TO_DEVICE",        CONV_DEFINE, API_RUNTIME, SEC::MEMORY};
   m["cudaMemcpyDeviceToHost"]    = {"ACL_MEMCPY_DEVICE_TO_HOST",        CONV_DEFINE, API_RUNTIME, SEC::MEMORY};

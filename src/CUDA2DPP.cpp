@@ -25,12 +25,14 @@ THE SOFTWARE.
 // Maps CUDA header names to DPP header names
 const std::map <llvm::StringRef, dppCounter> CUDA_INCLUDE_MAP {
   // CUDA includes -> Ascend ACL headers
-  {"cuda.h",                                                {"acl/acl_runtime.h",                                                                                          CONV_INCLUDE_CUDA_MAIN_H,    API_DRIVER, 0}},
-  {"cuda_runtime.h",                                        {"acl/acl_runtime.h",                                                                                          CONV_INCLUDE_CUDA_MAIN_H,    API_RUNTIME, 0}},
+  // Verified against CANN 9.0.0: acl_runtime.h does not exist; use acl/acl.h
+  {"cuda.h",                                                {"acl/acl.h",                                                                                                  CONV_INCLUDE_CUDA_MAIN_H,    API_DRIVER, 0}},
+  {"cuda_runtime.h",                                        {"acl/acl.h",                                                                                                  CONV_INCLUDE_CUDA_MAIN_H,    API_RUNTIME, 0}},
+  // acl_cub/aclcub.hpp not yet available in CANN 9.0.0; cub::BlockReduce needs software re-implementation
   {"cub/cub.cuh",                                          {"acl_cub/aclcub.hpp",                                                                                         CONV_INCLUDE,                API_CUB, 0}},
-  {"cuda_bf16.h",                                          {"acl/acl_bf16.h",                                                                                            CONV_INCLUDE,                API_RUNTIME, 0}},
-  // Keep math_constants.h as-is (device math header, no ACL equivalent)
-  // Keep assert.h as-is (standard C header)
+  // acl/acl_bf16.h does not exist in CANN 9.0.0; use simt_api/asc_bf16.h for bfloat16_t support
+  {"cuda_bf16.h",                                          {"simt_api/asc_bf16.h",                                                                                        CONV_INCLUDE,                API_RUNTIME, 0}},
+  {"math_constants.h",                                    {"simt_api/math_constants.h",                                                              CONV_INCLUDE,                API_RUNTIME, 0}},
 };
 
 const std::map<llvm::StringRef, dppCounter> &CUDA_RENAMES_MAP() {
