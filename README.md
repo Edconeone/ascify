@@ -6,11 +6,11 @@ The upstream Clang driver is still used for parsing and CUDA sema; ascify-specif
 
 ## Requirements
 
-- **CMake** 3.16.8 or newer  
-- **LLVM and Clang** installed or built from source, with CMake config files available (the directory you pass as `CMAKE_PREFIX_PATH` is usually the LLVM **build** tree, e.g. `llvm-project/build`)  
-- A **C++ toolchain** that can compile for the machine where you configure ascify (often the same Clang you built LLVM with, or the system compiler)  
-- **Ninja** (recommended) or another CMake generator  
-- For translating real CUDA inputs: a **CUDA toolkit** layout on disk (see `--cuda-path`) and Clang’s **resource directory** (see `--clang-resource-directory`) so CUDA headers and builtins resolve correctly  
+- **CMake** 3.16.8 or newer
+- **LLVM and Clang** installed or built from source, with CMake config files available (the directory you pass as `CMAKE_PREFIX_PATH` is usually the LLVM **build** tree, e.g. `llvm-project/build`)
+- A **C++ toolchain** that can compile for the machine where you configure ascify (often the same Clang you built LLVM with, or the system compiler)
+- **Ninja** (recommended) or another CMake generator
+- For translating real CUDA inputs: a **CUDA toolkit** layout on disk (see `--cuda-path`) and Clang’s **resource directory** (see `--clang-resource-directory`) so CUDA headers and builtins resolve correctly
 
 LLVM must be built with the backends and default triple you need (for example **X86** plus a non-empty **`LLVM_DEFAULT_TARGET_TRIPLE`** if you compile on x86_64 Linux). A Clang that only ships AArch64/NVPTX cannot drive native host compiles for CMake’s compiler tests.
 
@@ -60,7 +60,7 @@ ascify-clang [ascify-options] -- [clang-options] <inputs>
 
 Minimal ingredients for CUDA sources:
 
-- **`--cuda-path=<dir>`** — root of the CUDA installation (headers, `nvvm`, etc.).  
+- **`--cuda-path=<dir>`** — root of the CUDA installation (headers, `nvvm`, etc.).
 - **`--clang-resource-directory=<dir>`** — parent of Clang’s `include/` tree (contains `__clang_cuda_runtime_wrapper.h` and related runtime pieces). This is usually `…/lib/clang/<major>` inside your LLVM build or install.
 
 Example (adjust paths and Clang major version):
@@ -92,7 +92,7 @@ Full list: run **`ascify-clang --help`**.
 
 ## Examples
 
-- **`examples/vector_add.cu`** — CUDA runtime sample (`cuda_runtime.h`).  
+- **`examples/vector_add.cu`** — CUDA runtime sample (`cuda_runtime.h`).
 - **`examples/vector_add.cu.dpp`** — same logic after ascify-style rewrites toward ACL/DPP-style APIs (`acl/acl.h`, `aclrt*`).
 
 Use these to sanity-check your CUDA path, resource dir, and GPU arch flags.
@@ -101,6 +101,7 @@ Use these to sanity-check your CUDA path, resource dir, and GPU arch flags.
 
 | Path | Role |
 |------|------|
+| `acl_cub/` | The ACL version of the cub library includes the reduction of Warps within the Block |
 | `src/` | Frontend action, CUDA→DPP maps, CLI, statistics |
 | `examples/` | Sample CUDA and translated-style sources |
 | `build.sh` | Reference CMake configure for out-of-tree build |
