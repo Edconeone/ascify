@@ -1,0 +1,663 @@
+// Ascend950PR SIMT ceiling probes.
+//
+// This is deliberately one host+device translation unit for ccec's DPP mode.
+// stdout is machine-readable CSV; configuration and failures go to stderr.
+#include <acl/acl.h>
+#include "simt_api/device_types.h"
+#include "simt_api/device_warp_functions.h"
+#include "simt_api/math_functions.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+
+#define PROBE_WARP_SIZE 32
+#define PROBE_MAX_THREADS_PER_BLOCK 1024
+
+static_assert(sizeof(uint16_t) == 2, "2-byte copy type must stay scalar");
+static_assert(sizeof(uint32_t) == 4, "4-byte copy type must stay scalar");
+static_assert(sizeof(uint64_t) == 8, "8-byte copy type must stay scalar");
+static_assert(sizeof(int4) == 16, "int4 must provide a 16-byte DPP access");
+
+static void AclCheck(aclError error, const char* expression, const char* file, int line) {
+  if (error == ACL_SUCCESS) {
+    return;
+  }
+  std::fprintf(stderr, "ACL error %d at %s:%d: %s\n", static_cast<int>(error), file, line,
+               expression);
+  std::exit(1);
+}
+
+#define ACL_CHECK(expression) AclCheck((expression), #expression, __FILE__, __LINE__)
+
+// A single, observable GM read-modify-write keeps the SIMT launch from becoming
+// an empty compiler artifact. Only block 0 / lane 0 touches the word.
+__global__ void ProbeLaunchFloor(volatile uint32_t* sink) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    sink[0] = sink[0] + 1U;
+  }
+}
+
+#define DEFINE_COPY_KERNEL(kernel_name, value_type)                                      \
+  __global__ void kernel_name(const value_type* source, value_type* destination,          \
+                              uint64_t elements) {                                        \
+    uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;        \
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;                \
+    for (; index < elements; index += stride) {                                           \
+      destination[index] = source[index];                                                 \
+    }                                                                                     \
+  }
+
+DEFINE_COPY_KERNEL(ProbeCopy2, uint16_t)
+DEFINE_COPY_KERNEL(ProbeCopy4, uint32_t)
+DEFINE_COPY_KERNEL(ProbeCopy8, uint64_t)
+DEFINE_COPY_KERNEL(ProbeCopy16, int4)
+
+#undef DEFINE_COPY_KERNEL
+
+__global__ void ProbeWarpReduceHardware(float* output, int inner_iterations) {
+  const int lane = threadIdx.x & (PROBE_WARP_SIZE - 1);
+  const uint64_t global_thread =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint64_t global_warp = global_thread / PROBE_WARP_SIZE;
+  float accumulator = 0.0f;
+  for (int iteration = 0; iteration < inner_iterations; ++iteration) {
+    const float value = static_cast<float>(lane + 1) * 0.03125f
+                        + static_cast<float>(iteration & 7) * 0.001f;
+    const float reduced = asc_reduce_add(value);
+    if (lane == 0) {
+      accumulator += reduced;
+    }
+  }
+  if (lane == 0) {
+    output[global_warp] = accumulator;
+  }
+}
+
+__global__ void ProbeWarpReduceShuffle(float* output, int inner_iterations) {
+  const int lane = threadIdx.x & (PROBE_WARP_SIZE - 1);
+  const uint64_t global_thread =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint64_t global_warp = global_thread / PROBE_WARP_SIZE;
+  float accumulator = 0.0f;
+  for (int iteration = 0; iteration < inner_iterations; ++iteration) {
+    float reduced = static_cast<float>(lane + 1) * 0.03125f
+                    + static_cast<float>(iteration & 7) * 0.001f;
+#pragma unroll
+    for (int offset = PROBE_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      reduced += asc_shfl_xor(reduced, offset);
+    }
+    if (lane == 0) {
+      accumulator += reduced;
+    }
+  }
+  if (lane == 0) {
+    output[global_warp] = accumulator;
+  }
+}
+
+__global__ void ProbeExpf(float* output, int inner_iterations) {
+  const uint64_t global_thread =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  float accumulator = 0.0f;
+  for (int iteration = 0; iteration < inner_iterations; ++iteration) {
+    const uint32_t phase =
+        (static_cast<uint32_t>(global_thread) + static_cast<uint32_t>(iteration)) & 63U;
+    const float value = -static_cast<float>(phase) * 0.03125f;
+    accumulator += expf(value);
+  }
+  output[global_thread] = accumulator;
+}
+
+__global__ void ProbeRsqrtf(float* output, int inner_iterations) {
+  const uint64_t global_thread =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  float accumulator = 0.0f;
+  for (int iteration = 0; iteration < inner_iterations; ++iteration) {
+    const uint32_t phase =
+        (static_cast<uint32_t>(global_thread) + static_cast<uint32_t>(iteration)) & 63U;
+    const float value = 1.0f + static_cast<float>(phase) * 0.0625f;
+    accumulator += rsqrtf(value);
+  }
+  output[global_thread] = accumulator;
+}
+
+struct Config {
+  int device = 0;
+  uint64_t bytes = 256ULL * 1024ULL * 1024ULL;
+  int warmup = 3;
+  int timed_launches = 10;
+  int samples = 5;
+  int launch_floor_iterations = 1000;
+  int inner_iterations = 256;
+  int threads = 1024;
+  int blocks_per_aiv = 32;
+};
+
+static const char* FindArg(int argc, char** argv, const char* option) {
+  for (int index = 1; index + 1 < argc; ++index) {
+    if (std::strcmp(argv[index], option) == 0) {
+      return argv[index + 1];
+    }
+  }
+  return nullptr;
+}
+
+static bool HasFlag(int argc, char** argv, const char* option) {
+  for (int index = 1; index < argc; ++index) {
+    if (std::strcmp(argv[index], option) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsValueOption(const char* option) {
+  return std::strcmp(option, "--device") == 0 || std::strcmp(option, "--bytes-mib") == 0
+         || std::strcmp(option, "--warmup") == 0
+         || std::strcmp(option, "--iterations") == 0
+         || std::strcmp(option, "--samples") == 0
+         || std::strcmp(option, "--launch-iterations") == 0
+         || std::strcmp(option, "--inner-iterations") == 0
+         || std::strcmp(option, "--threads") == 0
+         || std::strcmp(option, "--blocks-per-aiv") == 0;
+}
+
+static void ValidateOptions(int argc, char** argv) {
+  for (int index = 1; index < argc; ++index) {
+    if (std::strcmp(argv[index], "--quick") == 0
+        || std::strcmp(argv[index], "--help") == 0) {
+      continue;
+    }
+    if (!IsValueOption(argv[index]) || index + 1 >= argc) {
+      std::fprintf(stderr, "unknown option or missing value: %s\n", argv[index]);
+      std::exit(2);
+    }
+    ++index;
+  }
+}
+
+static uint64_t ParseUnsigned(const char* text, const char* option) {
+  if (text == nullptr || text[0] == '\0' || text[0] == '-') {
+    std::fprintf(stderr, "%s requires a non-negative integer\n", option);
+    std::exit(2);
+  }
+  char* end = nullptr;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  if (end == text || *end != '\0') {
+    std::fprintf(stderr, "invalid integer for %s: %s\n", option, text);
+    std::exit(2);
+  }
+  return static_cast<uint64_t>(value);
+}
+
+static void OverrideInt(int argc, char** argv, const char* option, int* value) {
+  const char* text = FindArg(argc, argv, option);
+  if (text == nullptr) {
+    return;
+  }
+  const uint64_t parsed = ParseUnsigned(text, option);
+  if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    std::fprintf(stderr, "value for %s is too large\n", option);
+    std::exit(2);
+  }
+  *value = static_cast<int>(parsed);
+}
+
+static Config ParseConfig(int argc, char** argv) {
+  ValidateOptions(argc, argv);
+  Config config;
+  if (HasFlag(argc, argv, "--quick")) {
+    config.bytes = 32ULL * 1024ULL * 1024ULL;
+    config.warmup = 1;
+    config.timed_launches = 3;
+    config.samples = 3;
+    config.launch_floor_iterations = 100;
+    config.inner_iterations = 32;
+    config.threads = 256;
+    config.blocks_per_aiv = 4;
+  }
+
+  OverrideInt(argc, argv, "--device", &config.device);
+  OverrideInt(argc, argv, "--warmup", &config.warmup);
+  OverrideInt(argc, argv, "--iterations", &config.timed_launches);
+  OverrideInt(argc, argv, "--samples", &config.samples);
+  OverrideInt(argc, argv, "--launch-iterations", &config.launch_floor_iterations);
+  OverrideInt(argc, argv, "--inner-iterations", &config.inner_iterations);
+  OverrideInt(argc, argv, "--threads", &config.threads);
+  OverrideInt(argc, argv, "--blocks-per-aiv", &config.blocks_per_aiv);
+
+  const char* bytes_mib_text = FindArg(argc, argv, "--bytes-mib");
+  if (bytes_mib_text != nullptr) {
+    const uint64_t mib = ParseUnsigned(bytes_mib_text, "--bytes-mib");
+    if (mib > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL)) {
+      std::fprintf(stderr, "--bytes-mib is too large\n");
+      std::exit(2);
+    }
+    config.bytes = mib * 1024ULL * 1024ULL;
+  }
+
+  if (config.bytes < 16 || config.warmup < 0 || config.timed_launches <= 0
+      || config.samples <= 0 || config.launch_floor_iterations <= 0
+      || config.inner_iterations <= 0 || config.threads <= 0
+      || config.blocks_per_aiv <= 0) {
+    std::fprintf(stderr, "probe sizes and iteration counts must be positive\n");
+    std::exit(2);
+  }
+  config.bytes -= config.bytes % 16ULL;
+  return config;
+}
+
+static void PrintHelp(const char* program) {
+  std::printf(
+      "usage: %s [--quick] [options]\n"
+      "  --device N              logical ACL device (default 0)\n"
+      "  --bytes-mib N           bytes copied per launch (default 256 MiB)\n"
+      "  --warmup N              warmup launches per case (default 3)\n"
+      "  --iterations N          timed launches in each sample (default 10)\n"
+      "  --samples N             timing samples; median is reported (default 5)\n"
+      "  --launch-iterations N   launches in each launch-floor sample (default 1000)\n"
+      "  --inner-iterations N    reductions/math calls per lane (default 256)\n"
+      "  --threads N             width/reduce/math block size (default 1024)\n"
+      "  --blocks-per-aiv N      grid multiplier for throughput cases (default 32)\n",
+      program);
+}
+
+class DeviceBuffer {
+ public:
+  DeviceBuffer() = default;
+  ~DeviceBuffer() {
+    if (pointer_ != nullptr) {
+      aclrtFree(pointer_);
+    }
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  void Allocate(size_t bytes) {
+    ACL_CHECK(aclrtMalloc(&pointer_, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    bytes_ = bytes;
+  }
+
+  void* Get() {
+    return pointer_;
+  }
+
+  const void* Get() const {
+    return pointer_;
+  }
+
+  size_t Size() const {
+    return bytes_;
+  }
+
+ private:
+  void* pointer_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+struct Timing {
+  double median_ms = 0.0;
+  double minimum_ms = 0.0;
+};
+
+template<typename Launch>
+static Timing MeasureBatch(Launch launch, aclrtStream stream, int warmup, int timed_launches,
+                           int samples) {
+  for (int iteration = 0; iteration < warmup; ++iteration) {
+    launch();
+  }
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+
+  aclrtEvent start = nullptr;
+  aclrtEvent stop = nullptr;
+  ACL_CHECK(aclrtCreateEventExWithFlag(&start, ACL_EVENT_TIME_LINE));
+  ACL_CHECK(aclrtCreateEventExWithFlag(&stop, ACL_EVENT_TIME_LINE));
+  std::vector<float> milliseconds(static_cast<size_t>(samples));
+  for (int sample = 0; sample < samples; ++sample) {
+    ACL_CHECK(aclrtRecordEvent(start, stream));
+    for (int iteration = 0; iteration < timed_launches; ++iteration) {
+      launch();
+    }
+    ACL_CHECK(aclrtRecordEvent(stop, stream));
+    ACL_CHECK(aclrtSynchronizeEvent(stop));
+    ACL_CHECK(aclrtEventElapsedTime(&milliseconds[static_cast<size_t>(sample)], start, stop));
+  }
+  ACL_CHECK(aclrtDestroyEvent(start));
+  ACL_CHECK(aclrtDestroyEvent(stop));
+  std::sort(milliseconds.begin(), milliseconds.end());
+  Timing result;
+  result.minimum_ms = milliseconds.front();
+  result.median_ms = milliseconds[milliseconds.size() / 2];
+  return result;
+}
+
+static int64_t QueryDeviceAttribute(uint32_t device, aclrtDevAttr attribute,
+                                    const char* name, int64_t fallback) {
+  int64_t value = 0;
+  const aclError error = aclrtGetDeviceInfo(device, attribute, &value);
+  if (error != ACL_SUCCESS || value <= 0) {
+    std::fprintf(stderr, "warning: cannot query %s (ACL %d); using %lld\n", name,
+                 static_cast<int>(error), static_cast<long long>(fallback));
+    return fallback;
+  }
+  return value;
+}
+
+static void PrintCsvHeader() {
+  std::printf(
+      "schema_version,probe,variant,access_bytes,threads,blocks,elements,"
+      "inner_iterations,timed_launches,elapsed_ms_median,elapsed_ms_min,"
+      "ns_per_launch,traffic_bytes,gbps,operations,gops,checksum,status\n");
+}
+
+static void PrintResult(const char* probe, const char* variant, int access_bytes, int threads,
+                        int blocks, uint64_t elements, int inner_iterations,
+                        int timed_launches, const Timing& timing, uint64_t traffic_bytes,
+                        uint64_t operations, double checksum, const char* status) {
+  const double ns_per_launch =
+      timed_launches > 0 ? timing.median_ms * 1.0e6 / timed_launches : 0.0;
+  const double gbps =
+      timing.median_ms > 0.0 ? static_cast<double>(traffic_bytes) / timing.median_ms / 1.0e6
+                             : 0.0;
+  const double gops =
+      timing.median_ms > 0.0 ? static_cast<double>(operations) / timing.median_ms / 1.0e6
+                             : 0.0;
+  std::printf(
+      "1,%s,%s,%d,%d,%d,%llu,%d,%d,%.9f,%.9f,%.3f,%llu,%.6f,%llu,%.6f,"
+      "%.12g,%s\n",
+      probe, variant, access_bytes, threads, blocks,
+      static_cast<unsigned long long>(elements), inner_iterations, timed_launches,
+      timing.median_ms, timing.minimum_ms, ns_per_launch,
+      static_cast<unsigned long long>(traffic_bytes), gbps,
+      static_cast<unsigned long long>(operations), gops, checksum, status);
+  std::fflush(stdout);
+}
+
+static void LaunchCopy(int access_bytes, const void* source, void* destination,
+                       uint64_t elements, int blocks, int threads, aclrtStream stream) {
+  switch (access_bytes) {
+    case 2:
+      ProbeCopy2<<<blocks, threads, 0, stream>>>(
+          static_cast<const uint16_t*>(source), static_cast<uint16_t*>(destination), elements);
+      break;
+    case 4:
+      ProbeCopy4<<<blocks, threads, 0, stream>>>(
+          static_cast<const uint32_t*>(source), static_cast<uint32_t*>(destination), elements);
+      break;
+    case 8:
+      ProbeCopy8<<<blocks, threads, 0, stream>>>(
+          static_cast<const uint64_t*>(source), static_cast<uint64_t*>(destination), elements);
+      break;
+    case 16:
+      ProbeCopy16<<<blocks, threads, 0, stream>>>(
+          static_cast<const int4*>(source), static_cast<int4*>(destination), elements);
+      break;
+    default:
+      std::fprintf(stderr, "unsupported copy access width: %d\n", access_bytes);
+      std::exit(2);
+  }
+}
+
+static uint64_t CopySampleChecksum(const DeviceBuffer& destination) {
+  unsigned char sample[32] = {};
+  ACL_CHECK(aclrtMemcpy(sample, 16, destination.Get(), 16, ACL_MEMCPY_DEVICE_TO_HOST));
+  const unsigned char* tail =
+      static_cast<const unsigned char*>(destination.Get()) + destination.Size() - 16;
+  ACL_CHECK(aclrtMemcpy(sample + 16, 16, tail, 16, ACL_MEMCPY_DEVICE_TO_HOST));
+  uint64_t checksum = 0;
+  for (unsigned char byte : sample) {
+    checksum += byte;
+  }
+  return checksum;
+}
+
+static void RunCopyCase(const char* probe, const char* variant, int access_bytes,
+                        int launch_threads, int reported_threads, int blocks,
+                        const Config& config, aclrtStream stream,
+                        const DeviceBuffer& source, DeviceBuffer* destination) {
+  ACL_CHECK(aclrtMemset(destination->Get(), destination->Size(), 0, destination->Size()));
+  const uint64_t elements = config.bytes / static_cast<uint64_t>(access_bytes);
+  const auto launch = [&]() {
+    LaunchCopy(access_bytes, source.Get(), destination->Get(), elements, blocks,
+               launch_threads, stream);
+  };
+  const Timing timing =
+      MeasureBatch(launch, stream, config.warmup, config.timed_launches, config.samples);
+  const uint64_t checksum = CopySampleChecksum(*destination);
+  const uint64_t expected_checksum = 32ULL * 0x3cULL;
+  const uint64_t traffic_bytes =
+      2ULL * config.bytes * static_cast<uint64_t>(config.timed_launches);
+  PrintResult(probe, variant, access_bytes, reported_threads, blocks, elements, 0,
+              config.timed_launches, timing, traffic_bytes, 0, static_cast<double>(checksum),
+              checksum == expected_checksum ? "ok" : "checksum_mismatch");
+}
+
+static double SumDeviceFloats(const DeviceBuffer& buffer, size_t elements) {
+  std::vector<float> host(elements);
+  ACL_CHECK(aclrtMemcpy(host.data(), elements * sizeof(float), buffer.Get(),
+                        elements * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+  double checksum = 0.0;
+  for (float value : host) {
+    checksum += static_cast<double>(value);
+  }
+  return checksum;
+}
+
+static void RunLaunchFloor(const Config& config, int aiv_cores, aclrtStream stream) {
+  DeviceBuffer sink;
+  sink.Allocate(sizeof(uint32_t));
+  const int blocks[] = {1, aiv_cores};
+  const char* variants[] = {"one_block", "all_aiv"};
+  for (int case_index = 0; case_index < 2; ++case_index) {
+    ACL_CHECK(aclrtMemset(sink.Get(), sink.Size(), 0, sink.Size()));
+    const auto launch = [&]() {
+      ProbeLaunchFloor<<<blocks[case_index], PROBE_WARP_SIZE, 0, stream>>>(
+          static_cast<volatile uint32_t*>(sink.Get()));
+    };
+    const Timing timing =
+        MeasureBatch(launch, stream, config.warmup, config.launch_floor_iterations,
+                     config.samples);
+    uint32_t checksum = 0;
+    ACL_CHECK(aclrtMemcpy(&checksum, sizeof(checksum), sink.Get(), sizeof(checksum),
+                          ACL_MEMCPY_DEVICE_TO_HOST));
+    const uint64_t expected =
+        static_cast<uint64_t>(config.warmup)
+        + static_cast<uint64_t>(config.samples) * config.launch_floor_iterations;
+    PrintResult("launch_floor", variants[case_index], 0, PROBE_WARP_SIZE,
+                blocks[case_index], 1, 0, config.launch_floor_iterations, timing, 0, 0,
+                static_cast<double>(checksum),
+                checksum == expected ? "ok" : "checksum_mismatch");
+  }
+}
+
+static void RunWarpReduce(const Config& config, int blocks, aclrtStream stream) {
+  const uint64_t active_threads =
+      static_cast<uint64_t>(blocks) * static_cast<uint64_t>(config.threads);
+  const uint64_t warps = active_threads / PROBE_WARP_SIZE;
+  DeviceBuffer output;
+  output.Allocate(static_cast<size_t>(warps) * sizeof(float));
+
+  ACL_CHECK(aclrtMemset(output.Get(), output.Size(), 0, output.Size()));
+  const auto launch_hardware = [&]() {
+    ProbeWarpReduceHardware<<<blocks, config.threads, 0, stream>>>(
+        static_cast<float*>(output.Get()), config.inner_iterations);
+  };
+  const Timing hardware =
+      MeasureBatch(launch_hardware, stream, config.warmup, config.timed_launches,
+                   config.samples);
+  const double hardware_checksum = SumDeviceFloats(output, static_cast<size_t>(warps));
+
+  ACL_CHECK(aclrtMemset(output.Get(), output.Size(), 0, output.Size()));
+  const auto launch_shuffle = [&]() {
+    ProbeWarpReduceShuffle<<<blocks, config.threads, 0, stream>>>(
+        static_cast<float*>(output.Get()), config.inner_iterations);
+  };
+  const Timing shuffle =
+      MeasureBatch(launch_shuffle, stream, config.warmup, config.timed_launches,
+                   config.samples);
+  const double shuffle_checksum = SumDeviceFloats(output, static_cast<size_t>(warps));
+
+  const double difference = std::fabs(hardware_checksum - shuffle_checksum);
+  const double tolerance = std::max(1.0, std::fabs(shuffle_checksum)) * 2.0e-5;
+  const bool valid = std::isfinite(hardware_checksum) && std::isfinite(shuffle_checksum)
+                     && difference <= tolerance;
+  const uint64_t operations =
+      warps * static_cast<uint64_t>(config.inner_iterations)
+      * static_cast<uint64_t>(config.timed_launches);
+  PrintResult("warp_reduce", "asc_reduce_add", 0, config.threads, blocks, active_threads,
+              config.inner_iterations, config.timed_launches, hardware, 0, operations,
+              hardware_checksum, valid ? "ok" : "checksum_mismatch");
+  PrintResult("warp_reduce", "shuffle_xor_5stage", 0, config.threads, blocks,
+              active_threads, config.inner_iterations, config.timed_launches, shuffle, 0,
+              operations, shuffle_checksum, valid ? "ok" : "checksum_mismatch");
+}
+
+static void RunMath(const Config& config, int blocks, aclrtStream stream) {
+  const uint64_t active_threads =
+      static_cast<uint64_t>(blocks) * static_cast<uint64_t>(config.threads);
+  DeviceBuffer output;
+  output.Allocate(static_cast<size_t>(active_threads) * sizeof(float));
+  const uint64_t operations =
+      active_threads * static_cast<uint64_t>(config.inner_iterations)
+      * static_cast<uint64_t>(config.timed_launches);
+
+  ACL_CHECK(aclrtMemset(output.Get(), output.Size(), 0, output.Size()));
+  const auto launch_expf = [&]() {
+    ProbeExpf<<<blocks, config.threads, 0, stream>>>(static_cast<float*>(output.Get()),
+                                                    config.inner_iterations);
+  };
+  const Timing expf_timing =
+      MeasureBatch(launch_expf, stream, config.warmup, config.timed_launches,
+                   config.samples);
+  const double expf_checksum = SumDeviceFloats(output, static_cast<size_t>(active_threads));
+  PrintResult("math", "expf", 0, config.threads, blocks, active_threads,
+              config.inner_iterations, config.timed_launches, expf_timing, 0, operations,
+              expf_checksum,
+              std::isfinite(expf_checksum) && expf_checksum > 0.0 ? "ok" : "nonfinite");
+
+  ACL_CHECK(aclrtMemset(output.Get(), output.Size(), 0, output.Size()));
+  const auto launch_rsqrtf = [&]() {
+    ProbeRsqrtf<<<blocks, config.threads, 0, stream>>>(static_cast<float*>(output.Get()),
+                                                      config.inner_iterations);
+  };
+  const Timing rsqrtf_timing =
+      MeasureBatch(launch_rsqrtf, stream, config.warmup, config.timed_launches,
+                   config.samples);
+  const double rsqrtf_checksum =
+      SumDeviceFloats(output, static_cast<size_t>(active_threads));
+  PrintResult("math", "rsqrtf", 0, config.threads, blocks, active_threads,
+              config.inner_iterations, config.timed_launches, rsqrtf_timing, 0, operations,
+              rsqrtf_checksum,
+              std::isfinite(rsqrtf_checksum) && rsqrtf_checksum > 0.0 ? "ok" : "nonfinite");
+}
+
+int main(int argc, char** argv) {
+  if (HasFlag(argc, argv, "--help")) {
+    PrintHelp(argv[0]);
+    return 0;
+  }
+  const Config config = ParseConfig(argc, argv);
+
+  ACL_CHECK(aclInit(nullptr));
+  ACL_CHECK(aclrtSetDevice(config.device));
+  aclrtContext context = nullptr;
+  aclrtStream stream = nullptr;
+  ACL_CHECK(aclrtCreateContext(&context, config.device));
+  ACL_CHECK(aclrtCreateStream(&stream));
+
+  const int64_t aiv_cores =
+      QueryDeviceAttribute(static_cast<uint32_t>(config.device),
+                           ACL_DEV_ATTR_VECTOR_CORE_NUM, "VECTOR_CORE_NUM", 56);
+  const int64_t warp_size =
+      QueryDeviceAttribute(static_cast<uint32_t>(config.device), ACL_DEV_ATTR_WARP_SIZE,
+                           "WARP_SIZE", PROBE_WARP_SIZE);
+  const int64_t max_resident_threads =
+      QueryDeviceAttribute(static_cast<uint32_t>(config.device),
+                           ACL_DEV_ATTR_MAX_THREAD_PER_VECTOR_CORE,
+                           "MAX_THREAD_PER_VECTOR_CORE", 2048);
+  if (warp_size != PROBE_WARP_SIZE) {
+    std::fprintf(stderr, "unsupported warp size: %lld (probe requires %d)\n",
+                 static_cast<long long>(warp_size), PROBE_WARP_SIZE);
+    return 2;
+  }
+  if (config.threads > PROBE_MAX_THREADS_PER_BLOCK
+      || config.threads % PROBE_WARP_SIZE != 0) {
+    std::fprintf(stderr, "--threads must be a multiple of %d and <= %d\n",
+                 PROBE_WARP_SIZE, PROBE_MAX_THREADS_PER_BLOCK);
+    return 2;
+  }
+  if (aiv_cores > std::numeric_limits<int>::max() / config.blocks_per_aiv) {
+    std::fprintf(stderr, "computed grid is too large\n");
+    return 2;
+  }
+  const int throughput_blocks = static_cast<int>(aiv_cores) * config.blocks_per_aiv;
+
+  std::fprintf(
+      stderr,
+      "device=%d aiv=%lld warp=%lld max_resident_threads_per_aiv=%lld "
+      "max_threads_per_block=%d bytes=%llu blocks=%d "
+      "threads=%d warmup=%d iterations=%d samples=%d inner=%d\n",
+      config.device, static_cast<long long>(aiv_cores), static_cast<long long>(warp_size),
+      static_cast<long long>(max_resident_threads), PROBE_MAX_THREADS_PER_BLOCK,
+      static_cast<unsigned long long>(config.bytes), throughput_blocks, config.threads,
+      config.warmup, config.timed_launches, config.samples, config.inner_iterations);
+  PrintCsvHeader();
+
+  RunLaunchFloor(config, static_cast<int>(aiv_cores), stream);
+  {
+    DeviceBuffer source;
+    DeviceBuffer destination;
+    source.Allocate(static_cast<size_t>(config.bytes));
+    destination.Allocate(static_cast<size_t>(config.bytes));
+    ACL_CHECK(aclrtMemset(source.Get(), source.Size(), 0x3c, source.Size()));
+
+    const int access_widths[] = {2, 4, 8, 16};
+    for (int access_width : access_widths) {
+      RunCopyCase("copy_bandwidth", "width_sweep", access_width, config.threads,
+                  config.threads, throughput_blocks, config, stream, source,
+                  &destination);
+    }
+
+    const int thread_counts[] = {32, 64, 128, 256, 512, 1024, 2048};
+    for (int threads : thread_counts) {
+      if (threads == 2048 && max_resident_threads >= 2048) {
+        if (throughput_blocks > std::numeric_limits<int>::max() / 2) {
+          std::fprintf(stderr, "2048-resident-thread grid is too large\n");
+          return 2;
+        }
+        RunCopyCase("thread_scaling", "copy_16b_2x1024", 16,
+                    PROBE_MAX_THREADS_PER_BLOCK, 2048, throughput_blocks * 2,
+                    config, stream, source, &destination);
+        continue;
+      }
+      if (threads > PROBE_MAX_THREADS_PER_BLOCK
+          || threads > max_resident_threads) {
+        Timing skipped;
+        PrintResult("thread_scaling", "copy_16b", 16, threads, throughput_blocks,
+                    config.bytes / 16ULL, 0, config.timed_launches, skipped, 0, 0, 0.0,
+                    "unsupported");
+        continue;
+      }
+      RunCopyCase("thread_scaling", "copy_16b", 16, threads, threads,
+                  throughput_blocks, config, stream, source, &destination);
+    }
+  }
+
+  RunWarpReduce(config, throughput_blocks, stream);
+  RunMath(config, throughput_blocks, stream);
+
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+  ACL_CHECK(aclrtDestroyStream(stream));
+  ACL_CHECK(aclrtDestroyContext(context));
+  ACL_CHECK(aclrtResetDevice(config.device));
+  ACL_CHECK(aclFinalize());
+  return 0;
+}

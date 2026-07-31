@@ -12,6 +12,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "LLVMCompat.h"
+#include "ArgParse.h"
 
 using namespace clang;
 using namespace clang::tooling;
@@ -56,14 +57,38 @@ namespace {
   bool resolveLocalIncludeInternal(const std::string &mainSourceAbsPath,
                                   const std::string &includeTok,
                                   std::string &outAbs) {
-    SmallString<256> base(mainSourceAbsPath);
-    sys::path::remove_filename(base);
-    SmallString<256> candidate(base);
-    sys::path::append(candidate, includeTok);
-    sys::path::remove_dots(candidate, true);
-    if (pathExists(std::string(candidate.str()))) {
+    auto tryCandidate = [&](const SmallString<256> &path) {
+      SmallString<256> candidate(path);
+      sys::path::append(candidate, includeTok);
+      sys::path::remove_dots(candidate, true);
+      if (!pathExists(std::string(candidate.str()))) return false;
       outAbs = normalizeSmallStringPath(candidate);
       return true;
+    };
+
+    // Match the compiler's quoted-include order first: the including file's
+    // directory, followed by explicit -I roots.
+    SmallString<256> base(mainSourceAbsPath);
+    sys::path::remove_filename(base);
+    if (tryCandidate(base)) return true;
+    for (const std::string &includeDir : IncludeDirs) {
+      SmallString<256> root(includeDir);
+      if (tryCandidate(root)) return true;
+    }
+
+    // Project-qualified includes such as
+    // "oneflow/core/cuda/layer_norm.cuh" are common in CUDA headers. When the
+    // command line did not expose the project -I root to the option parser,
+    // walk the including file's ancestors and use the nearest matching root.
+    // This remains deterministic and never searches outside the ancestor
+    // chain.
+    SmallString<256> ancestor(base);
+    while (!ancestor.empty()) {
+      SmallString<256> parent(ancestor);
+      sys::path::remove_filename(parent);
+      if (parent == ancestor) break;
+      ancestor = parent;
+      if (tryCandidate(ancestor)) return true;
     }
     return false;
   }

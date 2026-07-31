@@ -1,0 +1,276 @@
+#ifdef ASCIFY950_USE_TUNED_RMSNORM
+#include "kernels/rmsnorm_native_kernel.cce"
+#endif
+#include "oneflow/core/cuda/rms_norm.cuh"
+#include "ascify950/rmsnorm_affine_store.cuh"
+#include "common/runner_common.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <string>
+#include <vector>
+
+#ifndef ASCIFY950_MATH_MODE
+#define ASCIFY950_MATH_MODE "unspecified"
+#endif
+
+namespace ln = oneflow::cuda::layer_norm;
+namespace rn = oneflow::cuda::rms_norm;
+namespace b950 = ascify950;
+
+static aclError LaunchRmsNorm(aclrtStream stream, const half* input, half* output,
+                              const half* weight, float* inv_rms, int64_t rows, int64_t cols,
+                              double eps, bool affine) {
+#ifdef ASCIFY950_USE_TUNED_RMSNORM
+  return ascify950::native_rmsnorm::Launch(
+      stream, input, output, affine ? weight : nullptr, inv_rms, rows, cols, eps);
+#else
+  ln::DirectLoad<half, float> load(input, cols);
+  if (affine) {
+    ascify950_recipe_fixture::RmsNormAffineStore<float, half, true> store(
+        output, weight, static_cast<int32_t>(cols));
+    return rn::LaunchRmsNorm<decltype(load), decltype(store), float>(
+        stream, load, store, rows, cols, eps, inv_rms);
+  }
+  ascify950_recipe_fixture::RmsNormAffineStore<float, half, false> store(
+      output, nullptr, static_cast<int32_t>(cols));
+  return rn::LaunchRmsNorm<decltype(load), decltype(store), float>(
+      stream, load, store, rows, cols, eps, inv_rms);
+#endif
+}
+
+static bool AddBytes(size_t value, size_t* total) {
+  if (value > std::numeric_limits<size_t>::max() - *total) { return false; }
+  *total += value;
+  return true;
+}
+
+int main(int argc, char** argv) {
+  const std::string shapes_path =
+      b950::GetArg(argc, argv, "--shapes", "shapes/correctness.csv");
+  const std::string output_path =
+      b950::GetArg(argc, argv, "--out", "perf_history.csv");
+  const std::string runtime_config_path =
+      b950::GetArg(argc, argv, "--runtime-config-out", "");
+  const std::string run_id = b950::GetArg(argc, argv, "--run-id", "manual");
+  const std::string requested_tier = b950::GetArg(argc, argv, "--tier", "smoke");
+  const int device_id = std::atoi(b950::GetArg(argc, argv, "--device", "0"));
+  const int warmup = std::atoi(b950::GetArg(argc, argv, "--warmup", "5"));
+  const int samples = std::atoi(b950::GetArg(argc, argv, "--samples", "20"));
+  const int inner_repeats = std::atoi(b950::GetArg(argc, argv, "--inner-repeats", "10"));
+  const int limit = std::atoi(b950::GetArg(argc, argv, "--limit", "0"));
+  const double max_memory_fraction =
+      std::strtod(b950::GetArg(argc, argv, "--max-frac", "0.80"), nullptr);
+  const uint64_t seed =
+      std::strtoull(b950::GetArg(argc, argv, "--seed", "0x9507a45"), nullptr, 0);
+
+  const std::vector<b950::Case> cases = b950::ReadCases(shapes_path);
+  b950::PerfCsvWriter csv(output_path);
+  b950::AclSession session;
+  const aclError init_error = session.Init(device_id);
+  if (init_error != ACL_SUCCESS) {
+    std::fprintf(stderr, "%s\n",
+                 b950::AclErrorReason("ACL session initialization", init_error).c_str());
+    return 1;
+  }
+#ifdef ASCIFY950_USE_TUNED_RMSNORM
+  const std::string runtime_variant = "native_plain+native_affine";
+  const std::string target_entry = "rmsnorm_fp16_explicit_grid0";
+#else
+  const std::string runtime_variant = "converted_plain+converted_affine";
+  const std::string target_entry = "try_rmsnorm_default_grid";
+#endif
+  std::string runtime_config_reason;
+  if (!b950::WriteRuntimeGridConfig(
+          runtime_config_path, run_id, "rms_norm", runtime_variant, target_entry,
+          "plain512-affine256-auto", device_id, &runtime_config_reason)) {
+    std::fprintf(stderr, "runtime grid config: %s\n", runtime_config_reason.c_str());
+    return 1;
+  }
+
+  int selected = 0;
+  int measured = 0;
+  int failed = 0;
+  int skipped = 0;
+  for (const b950::Case& test_case : cases) {
+    if (test_case.op != "rms_norm" || test_case.dtype != "fp16" || !test_case.run_bench
+        || !b950::TierEnabled(test_case.tier, requested_tier)) {
+      continue;
+    }
+    if (limit > 0 && selected >= limit) { break; }
+    ++selected;
+
+    b950::PerfRecord record;
+    record.run_id = run_id;
+    record.op = "rms_norm";
+    record.dtype = "fp16";
+    record.math_mode = ASCIFY950_MATH_MODE;
+#ifdef ASCIFY950_USE_TUNED_RMSNORM
+    record.variant = test_case.affine ? "native_affine" : "native_plain";
+#else
+    record.variant = test_case.affine ? "converted_affine" : "converted_plain";
+#endif
+    record.test_case = test_case;
+    record.device_id = device_id;
+    record.warmup = warmup;
+    record.samples = samples;
+    record.inner_repeats = inner_repeats;
+
+    size_t elements = 0;
+    size_t tensor_bytes = 0;
+    size_t weight_elements = 0;
+    size_t weight_bytes = 0;
+    size_t inv_elements = 0;
+    size_t inv_bytes = 0;
+    std::string size_reason;
+    bool size_ok =
+        b950::CheckedTensorSize(test_case.rows, test_case.cols, sizeof(half), &elements,
+                                &tensor_bytes, &size_reason);
+    if (size_ok) {
+      size_ok = b950::CheckedTensorSize(1, test_case.cols, sizeof(half), &weight_elements,
+                                        &weight_bytes, &size_reason);
+    }
+    if (size_ok) {
+      size_ok = b950::CheckedTensorSize(test_case.rows, 1, sizeof(float), &inv_elements,
+                                        &inv_bytes, &size_reason);
+    }
+    if (!size_ok || test_case.rows > std::numeric_limits<int>::max()
+        || test_case.cols > std::numeric_limits<int>::max()) {
+      record.status = "error";
+      record.reason = size_ok ? "rows or cols exceed the kernel int32 launch domain" : size_reason;
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    if (!(test_case.eps > 0.0)) {
+      record.status = "error";
+      record.reason = "eps must be positive";
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    size_t required_bytes = 0;
+    if (!AddBytes(tensor_bytes, &required_bytes)
+        || !AddBytes(tensor_bytes, &required_bytes)
+        || !AddBytes(inv_bytes, &required_bytes)
+        || (test_case.affine && !AddBytes(weight_bytes, &required_bytes))) {
+      record.status = "error";
+      record.reason = "RMSNorm allocation byte count overflows size_t";
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    aclError error = aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes);
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("aclrtGetMemInfo", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    if (free_bytes > 0
+        && static_cast<double>(required_bytes)
+               > static_cast<double>(free_bytes) * max_memory_fraction) {
+      record.status = "skip";
+      record.reason = "predicted OOM under --max-frac";
+      csv.Write(record);
+      ++skipped;
+      continue;
+    }
+
+    b950::DeviceBuffer device_input;
+    b950::DeviceBuffer device_output;
+    b950::DeviceBuffer device_inv_rms;
+    b950::DeviceBuffer device_weight;
+    error = device_input.Allocate(tensor_bytes);
+    if (error == ACL_SUCCESS) { error = device_output.Allocate(tensor_bytes); }
+    if (error == ACL_SUCCESS) { error = device_inv_rms.Allocate(inv_bytes); }
+    if (error == ACL_SUCCESS && test_case.affine) {
+      error = device_weight.Allocate(weight_bytes);
+    }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("aclrtMalloc", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    const b950::InputPatternCode pattern = b950::PatternCode(test_case.input_pattern);
+    const uint64_t case_seed = seed ^ static_cast<uint64_t>(test_case.idx + 1);
+    error = b950::FillDeviceHalf(device_input.As<half>(), elements, test_case.cols, pattern,
+                                 case_seed, session.Stream());
+    if (error == ACL_SUCCESS && test_case.affine) {
+      error = b950::FillDeviceHalf(device_weight.As<half>(), weight_elements, test_case.cols,
+                                   b950::kRandom, case_seed ^ 0x55aa55aaULL,
+                                   session.Stream());
+    }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemset(device_output.Get(), tensor_bytes, 0xa5, tensor_bytes);
+    }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemset(device_inv_rms.Get(), inv_bytes, 0xa5, inv_bytes);
+    }
+    if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(session.Stream()); }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("deterministic device initialization", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    auto launch = [&]() {
+      return LaunchRmsNorm(
+          session.Stream(), device_input.As<const half>(), device_output.As<half>(),
+          test_case.affine ? device_weight.As<const half>() : nullptr,
+          device_inv_rms.As<float>(), test_case.rows, test_case.cols, test_case.eps,
+          test_case.affine);
+    };
+    error = launch();
+    if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(session.Stream()); }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("validation launch", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    const b950::TimingResult timing =
+        b950::TimeKernel(launch, session.Stream(), warmup, samples, inner_repeats);
+    if (!timing.ok || timing.stats.median_ms <= 0.0) {
+      record.status = "error";
+      record.reason = timing.reason.empty() ? "non-positive median latency" : timing.reason;
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    size_t logical_bytes = tensor_bytes * 2 + inv_bytes;
+    if (test_case.affine) { logical_bytes += weight_bytes; }
+    record.latency = timing.stats;
+    record.logical_bytes = static_cast<uint64_t>(logical_bytes);
+    record.gbps = static_cast<double>(record.logical_bytes)
+                  / (record.latency.median_ms * 1.0e-3) / 1.0e9;
+    record.status = "pass";
+    csv.Write(record);
+    ++measured;
+    std::fprintf(stderr,
+                 "[pass] %s rows=%lld cols=%lld median=%.6f ms p90=%.6f ms %.2f GB/s\n",
+                 record.variant.c_str(), static_cast<long long>(test_case.rows),
+                 static_cast<long long>(test_case.cols), record.latency.median_ms,
+                 record.latency.p90_ms, record.gbps);
+  }
+
+  std::fprintf(stderr, "rms_norm benchmark: selected=%d measured=%d fail=%d skip=%d\n",
+               selected, measured, failed, skipped);
+  if (selected == 0 || measured == 0) { return 3; }
+  return failed == 0 ? 0 : 2;
+}

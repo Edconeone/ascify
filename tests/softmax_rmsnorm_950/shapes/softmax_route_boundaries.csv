@@ -1,0 +1,10 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+sm_rb001,2200,softmax,fp16,tune,0,1,1776,8192,route_boundary,random,block_smem,0,1e-5,just_below_warp_ready_rows
+sm_rb002,2201,softmax,fp16,tune,0,1,1808,8192,route_boundary,random,block_smem,0,1e-5,just_above_warp_ready_rows
+sm_rb003,2202,softmax,fp16,tune,0,1,1792,12288,route_boundary,random,block_smem,0,1e-5,exact_warp_ready_rows
+sm_rb004,2203,softmax,fp16,tune,0,1,1536,32768,route_boundary,random,block_uncached,0,1e-5,block_thread_crossover
+sm_rb005,2204,softmax,fp16,tune,0,1,1792,32768,route_boundary,random,block_uncached,0,1e-5,block_thread_crossover
+sm_rb006,2205,softmax,fp16,tune,0,1,2048,16384,route_boundary,random,block_smem,0,1e-5,two_packet_loops
+sm_rb007,2206,softmax,fp16,tune,0,1,2048,24576,route_boundary,random,block_smem,0,1e-5,three_packet_loops
+sm_rb008,2207,softmax,fp16,tune,0,1,1344,32768,route_boundary,random,block_uncached,0,1e-5,four_loop_block_thread_crossover
+sm_rb009,2208,softmax,fp16,tune,0,1,1792,24576,route_boundary,random,block_smem,0,1e-5,three_loop_block_thread_crossover

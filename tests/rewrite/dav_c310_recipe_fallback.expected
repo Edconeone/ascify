@@ -1,0 +1,18 @@
+# portable+precise, portable+fast and dav-c310-vec+precise all fall back.
++struct PackedInput {
++struct PackedOutput {
++struct SkipLoadLike {
++struct ShiftedInput {
++RouteProbability(
++RouteLogarithmic(
++RouteDoubleFallback(
++RouteScale(
+-#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+-ascify_target_direct_load_tag
+-ascify_target_direct_store_tag
+-ascify_target_storage_type
+-ascify_target_compute_type
+-ascify_target_data
+-ascify_target_row_stride
+-::ascify::target::dav_c310::TrySoftmax(
+-::ascify::target::dav_c310::TryRmsNorm(

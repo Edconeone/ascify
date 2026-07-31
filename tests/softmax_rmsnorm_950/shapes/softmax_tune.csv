@@ -1,0 +1,16 @@
+idx,rows,cols,scenario,predicted_path
+2000,262144,128,throughput,warp
+2001,196608,256,throughput,warp
+2002,131072,512,throughput,warp
+2003,98304,768,throughput,warp
+2004,65536,1024,throughput,block_smem
+2005,49152,1536,throughput,block_smem
+2006,32768,2048,throughput,block_smem
+2007,16384,4096,throughput,block_smem
+2008,8192,8192,throughput,block_smem
+2009,4096,12288,throughput,block_smem
+2010,2048,32768,throughput,block_uncached
+2011,196608,333,unaligned,warp
+2012,98304,769,unaligned,warp
+2013,65536,1031,unaligned,block_smem
+2014,8192,8193,unaligned,block_smem

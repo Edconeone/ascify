@@ -1,0 +1,10 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+sm_wc001,2300,softmax,fp16,tune,0,1,1120,8192,warp_block_crossover,random,block_smem,0,1e-5,twenty_warps_per_aiv
+sm_wc002,2301,softmax,fp16,tune,0,1,1344,8192,warp_block_crossover,random,block_smem,0,1e-5,twenty_four_warps_per_aiv
+sm_wc003,2302,softmax,fp16,tune,0,1,1536,8192,warp_block_crossover,random,block_smem,0,1e-5,mid_crossover
+sm_wc004,2303,softmax,fp16,tune,0,1,1120,12288,warp_block_crossover,random,block_smem,0,1e-5,twenty_warps_per_aiv
+sm_wc005,2304,softmax,fp16,tune,0,1,1344,12288,warp_block_crossover,random,block_smem,0,1e-5,twenty_four_warps_per_aiv
+sm_wc006,2305,softmax,fp16,tune,0,1,1536,12288,warp_block_crossover,random,block_smem,0,1e-5,mid_crossover
+sm_wc007,2306,softmax,fp16,tune,0,1,1120,16384,warp_block_crossover,random,block_smem,0,1e-5,twenty_warps_per_aiv
+sm_wc008,2307,softmax,fp16,tune,0,1,1344,16384,warp_block_crossover,random,block_smem,0,1e-5,twenty_four_warps_per_aiv
+sm_wc009,2308,softmax,fp16,tune,0,1,1536,16384,warp_block_crossover,random,block_smem,0,1e-5,mid_crossover

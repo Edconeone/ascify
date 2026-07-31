@@ -1,0 +1,10 @@
+# portable + precise: every loop remains on the compatibility shuffle path.
++#include <ascify/ascify_cuda_compat.hpp>
++__aicore__ float CanonicalFloatAdd(float value) {
++__aicore__ int CanonicalIntAdd(int value) {
++__aicore__ unsigned int CanonicalUintAdd(unsigned int value) {
++ascify::shfl_xor_sync(0xffffffffu, value, offset)
++ascify::shfl_xor_sync(UINT32_MAX, value, offset, 32)
+
+-ascify::warp_reduce_add(value)
+-__shfl_xor_sync(

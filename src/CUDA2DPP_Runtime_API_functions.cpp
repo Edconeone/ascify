@@ -41,11 +41,15 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   m["cudaGetDevice"]                                           = {"aclrtGetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaSetDevice"]                                           = {"aclrtSetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaGetDeviceCount"]                                      = {"aclrtGetDeviceCount",                                    CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
-  // Device attribute query (CANN 9.0.0 uses aclrtGetDeviceInfo, not aclDeviceGetAttribute)
-// cudaDeviceGetAttribute -> aclrtGetDeviceInfo (CANN 9.0.0: aclrtDevAttr + aclrtGetDeviceInfo)
-  m["cudaDeviceGetAttribute"]                                  = {"aclrtGetDeviceInfo",                                    CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // CANN uses a different argument order and writes int64_t. Keep CUDA's
+  // signature at the call site and adapt it in the compatibility shim.
+  m["cudaDeviceGetAttribute"]                                  = {"ascify::cudaDeviceGetAttribute",                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDeviceSynchronize"]                                   = {"aclrtSynchronizeDevice",                                 CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDeviceReset"]                                         = {"aclrtResetDevice",                                       CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // beta3 has no per-kernel attribute API. The compatibility layer exposes the
+  // subset needed by OneFlow's dynamic-UB selection code.
+  m["cudaFuncGetAttributes"]                                   = {"ascify::cudaFuncGetAttributes",                          CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaFuncSetAttribute"]                                    = {"ascify::cudaFuncSetAttribute",                           CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   // Stream management
   m["cudaStreamCreate"]                                        = {"aclrtCreateStream",                                      CONV_STREAM, API_RUNTIME, SEC::STREAM};
   m["cudaStreamDestroy"]                                       = {"aclrtDestroyStream",                                     CONV_STREAM, API_RUNTIME, SEC::STREAM};
@@ -58,11 +62,10 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   m["cudaEventElapsedTime"]                                    = {"aclrtEventElapsedTime",                                  CONV_EVENT, API_RUNTIME, SEC::EVENT};
   // Error handling
   m["cudaGetLastError"]                                        = {"aclrtGetLastError",                                      CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
-  m["cudaPeekAtLastError"]                                     = {"aclrtPeekAtLastError",                                   CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  m["cudaPeekAtLastError"]                                     = {"ascify::cudaPeekAtLastError",                            CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
   m["cudaGetErrorString"]                                      = {"aclGetRecentErrMsg",                                     CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
-  // Occupancy API: no Ascend equivalent (verified CANN 9.0.0). Manual rewrite needed:
-  // Replace with: int sm_count; aclrtGetDeviceCount(&sm_count);
-  //               *num_blocks = max(1, min(max_blocks, sm_count * tpm / block_size * waves));
-  m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"", CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY | UNSUPPORTED};
+  // There is no direct CANN counterpart. The shim preserves the CUDA template
+  // signature and estimates per-vector-core occupancy from thread and UB limits.
+  m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"ascify::cudaOccupancyMaxActiveBlocksPerMultiprocessor", CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY, FULL};
   return m;
 }();

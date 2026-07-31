@@ -27,7 +27,7 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_TYPE_NAME_MAP = [] {
   std::map<llvm::StringRef, dppCounter> m;
   // Bfloat16 type (verified against CANN 9.0.0: Ascend uses bfloat16_t, not acl_bfloat16)
   m["nv_bfloat16"]    = {"bfloat16_t",       CONV_DEVICE_TYPE, API_RUNTIME, 0};
-  m["nv_bfloat16_2"]  = {"bfloat16_t",     CONV_DEVICE_TYPE, API_RUNTIME, 0};
+  m["nv_bfloat16_2"]  = {"bfloat16x2_t",     CONV_DEVICE_TYPE, API_RUNTIME, 0};
   return m;
 }();
 
@@ -43,33 +43,35 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["CUDART_MIN_NORMAL_F"] = {"__FLT_MIN__", CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
   m["CUDART_NEG_ZERO_F"] = {"(-0.0f)",    CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
   m["CUDART_ZERO_F"]     = {"(0.0f)",     CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
-  // Warp shuffle functions -> official Ascend SIMT API (CANN 9.0.0, simt_api/device_warp_functions.h)
-  // Signature change: __shfl_xxx_sync(mask, val, offset) -> asc_shfl_xxx(val, offset, width)
-  m["__shfl_down_sync"]  = {"asc_shfl_down",    CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__shfl_up_sync"]    = {"asc_shfl_up",      CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__shfl_xor_sync"]   = {"asc_shfl_xor",     CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__shfl_sync"]       = {"asc_shfl",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  // Preserve the CUDA shuffle signature. The compatibility shim validates that
+  // the mask is a full warp before calling the unmasked beta3 asc_shfl* API.
+  m["__shfl_down_sync"]  = {"ascify::shfl_down_sync", CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__shfl_up_sync"]    = {"ascify::shfl_up_sync",   CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__shfl_xor_sync"]   = {"ascify::shfl_xor_sync",  CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__shfl_sync"]       = {"ascify::shfl_sync",      CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Sync intrinsics -> official Ascend SIMT API (CANN 9.0.0, simt_api/device_sync_functions.h)
   // Note: asc_syncthreads currently only supported in SIMD+SIMT mixed mode (not pure SIMT)
   m["__syncthreads"]     = {"asc_syncthreads",     CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__syncthreads_and"] = {"asc_syncthreads_and", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__syncthreads_or"]  = {"asc_syncthreads_or",  CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__syncthreads_count"] = {"asc_syncthreads_count", CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  // beta3 has lockstep warp execution but no warp-only barrier API.
+  m["__syncwarp"]        = {"ascify::syncwarp",    CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Memory fence -> official Ascend SIMT API
   m["__threadfence_block"] = {"asc_threadfence_block", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__threadfence"]       = {"asc_threadfence",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // Fast math intrinsics (keep same on SIMT)
-  m["__expf"]            = {"__builtin_expf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__logf"]            = {"__builtin_logf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__log2f"]           = {"__builtin_log2f",           CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__log10f"]          = {"__builtin_log10f",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__fdividef"]        = {"__builtin_fdividef",        CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  // Use the beta3 SIMT math entry points rather than host/compiler builtins.
+  m["__expf"]            = {"expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__logf"]            = {"logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__log2f"]           = {"log2f",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__log10f"]          = {"log10f",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__fdividef"]        = {"ascify::fdividef",  CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fmul_rn"]         = {"__fmul_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fmaf_rn"]          = {"__fmaf_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fadd_rn"]          = {"__fadd_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fsub_rn"]          = {"__fsub_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__frsqrt_rn"]        = {"__frsqrt_rn",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__fsqrt_rn"]         = {"__fsqrt_rn",        CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__frsqrt_rn"]        = {"rsqrtf",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__fsqrt_rn"]         = {"sqrtf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__frcp_rn"]          = {"__frcp_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__float2half_rn"]    = {"__float2half_rn",    CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__half2float"]       = {"__half2float",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
@@ -81,12 +83,14 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["__double_as_longlong"] = {"__double_as_longlong", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Trap -> __trap (CCE directly supports __trap)
   m["__trap"]             = {"__builtin_trap",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // Math function type conversion: double-precision -> single-precision (A5 vector core does not support double)
-  m["exp"]                = {"__builtin_expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["log"]                = {"__builtin_logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["sqrt"]               = {"__builtin_sqrtf",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // Type conversion: double -> float (A5 vector core does not support double)
-  m["double"]             = {"float",             CONV_DEVICE_TYPE, API_RUNTIME, 0};
+  // The vector core has float math APIs. Do not rewrite the `double` token
+  // globally: host signatures and type traits must retain their source
+  // semantics. AscifyAction applies the narrower AST rule only to proven
+  // by-value scalar double parameters on CUDA global functions.
+  m["exp"]                = {"expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["log"]                = {"logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["sqrt"]               = {"sqrtf",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["rsqrt"]              = {"rsqrtf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // std::max/min -> Ascend SIMT equivalents
 //   m["std::max"]           = {"llmax",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
 //   m["std::min"]           = {"llmin",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
@@ -101,8 +105,10 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   // ---------- CUDA qualifier replacements (note: may need Clang-level Attr rewrite) ----------
   // __device__ / __forceinline__ have no Ascend C equivalent; kernel functions use __global__ only
   m["__device__"]         = {"__aicore__",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__forceinline__"]    = {"inline",           CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__forceinline__"]    = {"ASCIFY_FORCEINLINE", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // __shared__ -> __ubuf__ (Ascend C Unified Buffer qualifier, defined as empty macro in cpu_stub.hpp)
   m["__shared__"]         = {"__ubuf__",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  // Preserve CUDA declaration alignment instead of dropping the attribute.
+  m["__align__"]          = {"ASCIFY_ALIGN",     CONV_DEVICE_FUNC, API_RUNTIME, 0};
   return m;
 }();

@@ -1,0 +1,416 @@
+// Compile-only contract probe for the dav-c310 row-wise target adapters.
+//
+// This translation unit has no runtime assertions. Every accepted/rejected
+// adapter shape is checked at compile time against the same public header that
+// Ascify-generated code includes.
+
+#define SMN_WARP 17
+#define SMN_CACHE_MAX 31337
+#define SMN_BUF 99
+#define SMN_USE_ASC_REDUCE 41
+#define SMN_USE_HALF2_EXP 42
+#define SMN_HALF2_REFINE_COMPACT 43
+#define SMN_USE_BLOCK_PER_ROW 44
+#define SMN_FAST_EXP 45
+#define SMN_HALF2_REFINE 46
+#define SMN_STREAM_THREE_PASS 47
+#define SMN_FORCE_BLOCK_THREADS 512
+#define SMN_BLOCK_ROW_MAX 271
+#define SMN_FALLBACK_AIV_COUNT 73
+#define ASCIFY950_RMN_BLOCK_ROW_THREADS 512
+#define ASCIFY950_RMN_BLOCK_ROW_AFFINE_THREADS 256
+#define ASCIFY_ROWWISE_CALLER_SENTINEL 0x5a17
+#ifdef ASCIFY_ROWWISE_PROBE_PREDEFINED_ACLCUB_WARP_SIZE
+#define ACLCUB_WARP_SIZE 19
+#endif
+
+#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+
+#ifdef ASCIFY_ROWWISE_PROBE_PREDEFINED_ACLCUB_WARP_SIZE
+#ifndef ACLCUB_WARP_SIZE
+#error "rowwise recipe header cleared caller-owned ACLCUB_WARP_SIZE"
+#endif
+static_assert(ACLCUB_WARP_SIZE == 19,
+              "caller-owned ACLCUB_WARP_SIZE changed");
+#else
+#ifdef ACLCUB_WARP_SIZE
+#error "rowwise recipe header leaked ACLCUB_WARP_SIZE"
+#endif
+#endif
+
+#ifndef SMN_WARP
+#error "rowwise recipe header cleared caller-owned SMN_WARP"
+#endif
+#ifndef SMN_CACHE_MAX
+#error "rowwise recipe header cleared caller-owned SMN_CACHE_MAX"
+#endif
+#ifndef SMN_BUF
+#error "rowwise recipe header cleared caller-owned SMN_BUF"
+#endif
+#ifndef SMN_USE_ASC_REDUCE
+#error "rowwise recipe header cleared caller-owned SMN_USE_ASC_REDUCE"
+#endif
+#ifndef SMN_USE_HALF2_EXP
+#error "rowwise recipe header cleared caller-owned SMN_USE_HALF2_EXP"
+#endif
+#ifndef SMN_HALF2_REFINE_COMPACT
+#error "rowwise recipe header cleared caller-owned SMN_HALF2_REFINE_COMPACT"
+#endif
+#ifndef SMN_USE_BLOCK_PER_ROW
+#error "rowwise recipe header cleared caller-owned SMN_USE_BLOCK_PER_ROW"
+#endif
+#ifndef SMN_FAST_EXP
+#error "rowwise recipe header cleared caller-owned SMN_FAST_EXP"
+#endif
+#ifndef SMN_HALF2_REFINE
+#error "rowwise recipe header cleared caller-owned SMN_HALF2_REFINE"
+#endif
+#ifndef SMN_STREAM_THREE_PASS
+#error "rowwise recipe header cleared caller-owned SMN_STREAM_THREE_PASS"
+#endif
+#ifndef SMN_FORCE_BLOCK_THREADS
+#error "rowwise recipe header cleared caller-owned SMN_FORCE_BLOCK_THREADS"
+#endif
+#ifndef SMN_BLOCK_ROW_MAX
+#error "rowwise recipe header cleared caller-owned SMN_BLOCK_ROW_MAX"
+#endif
+#ifndef SMN_FALLBACK_AIV_COUNT
+#error "rowwise recipe header cleared caller-owned SMN_FALLBACK_AIV_COUNT"
+#endif
+#ifndef ASCIFY950_RMN_BLOCK_ROW_THREADS
+#error "rowwise recipe header cleared caller-owned RMS block-row setting"
+#endif
+#ifndef ASCIFY950_RMN_BLOCK_ROW_AFFINE_THREADS
+#error "rowwise recipe header cleared caller-owned affine block-row setting"
+#endif
+#ifndef ASCIFY_ROWWISE_CALLER_SENTINEL
+#error "rowwise recipe header cleared an unrelated caller macro"
+#endif
+
+static_assert(SMN_WARP == 17, "caller-owned SMN_WARP changed");
+static_assert(SMN_CACHE_MAX == 31337,
+              "caller-owned SMN_CACHE_MAX changed");
+static_assert(SMN_BUF == 99, "caller-owned SMN_BUF changed");
+static_assert(SMN_USE_ASC_REDUCE == 41,
+              "caller-owned softmax feature macro changed");
+static_assert(SMN_USE_HALF2_EXP == 42,
+              "caller-owned half2 feature macro changed");
+static_assert(SMN_HALF2_REFINE_COMPACT == 43,
+              "caller-owned refinement feature macro changed");
+static_assert(SMN_USE_BLOCK_PER_ROW == 44,
+              "caller-owned block-row feature macro changed");
+static_assert(SMN_FAST_EXP == 45,
+              "caller-owned fast-exp feature macro changed");
+static_assert(SMN_HALF2_REFINE == 46,
+              "caller-owned full refinement feature macro changed");
+static_assert(SMN_STREAM_THREE_PASS == 47,
+              "caller-owned streaming feature macro changed");
+static_assert(SMN_FORCE_BLOCK_THREADS == 512,
+              "caller-owned forced block size changed");
+static_assert(SMN_BLOCK_ROW_MAX == 271,
+              "caller-owned block-row limit changed");
+static_assert(SMN_FALLBACK_AIV_COUNT == 73,
+              "caller-owned fallback AIV count changed");
+static_assert(ASCIFY950_RMN_BLOCK_ROW_THREADS == 512,
+              "caller-owned RMS block-row setting changed");
+static_assert(ASCIFY950_RMN_BLOCK_ROW_AFFINE_THREADS == 256,
+              "caller-owned affine block-row setting changed");
+static_assert(ASCIFY_ROWWISE_CALLER_SENTINEL == 0x5a17,
+              "unrelated caller macro changed");
+
+namespace rowwise_recipe_traits_probe {
+
+namespace target = ::ascify::target::dav_c310;
+namespace adapter = ::ascify::target::dav_c310::v1::adapter_detail;
+namespace contract = ::ascify::target::dav_c310::v1::contract_detail;
+
+static_assert(
+    contract::SoftmaxColumnsFitTargetKernel(
+        std::numeric_limits<int>::max()),
+    "Softmax rejected the largest column count preserved by its target kernel");
+static_assert(
+    !contract::SoftmaxColumnsFitTargetKernel(0)
+        && !contract::SoftmaxColumnsFitTargetKernel(-1)
+        && !contract::SoftmaxColumnsFitTargetKernel(
+               static_cast<int64_t>(std::numeric_limits<int>::min()) - 1),
+    "Softmax accepted a non-positive int64 column count before narrowing");
+static_assert(
+    !contract::SoftmaxColumnsFitTargetKernel(
+        static_cast<int64_t>(std::numeric_limits<int>::max()) + 1),
+    "Softmax accepted a column count narrowed by its target kernel");
+static_assert(
+    contract::RmsNormDimensionsFitOriginalKernel(
+        std::numeric_limits<int>::max(), 1),
+    "RMSNorm rejected the largest row count preserved by the CUDA kernel");
+static_assert(
+    !contract::RmsNormDimensionsFitOriginalKernel(
+        static_cast<int64_t>(std::numeric_limits<int>::max()) + 1, 1),
+    "RMSNorm intercepted a row count narrowed by the CUDA kernel launch");
+
+struct DirectLoad {
+  using ascify_target_direct_load_tag = void;
+  using ascify_target_adapter_owner_type = DirectLoad;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+
+  const half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  const half* data;
+  int64_t stride;
+};
+
+struct DirectStore {
+  using ascify_target_direct_store_tag = void;
+  using ascify_target_adapter_owner_type = DirectStore;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+  static constexpr bool ascify_target_store_is_affine = false;
+
+  half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  half* data;
+  int64_t stride;
+};
+
+template<bool kAffine>
+struct BoolAffineStore {
+  using ascify_target_direct_store_tag = void;
+  using ascify_target_adapter_owner_type = BoolAffineStore<kAffine>;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+  static constexpr bool ascify_target_store_is_affine = kAffine;
+
+  half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+  const half* ascify_target_weight() const { return weight; }
+
+  half* data;
+  const half* weight;
+  int64_t stride;
+};
+
+// The owner marker is deliberately inherited unchanged. A derived record must
+// not acquire the base record's proven memory contract implicitly.
+struct DerivedLoad : DirectLoad {};
+struct DerivedStore : DirectStore {};
+
+struct VolatileLoad {
+  using ascify_target_direct_load_tag = void;
+  using ascify_target_adapter_owner_type = VolatileLoad;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+
+  const volatile half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  const volatile half* data;
+  int64_t stride;
+};
+
+struct VolatileStore {
+  using ascify_target_direct_store_tag = void;
+  using ascify_target_adapter_owner_type = VolatileStore;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+  static constexpr bool ascify_target_store_is_affine = false;
+
+  volatile half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  volatile half* data;
+  int64_t stride;
+};
+
+struct CustomCompute {};
+
+struct DoubleComputeMarker {
+  using ascify_target_compute_type = double;
+};
+
+template<typename>
+struct DependentFalse : std::false_type {};
+
+// These adapters satisfy the public marker/accessor types, but instantiating an
+// accessor body is a compile error. Unsupported dispatcher ComputeType tags
+// must discard the target path before LoadAccess/StoreAccess touches them.
+struct GuardedLoad {
+  using ascify_target_direct_load_tag = void;
+  using ascify_target_adapter_owner_type = GuardedLoad;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+
+  template<typename Trigger = void>
+  const half* ascify_target_data() const {
+    static_assert(
+        DependentFalse<Trigger>::value,
+        "compute mismatch instantiated the guarded load target path");
+    return nullptr;
+  }
+
+  template<typename Trigger = void>
+  int64_t ascify_target_row_stride() const {
+    static_assert(
+        DependentFalse<Trigger>::value,
+        "compute mismatch instantiated the guarded load target path");
+    return 0;
+  }
+};
+
+struct GuardedStore {
+  using ascify_target_direct_store_tag = void;
+  using ascify_target_adapter_owner_type = GuardedStore;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+  static constexpr bool ascify_target_store_is_affine = false;
+
+  template<typename Trigger = void>
+  half* ascify_target_data() const {
+    static_assert(
+        DependentFalse<Trigger>::value,
+        "compute mismatch instantiated the guarded store target path");
+    return nullptr;
+  }
+
+  template<typename Trigger = void>
+  int64_t ascify_target_row_stride() const {
+    static_assert(
+        DependentFalse<Trigger>::value,
+        "compute mismatch instantiated the guarded store target path");
+    return 0;
+  }
+};
+
+using PlainWithWeight = BoolAffineStore<false>;
+using AffineWithWeight = BoolAffineStore<true>;
+
+static_assert(adapter::HasMarkedLoadAccess<DirectLoad>::value,
+              "valid exact-owner direct load rejected");
+static_assert(adapter::LoadAccess<DirectLoad>::kValid,
+              "valid direct load did not select LoadAccess");
+static_assert(adapter::HasMarkedStoreAccess<DirectStore>::value,
+              "valid exact-owner direct store rejected");
+static_assert(adapter::StoreAccess<DirectStore>::kValid,
+              "valid direct store did not select StoreAccess");
+static_assert(!adapter::StoreAccess<DirectStore>::kAffine,
+              "plain direct store classified as affine");
+
+static_assert(adapter::HasMarkedStoreAccess<AffineWithWeight>::value,
+              "bool-affine store rejected");
+static_assert(
+    adapter::HasMarkedAffineStoreAccess<AffineWithWeight>::value,
+    "bool-affine store weight accessor rejected");
+static_assert(adapter::StoreAccess<AffineWithWeight>::kValid,
+              "bool-affine store did not select StoreAccess");
+static_assert(adapter::StoreAccess<AffineWithWeight>::kAffine,
+              "bool-affine=true was not preserved");
+
+static_assert(adapter::HasMarkedStoreAccess<PlainWithWeight>::value,
+              "bool-affine=false store rejected");
+static_assert(
+    adapter::HasMarkedAffineStoreAccess<PlainWithWeight>::value,
+    "plain store's present weight accessor should remain well-formed");
+static_assert(adapter::StoreAccess<PlainWithWeight>::kValid,
+              "bool-affine=false store did not select StoreAccess");
+static_assert(!adapter::StoreAccess<PlainWithWeight>::kAffine,
+              "weight accessor overrode explicit bool-affine=false");
+
+static_assert(!adapter::HasMarkedLoadAccess<DerivedLoad>::value,
+              "derived load inherited another owner's proof");
+static_assert(!adapter::LoadAccess<DerivedLoad>::kValid,
+              "derived load selected LoadAccess");
+static_assert(!adapter::HasMarkedStoreAccess<DerivedStore>::value,
+              "derived store inherited another owner's proof");
+static_assert(!adapter::StoreAccess<DerivedStore>::kValid,
+              "derived store selected StoreAccess");
+
+static_assert(!adapter::HasMarkedLoadAccess<VolatileLoad>::value,
+              "volatile input pointer lost its qualifier");
+static_assert(!adapter::LoadAccess<VolatileLoad>::kValid,
+              "volatile input selected LoadAccess");
+static_assert(!adapter::HasMarkedStoreAccess<VolatileStore>::value,
+              "volatile output pointer lost its qualifier");
+static_assert(!adapter::StoreAccess<VolatileStore>::kValid,
+              "volatile output selected StoreAccess");
+
+static_assert(
+    adapter::HasSupportedComputeContract<
+        float, DirectLoad, DirectStore>::value,
+    "exact float dispatcher/adapter compute contract rejected");
+static_assert(
+    !adapter::HasSupportedComputeContract<
+        double, DirectLoad, DirectStore>::value,
+    "double dispatcher compute bypassed the fp16/float contract");
+static_assert(
+    !adapter::HasSupportedComputeContract<
+        CustomCompute, DirectLoad, DirectStore>::value,
+    "custom dispatcher compute bypassed the fp16/float contract");
+static_assert(
+    !adapter::HasSupportedComputeContract<
+        float, DoubleComputeMarker, DirectStore>::value,
+    "dispatcher compute was not bound to the load marker alias");
+static_assert(
+    !adapter::HasSupportedComputeContract<
+        float, DirectLoad, DoubleComputeMarker>::value,
+    "dispatcher compute was not bound to the store marker alias");
+
+// Instantiate the public adapter entry points as well as the traits. This
+// catches a facade regression that static trait values alone would miss.
+static void InstantiatePublicFacade(
+    aclrtStream stream, const DirectLoad& load, const DirectStore& store,
+    const PlainWithWeight& plain_with_weight,
+    const AffineWithWeight& affine_with_weight,
+    const DerivedLoad& derived_load, const VolatileStore& volatile_store,
+    const GuardedLoad& guarded_load, const GuardedStore& guarded_store,
+    float* inverse_rms, double* double_inverse_rms, int64_t rows,
+    int64_t columns) {
+  (void)target::TrySoftmax(
+      stream, load, store, rows, columns,
+      static_cast<float*>(nullptr));
+  // Dispatcher ComputeType mismatches must remain well-formed and select the
+  // NotHandled branch instead of the float target recipe.
+  (void)target::TrySoftmax(
+      stream, load, store, rows, columns,
+      static_cast<double*>(nullptr));
+  (void)target::TrySoftmax(
+      stream, load, store, rows, columns,
+      static_cast<CustomCompute*>(nullptr));
+  (void)target::TrySoftmax(
+      stream, guarded_load, guarded_store, rows, columns,
+      static_cast<double*>(nullptr));
+  (void)target::TrySoftmax(
+      stream, guarded_load, guarded_store, rows, columns,
+      static_cast<CustomCompute*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, load, store, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<float*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, load, plain_with_weight, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<float*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, load, affine_with_weight, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<float*>(nullptr));
+  // Unsupported ComputeType must remain a well-formed NotHandled path so the
+  // converted double implementation can compile and run.
+  (void)target::TryRmsNorm(
+      stream, load, store, rows, columns, 1.0e-5, double_inverse_rms,
+      static_cast<float*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, load, store, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<double*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, load, store, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<CustomCompute*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, guarded_load, guarded_store, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<double*>(nullptr));
+  (void)target::TryRmsNorm(
+      stream, guarded_load, guarded_store, rows, columns, 1.0e-5, inverse_rms,
+      static_cast<CustomCompute*>(nullptr));
+  (void)target::TrySoftmax(
+      stream, derived_load, volatile_store, rows, columns,
+      static_cast<float*>(nullptr));
+}
+
+}  // namespace rowwise_recipe_traits_probe

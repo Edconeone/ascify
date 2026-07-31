@@ -170,6 +170,24 @@ cl::opt<bool> Experimental("experimental",
   cl::value_desc("experimental"),
   cl::cat(ToolTemplateCategory));
 
+cl::opt<bool> NoLowerDeviceDoubleParams("no-lower-device-double-params",
+  cl::desc("Keep by-value scalar double parameters on CUDA __global__ functions "
+           "(default: lower them to float for Ascend SIMT)"),
+  cl::init(false),
+  cl::cat(ToolTemplateCategory));
+
+cl::opt<std::string> TargetPolicy("target-policy",
+  cl::desc("SIMT target policy: portable (default) or dav-c310-vec"),
+  cl::value_desc("policy"),
+  cl::init("portable"),
+  cl::cat(ToolTemplateCategory));
+
+cl::opt<std::string> SimtMathMode("simt-math",
+  cl::desc("SIMT floating-point transformation mode: precise (default) or fast"),
+  cl::value_desc("mode"),
+  cl::init("precise"),
+  cl::cat(ToolTemplateCategory));
+
 cl::opt<bool> NoUndocumented("no-undocumented-features",
   cl::desc("Do not rely on undocumented features in code transformation"),
   cl::value_desc("no-undocumented-features"),
@@ -234,6 +252,7 @@ const std::vector<std::string> ascifyOptions {
   std::string(SaveTemps.ArgStr),
   std::string(DocFormat.ArgStr),
   std::string(Experimental.ArgStr),
+  std::string(NoLowerDeviceDoubleParams.ArgStr),
   std::string(Versions.ArgStr),
   std::string(NoUndocumented.ArgStr),
   std::string(NoWarningsUndocumented.ArgStr),
@@ -249,4 +268,6 @@ const std::vector<std::string> ascifyOptionsWithTwoArgs {
   std::string(OutputStatsFilename.ArgStr),
   std::string(TemporaryDir.ArgStr),
   std::string(ClangResourceDir.ArgStr),
+  std::string(TargetPolicy.ArgStr),
+  std::string(SimtMathMode.ArgStr),
 };

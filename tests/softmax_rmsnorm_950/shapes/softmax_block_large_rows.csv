@@ -1,0 +1,5 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+sm_bl001,2100,softmax,fp16,tune,0,1,4096,16384,block_large_rows,random,block_smem,0,1e-5,large_row_count
+sm_bl002,2101,softmax,fp16,tune,0,1,8192,16384,block_large_rows,random,block_smem,0,1e-5,large_row_count
+sm_bl003,2102,softmax,fp16,tune,0,1,4096,32768,block_large_rows,random,block_uncached,0,1e-5,large_row_count
+sm_bl004,2103,softmax,fp16,tune,0,1,8192,32768,block_large_rows,random,block_uncached,0,1e-5,large_row_count

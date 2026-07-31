@@ -1,0 +1,24 @@
+// Compatibility wrapper for the historical native softmax benchmark.
+// The production implementation is installed with Ascify's dav-c310 target
+// recipes so converted kernels and the benchmark exercise the same code.
+#ifndef SOFTMAX_NATIVE_KERNEL_CCE
+#define SOFTMAX_NATIVE_KERNEL_CCE
+
+#ifndef ASCIFY_DAV_C310_USE_CALLER_SOFTMAX_FEATURE_FLAGS
+#define ASCIFY_DAV_C310_USE_CALLER_SOFTMAX_FEATURE_FLAGS
+#define ASCIFY_DAV_C310_UNDEF_CALLER_SOFTMAX_FEATURE_FLAGS
+#endif
+#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+#ifdef ASCIFY_DAV_C310_UNDEF_CALLER_SOFTMAX_FEATURE_FLAGS
+#undef ASCIFY_DAV_C310_USE_CALLER_SOFTMAX_FEATURE_FLAGS
+#undef ASCIFY_DAV_C310_UNDEF_CALLER_SOFTMAX_FEATURE_FLAGS
+#endif
+
+static inline aclError softmax_native_dispatch(
+    aclrtStream stream, const half* input, half* output, int64_t rows,
+    int columns, int block_threads, int grid_cap) {
+  return ::ascify::target::dav_c310::SoftmaxFp16(
+      stream, input, output, rows, columns, block_threads, grid_cap);
+}
+
+#endif  // SOFTMAX_NATIVE_KERNEL_CCE

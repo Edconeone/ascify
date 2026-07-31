@@ -21,8 +21,15 @@ THE SOFTWARE.
 */
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include "AscifyAction.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/AST/TypeLoc.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TokenKinds.h"
@@ -30,6 +37,8 @@ THE SOFTWARE.
 #include "clang/Lex/Lexer.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 #include "clang/ASTMatchers/ASTMatchers.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/APSInt.h"
 #if LLVM_VERSION_MAJOR < 17
 #include "clang/Basic/TargetInfo.h"
 #endif
@@ -45,6 +54,9 @@ const std::string sDPP = "DPP";
 const std::string s_string_literal = "[string literal]";
 // Matchers' names
 const StringRef sCudaLaunchKernel = "cudaLaunchKernel";
+const StringRef sCudaGlobalScalarDoubleParam = "cudaGlobalScalarDoubleParam";
+const StringRef sCanonicalWarpAddReduction = "canonicalWarpAddReduction";
+const StringRef sCanonicalBinaryReducer = "canonicalBinaryReducer";
 
 void AscifyAction::RewriteString(StringRef s, clang::SourceLocation start) {
   auto &SM = getCompilerInstance().getSourceManager();
@@ -174,6 +186,59 @@ static bool isDeclSpecifierLike(const clang::Token &t) {
   }
 }
 
+static const clang::Token *previousSignificantToken(
+    const std::deque<clang::Token> &tokens) {
+  if (tokens.size() < 2)
+    return nullptr;
+  for (std::size_t i = tokens.size() - 1; i > 0;) {
+    --i;
+    if (tokens[i].getKind() != 0)
+      return &tokens[i];
+  }
+  return nullptr;
+}
+
+static bool isUnqualifiedFloatMathName(llvm::StringRef name) {
+  return name == "exp" || name == "log" || name == "sqrt" || name == "rsqrt";
+}
+
+static bool requiresCudaCompatHeader(llvm::StringRef name) {
+  return name == "cudaDeviceGetAttribute" ||
+         name == "cudaPeekAtLastError" ||
+         name == "cudaOccupancyMaxActiveBlocksPerMultiprocessor" ||
+         name == "__shfl_sync" ||
+         name == "__shfl_up_sync" ||
+         name == "__shfl_down_sync" ||
+         name == "__shfl_xor_sync" ||
+         name == "__syncthreads" ||
+         name == "__syncthreads_and" ||
+         name == "__syncthreads_or" ||
+         name == "__syncthreads_count" ||
+         name == "__syncwarp" ||
+         name == "__threadfence" ||
+         name == "__threadfence_block" ||
+         name == "__expf" ||
+         name == "__logf" ||
+         name == "__log2f" ||
+         name == "__log10f" ||
+         name == "__fdividef" ||
+         name == "__frsqrt_rn" ||
+         name == "__fsqrt_rn" ||
+         name == "exp" ||
+         name == "log" ||
+         name == "sqrt" ||
+         name == "rsqrt" ||
+         name == "__forceinline__" ||
+         name == "__align__" ||
+         name == "nv_bfloat16" ||
+         name == "nv_bfloat16_2" ||
+         name == "cudaFuncAttributes" ||
+         name == "cudaFuncAttribute" ||
+         name == "cudaFuncAttributeMaxDynamicSharedMemorySize" ||
+         name == "cudaFuncGetAttributes" ||
+         name == "cudaFuncSetAttribute";
+}
+
 int getNextNonZeroIdx(const std::deque<clang::Token> &rawTokenWindow, int &idx) {
   if (idx == 0) return 0;
   idx--;
@@ -224,6 +289,494 @@ static bool matchParenCastBeforeMalloc(const std::deque<clang::Token> &win, int 
 
 static unsigned ascifySourceOffset(const clang::SourceManager &SM, clang::SourceLocation loc) {
   return SM.getDecomposedLoc(SM.getFileLoc(loc)).second;
+}
+
+static const clang::Expr *stripParenAndImplicitCasts(const clang::Expr *expr) {
+  if (expr == nullptr)
+    return nullptr;
+  if (const auto *defaultArgument =
+          llvm::dyn_cast<clang::CXXDefaultArgExpr>(expr))
+    expr = defaultArgument->getExpr();
+  return expr->IgnoreParenImpCasts();
+}
+
+static const clang::VarDecl *referencedVariable(const clang::Expr *expr) {
+  expr = stripParenAndImplicitCasts(expr);
+  const auto *reference = llvm::dyn_cast_or_null<clang::DeclRefExpr>(expr);
+  return reference == nullptr
+             ? nullptr
+             : llvm::dyn_cast<clang::VarDecl>(reference->getDecl());
+}
+
+static bool evaluatesToNonNegative(const clang::Expr *expr,
+                                   uint64_t expected,
+                                   clang::ASTContext &context) {
+  if (expr == nullptr)
+    return false;
+  expr = stripParenAndImplicitCasts(expr);
+  clang::Expr::EvalResult result;
+  if (!expr->EvaluateAsInt(result, context) || !result.Val.isInt())
+    return false;
+  const llvm::APSInt &value = result.Val.getInt();
+  if ((value.isSigned() && value.isNegative()) ||
+      value.getBitWidth() > 64)
+    return false;
+  return value.getZExtValue() == expected;
+}
+
+static bool evaluatesToFullWarpMask(const clang::Expr *expr,
+                                    clang::ASTContext &context) {
+  if (expr == nullptr || !expr->getType()->isIntegerType() ||
+      context.getTypeSize(expr->getType()) != 32)
+    return false;
+
+  expr = stripParenAndImplicitCasts(expr);
+  clang::Expr::EvalResult result;
+  if (!expr->EvaluateAsInt(result, context) || !result.Val.isInt())
+    return false;
+  const llvm::APSInt &value = result.Val.getInt();
+  const llvm::APInt normalized = llvm::APInt(value).zextOrTrunc(32);
+  return normalized == llvm::APInt(32, UINT32_MAX);
+}
+
+static bool isSupportedWarpAddType(clang::QualType type,
+                                   clang::ASTContext &context) {
+  if (type.isNull() || type->isReferenceType() ||
+      type.isVolatileQualified())
+    return false;
+
+  type = type.getCanonicalType().getUnqualifiedType();
+  const auto *builtin = type->getAs<clang::BuiltinType>();
+  if (builtin == nullptr || context.getTypeSize(type) != 32)
+    return false;
+  return builtin->getKind() == clang::BuiltinType::Float ||
+         builtin->getKind() == clang::BuiltinType::Int ||
+         builtin->getKind() == clang::BuiltinType::UInt;
+}
+
+static const clang::Stmt *singleLoopUpdate(const clang::Stmt *body) {
+  const auto *compound = llvm::dyn_cast_or_null<clang::CompoundStmt>(body);
+  if (compound == nullptr)
+    return body;
+  if (compound->size() != 1)
+    return nullptr;
+  return *compound->body_begin();
+}
+
+static const clang::Stmt *directFunctionBodyStatement(
+    const clang::ForStmt *loop,
+    const clang::FunctionDecl *function) {
+  const auto *body =
+      llvm::dyn_cast_or_null<clang::CompoundStmt>(function->getBody());
+  if (body == nullptr)
+    return nullptr;
+  for (const clang::Stmt *statement : body->body()) {
+    const clang::Stmt *unwrapped = statement;
+    while (const auto *attributed =
+               llvm::dyn_cast<clang::AttributedStmt>(unwrapped))
+      unwrapped = attributed->getSubStmt();
+    if (unwrapped == loop)
+      return statement;
+  }
+  return nullptr;
+}
+
+static bool isOnlyUnrollPragmasAndWhitespace(llvm::StringRef source) {
+  bool sawUnrollPragma = false;
+  while (!source.empty()) {
+    const std::pair<llvm::StringRef, llvm::StringRef> line =
+        source.split('\n');
+    source = line.second;
+    const llvm::StringRef trimmed = line.first.trim();
+    if (trimmed.empty())
+      continue;
+    if (trimmed != "#pragma unroll")
+      return false;
+    sawUnrollPragma = true;
+  }
+  return sawUnrollPragma;
+}
+
+// When Clang wraps a loop in AttributedStmt for `#pragma unroll`, own the
+// complete physical pragma line as well as the loop.  Starting at column one
+// prevents leaving a dangling `#pragma` fragment if an LLVM version reports
+// the attribute location at a token after '#'.
+static clang::SourceLocation canonicalWarpReductionReplacementBegin(
+    const clang::Stmt *ownedStatement,
+    const clang::ForStmt *loop,
+    clang::SourceManager &sourceManager,
+    const clang::LangOptions &langOptions) {
+  const clang::SourceLocation loopBegin =
+      sourceManager.getFileLoc(loop->getBeginLoc());
+  if (ownedStatement == loop)
+    return loopBegin;
+
+  const clang::SourceLocation ownedBegin =
+      sourceManager.getFileLoc(ownedStatement->getBeginLoc());
+  if (ownedBegin.isInvalid() || loopBegin.isInvalid())
+    return clang::SourceLocation();
+  const std::pair<clang::FileID, unsigned> decomposedOwned =
+      sourceManager.getDecomposedLoc(ownedBegin);
+  const std::pair<clang::FileID, unsigned> decomposedLoop =
+      sourceManager.getDecomposedLoc(loopBegin);
+  if (decomposedOwned.first != decomposedLoop.first ||
+      decomposedOwned.second >= decomposedLoop.second)
+    return clang::SourceLocation();
+
+  const unsigned line = sourceManager.getSpellingLineNumber(ownedBegin);
+  const clang::SourceLocation lineBegin =
+      sourceManager.translateLineCol(decomposedOwned.first, line, 1);
+  if (lineBegin.isInvalid())
+    return clang::SourceLocation();
+  const llvm::StringRef prefix = clang::Lexer::getSourceText(
+      clang::CharSourceRange::getCharRange(lineBegin, loopBegin),
+      sourceManager, langOptions);
+  if (!isOnlyUnrollPragmasAndWhitespace(prefix))
+    return clang::SourceLocation();
+  return lineBegin;
+}
+
+static bool matchCanonicalWarpAddReduction(
+    const clang::ForStmt *loop,
+    clang::ASTContext &context,
+    clang::SourceManager &sourceManager,
+    const clang::VarDecl *&accumulator) {
+  accumulator = nullptr;
+  if (loop == nullptr || loop->getInit() == nullptr ||
+      loop->getCond() == nullptr || loop->getInc() == nullptr ||
+      loop->getBody() == nullptr)
+    return false;
+
+  const clang::SourceLocation begin = loop->getBeginLoc();
+  const clang::SourceLocation end = loop->getEndLoc();
+  if (begin.isInvalid() || end.isInvalid() || begin.isMacroID() ||
+      end.isMacroID() || !sourceManager.isWrittenInMainFile(begin) ||
+      !sourceManager.isWrittenInMainFile(end))
+    return false;
+
+  const auto *declaration =
+      llvm::dyn_cast<clang::DeclStmt>(loop->getInit());
+  if (declaration == nullptr || !declaration->isSingleDecl())
+    return false;
+  const auto *offset =
+      llvm::dyn_cast<clang::VarDecl>(declaration->getSingleDecl());
+  if (offset == nullptr || !offset->hasInit() ||
+      offset->getStorageDuration() != clang::SD_Automatic ||
+      !offset->getType()->isIntegerType() ||
+      offset->getType().isVolatileQualified() ||
+      context.getTypeSize(offset->getType()) != 32 ||
+      !evaluatesToNonNegative(offset->getInit(), 16, context))
+    return false;
+
+  const auto *condition = llvm::dyn_cast<clang::BinaryOperator>(
+      stripParenAndImplicitCasts(loop->getCond()));
+  if (condition == nullptr || condition->getOpcode() != clang::BO_GT ||
+      referencedVariable(condition->getLHS()) != offset ||
+      !evaluatesToNonNegative(condition->getRHS(), 0, context))
+    return false;
+
+  const auto *increment = llvm::dyn_cast<clang::CompoundAssignOperator>(
+      stripParenAndImplicitCasts(loop->getInc()));
+  if (increment == nullptr || referencedVariable(increment->getLHS()) != offset)
+    return false;
+  if (increment->getOpcode() == clang::BO_DivAssign) {
+    if (!evaluatesToNonNegative(increment->getRHS(), 2, context))
+      return false;
+  } else if (increment->getOpcode() == clang::BO_ShrAssign) {
+    if (!evaluatesToNonNegative(increment->getRHS(), 1, context))
+      return false;
+  } else {
+    return false;
+  }
+
+  const clang::Stmt *updateStatement = singleLoopUpdate(loop->getBody());
+  const auto *updateExpression =
+      llvm::dyn_cast_or_null<clang::Expr>(updateStatement);
+  if (updateExpression == nullptr)
+    return false;
+  updateExpression = stripParenAndImplicitCasts(updateExpression);
+
+  const clang::CallExpr *shuffle = nullptr;
+  if (const auto *compoundAdd =
+          llvm::dyn_cast<clang::CompoundAssignOperator>(updateExpression)) {
+    if (compoundAdd->getOpcode() != clang::BO_AddAssign)
+      return false;
+    accumulator = referencedVariable(compoundAdd->getLHS());
+    shuffle = llvm::dyn_cast_or_null<clang::CallExpr>(
+        stripParenAndImplicitCasts(compoundAdd->getRHS()));
+  } else if (const auto *assignment =
+                 llvm::dyn_cast<clang::BinaryOperator>(updateExpression)) {
+    if (assignment->getOpcode() != clang::BO_Assign)
+      return false;
+    accumulator = referencedVariable(assignment->getLHS());
+    const auto *addition = llvm::dyn_cast_or_null<clang::BinaryOperator>(
+        stripParenAndImplicitCasts(assignment->getRHS()));
+    if (addition == nullptr || addition->getOpcode() != clang::BO_Add)
+      return false;
+    const clang::Expr *shuffleExpression = nullptr;
+    if (referencedVariable(addition->getLHS()) == accumulator)
+      shuffleExpression = addition->getRHS();
+    else if (referencedVariable(addition->getRHS()) == accumulator)
+      shuffleExpression = addition->getLHS();
+    else
+      return false;
+    shuffle = llvm::dyn_cast_or_null<clang::CallExpr>(
+        stripParenAndImplicitCasts(shuffleExpression));
+  } else {
+    return false;
+  }
+
+  if (accumulator == nullptr || accumulator == offset || shuffle == nullptr ||
+      !isSupportedWarpAddType(accumulator->getType(), context))
+    return false;
+
+  const auto *function =
+      llvm::dyn_cast<clang::FunctionDecl>(accumulator->getDeclContext());
+  if (function == nullptr ||
+      (!function->hasAttr<clang::CUDADeviceAttr>() &&
+      !function->hasAttr<clang::CUDAGlobalAttr>()) ||
+      function->getTemplatedKind() != clang::FunctionDecl::TK_NonTemplate ||
+      function->getDeclContext()->isDependentContext())
+    return false;
+
+  const clang::Stmt *ownedStatement =
+      directFunctionBodyStatement(loop, function);
+  if (ownedStatement == nullptr)
+    return false;
+
+  // The transformation removes the entire for-init declaration.  Prove the
+  // accumulator is a different declaration that precedes, and therefore
+  // remains visible at, the replacement site.
+  const clang::SourceLocation accumulatorLoc =
+      sourceManager.getFileLoc(accumulator->getLocation());
+  const clang::SourceLocation ownedBegin =
+      sourceManager.getFileLoc(ownedStatement->getBeginLoc());
+  if (accumulator->getLocation().isInvalid() ||
+      accumulator->getLocation().isMacroID() ||
+      accumulatorLoc.isInvalid() || ownedBegin.isInvalid())
+    return false;
+  const std::pair<clang::FileID, unsigned> decomposedAccumulator =
+      sourceManager.getDecomposedLoc(accumulatorLoc);
+  const std::pair<clang::FileID, unsigned> decomposedOwned =
+      sourceManager.getDecomposedLoc(ownedBegin);
+  if (decomposedAccumulator.first != decomposedOwned.first ||
+      decomposedAccumulator.second >= decomposedOwned.second)
+    return false;
+
+  const clang::FunctionDecl *callee = shuffle->getDirectCallee();
+  if (callee == nullptr ||
+      callee->getQualifiedNameAsString() != "__shfl_xor_sync" ||
+      callee->getLocation().isInvalid() ||
+      !sourceManager.isInSystemHeader(callee->getLocation()) ||
+      shuffle->getNumArgs() < 3 || shuffle->getNumArgs() > 4 ||
+      !evaluatesToFullWarpMask(shuffle->getArg(0), context) ||
+      referencedVariable(shuffle->getArg(1)) != accumulator ||
+      referencedVariable(shuffle->getArg(2)) != offset)
+    return false;
+
+  const clang::Expr *width = nullptr;
+  if (shuffle->getNumArgs() == 4) {
+    width = shuffle->getArg(3);
+  } else {
+    if (callee->getNumParams() != 4 ||
+        !callee->getParamDecl(3)->hasDefaultArg())
+      return false;
+    width = callee->getParamDecl(3)->getDefaultArg();
+  }
+  if (!evaluatesToNonNegative(width, 32, context))
+    return false;
+  return true;
+}
+
+enum class CanonicalReducerKind {
+  None,
+  Sum,
+  Max,
+  Min,
+};
+
+static const clang::ParmVarDecl *referencedParameter(
+    const clang::Expr *expr) {
+  expr = stripParenAndImplicitCasts(expr);
+  const auto *reference =
+      llvm::dyn_cast_or_null<clang::DeclRefExpr>(expr);
+  return reference == nullptr
+             ? nullptr
+             : llvm::dyn_cast<clang::ParmVarDecl>(reference->getDecl());
+}
+
+static clang::QualType canonicalReducerValueType(clang::QualType type) {
+  if (type.isNull())
+    return type;
+  if (type->isReferenceType())
+    type = type.getNonReferenceType();
+  return type.getCanonicalType().getUnqualifiedType();
+}
+
+static bool referencesBothParameters(
+    const clang::Expr *lhs,
+    const clang::Expr *rhs,
+    const clang::ParmVarDecl *first,
+    const clang::ParmVarDecl *second) {
+  const clang::ParmVarDecl *lhsParameter = referencedParameter(lhs);
+  const clang::ParmVarDecl *rhsParameter = referencedParameter(rhs);
+  return (lhsParameter == first && rhsParameter == second) ||
+         (lhsParameter == second && rhsParameter == first);
+}
+
+static CanonicalReducerKind classifyCanonicalReducerReturn(
+    const clang::Expr *expression,
+    const clang::ParmVarDecl *first,
+    const clang::ParmVarDecl *second) {
+  expression = stripParenAndImplicitCasts(expression);
+  if (const auto *addition =
+          llvm::dyn_cast_or_null<clang::BinaryOperator>(expression)) {
+    if (addition->getOpcode() == clang::BO_Add &&
+        referencesBothParameters(
+            addition->getLHS(), addition->getRHS(), first, second))
+      return CanonicalReducerKind::Sum;
+    return CanonicalReducerKind::None;
+  }
+
+  const auto *conditional =
+      llvm::dyn_cast_or_null<clang::ConditionalOperator>(expression);
+  if (conditional == nullptr)
+    return CanonicalReducerKind::None;
+  const auto *comparison = llvm::dyn_cast<clang::BinaryOperator>(
+      stripParenAndImplicitCasts(conditional->getCond()));
+  if (comparison == nullptr ||
+      (comparison->getOpcode() != clang::BO_GT &&
+       comparison->getOpcode() != clang::BO_LT) ||
+      !referencesBothParameters(
+          comparison->getLHS(), comparison->getRHS(), first, second))
+    return CanonicalReducerKind::None;
+
+  const clang::ParmVarDecl *conditionLhs =
+      referencedParameter(comparison->getLHS());
+  const clang::ParmVarDecl *conditionRhs =
+      referencedParameter(comparison->getRHS());
+  const clang::ParmVarDecl *trueValue =
+      referencedParameter(conditional->getTrueExpr());
+  const clang::ParmVarDecl *falseValue =
+      referencedParameter(conditional->getFalseExpr());
+  if (trueValue == nullptr || falseValue == nullptr)
+    return CanonicalReducerKind::None;
+
+  const bool selectsConditionLhs =
+      trueValue == conditionLhs && falseValue == conditionRhs;
+  const bool selectsConditionRhs =
+      trueValue == conditionRhs && falseValue == conditionLhs;
+  if (!selectsConditionLhs && !selectsConditionRhs)
+    return CanonicalReducerKind::None;
+
+  if (comparison->getOpcode() == clang::BO_GT)
+    return selectsConditionLhs ? CanonicalReducerKind::Max
+                               : CanonicalReducerKind::Min;
+  return selectsConditionLhs ? CanonicalReducerKind::Min
+                             : CanonicalReducerKind::Max;
+}
+
+static CanonicalReducerKind classifyCanonicalBinaryReducer(
+    const clang::CXXRecordDecl *record,
+    clang::ASTContext &context,
+    clang::SourceManager &sourceManager) {
+  if (record == nullptr || !record->isThisDeclarationADefinition() ||
+      record->isImplicit() || record->isUnion() ||
+      record->getIdentifier() == nullptr ||
+      !record->getDeclContext()->isFileContext() ||
+      record->getNumBases() != 0 ||
+      record->getLocation().isInvalid() ||
+      record->getLocation().isMacroID() ||
+      !sourceManager.isWrittenInMainFile(record->getLocation()))
+    return CanonicalReducerKind::None;
+
+  const clang::ClassTemplateDecl *classTemplate =
+      record->getDescribedClassTemplate();
+  if (classTemplate == nullptr ||
+      classTemplate->getTemplateParameters()->size() != 1)
+    return CanonicalReducerKind::None;
+  const auto *valueTypeParameter =
+      llvm::dyn_cast<clang::TemplateTypeParmDecl>(
+          classTemplate->getTemplateParameters()->getParam(0));
+  if (valueTypeParameter == nullptr ||
+      valueTypeParameter->isParameterPack() ||
+      valueTypeParameter->getIdentifier() == nullptr)
+    return CanonicalReducerKind::None;
+
+  if (!record->lookup(
+          &context.Idents.get("ascify_reduction_tag")).empty() ||
+      !record->lookup(
+          &context.Idents.get("ascify_reduction_value_type")).empty() ||
+      !record->lookup(
+          &context.Idents.get("ascify_reduction_owner_type")).empty())
+    return CanonicalReducerKind::None;
+
+  const clang::CXXMethodDecl *callOperator = nullptr;
+  for (const clang::CXXMethodDecl *method : record->methods()) {
+    if (method->isImplicit() ||
+        method->getOverloadedOperator() != clang::OO_Call)
+      continue;
+    if (callOperator != nullptr)
+      return CanonicalReducerKind::None;
+    callOperator = method;
+  }
+  if (callOperator == nullptr || callOperator->isDeleted() ||
+      callOperator->isVariadic() || !callOperator->isConst() ||
+      callOperator->getNumParams() != 2 ||
+      callOperator->getTemplatedKind() !=
+          clang::FunctionDecl::TK_NonTemplate ||
+      !callOperator->hasAttr<clang::CUDADeviceAttr>() ||
+      !callOperator->hasBody())
+    return CanonicalReducerKind::None;
+
+  const clang::ParmVarDecl *first = callOperator->getParamDecl(0);
+  const clang::ParmVarDecl *second = callOperator->getParamDecl(1);
+  clang::QualType firstType =
+      canonicalReducerValueType(first->getType());
+  clang::QualType secondType =
+      canonicalReducerValueType(second->getType());
+  clang::QualType returnType =
+      canonicalReducerValueType(callOperator->getReturnType());
+  const clang::QualType templateValueType =
+      context.getTypeDeclType(valueTypeParameter)
+          .getCanonicalType().getUnqualifiedType();
+  if (firstType.isNull() || secondType.isNull() || returnType.isNull() ||
+      templateValueType.isNull() ||
+      first->getType().getNonReferenceType().isVolatileQualified() ||
+      second->getType().getNonReferenceType().isVolatileQualified() ||
+      callOperator->getReturnType()->isReferenceType() ||
+      !context.hasSameType(firstType, secondType) ||
+      !context.hasSameType(firstType, returnType) ||
+      !context.hasSameType(firstType, templateValueType))
+    return CanonicalReducerKind::None;
+
+  const auto *body =
+      llvm::dyn_cast<clang::CompoundStmt>(callOperator->getBody());
+  if (body == nullptr || body->size() != 1 ||
+      body->getBeginLoc().isInvalid() || body->getEndLoc().isInvalid() ||
+      body->getBeginLoc().isMacroID() || body->getEndLoc().isMacroID())
+    return CanonicalReducerKind::None;
+  const auto *returnStatement =
+      llvm::dyn_cast<clang::ReturnStmt>(*body->body_begin());
+  if (returnStatement == nullptr || returnStatement->getRetValue() == nullptr)
+    return CanonicalReducerKind::None;
+
+  return classifyCanonicalReducerReturn(
+      returnStatement->getRetValue(), first, second);
+}
+
+static llvm::StringRef canonicalReducerTagName(CanonicalReducerKind kind) {
+  switch (kind) {
+  case CanonicalReducerKind::Sum:
+    return "Sum";
+  case CanonicalReducerKind::Max:
+    return "Max";
+  case CanonicalReducerKind::Min:
+    return "Min";
+  case CanonicalReducerKind::None:
+    break;
+  }
+  return "";
 }
 
 static bool scanMallocCallAndSemi(const char *p, llvm::StringRef &argOut, const char *&afterSemiOut) {
@@ -417,7 +970,31 @@ bool AscifyAction::tryRewriteMallocDeviceAllocDecl(clang::Lexer &lex, clang::Tok
   *
   * Returns true when the raw lexer was advanced past rewritten text (see malloc rewrite).
   */
+bool AscifyAction::isInSemanticRewriteRange(clang::SourceLocation loc) {
+  if (loc.isInvalid())
+    return false;
+  auto &SM = getCompilerInstance().getSourceManager();
+  const clang::SourceLocation fileLoc = SM.getFileLoc(loc);
+  if (fileLoc.isInvalid())
+    return false;
+  const std::pair<clang::FileID, unsigned> decomposed =
+      SM.getDecomposedLoc(fileLoc);
+  for (const SemanticRewriteRange &range : SemanticRewriteRanges) {
+    if (range.file == decomposed.first &&
+        decomposed.second >= range.beginOffset &&
+        decomposed.second < range.endOffset)
+      return true;
+  }
+  return false;
+}
+
 bool AscifyAction::RewriteToken(clang::Lexer &lex, clang::Token &tok) {
+  // AST semantic transformations own their complete source span.  The raw
+  // identifier pass runs later and must not add overlapping token replacements
+  // inside that span.
+  if (isInSemanticRewriteRange(tok.getLocation()))
+    return false;
+
   if (!AscifyAMAP) {
     clang::SourceRange sr(tok.getLocation());
     for (const auto &skipped : SkippedSourceRanges) {
@@ -438,6 +1015,17 @@ bool AscifyAction::RewriteToken(clang::Lexer &lex, clang::Token &tok) {
   if (name == "malloc" && tryRewriteMallocDeviceAllocDecl(lex, tok))
     return true;
 
+  // Do not turn std::exp (or another explicitly-qualified function) into an
+  // invalid std::expf spelling. Unqualified CUDA device math remains mapped.
+  if (isUnqualifiedFloatMathName(name)) {
+    const clang::Token *previous = previousSignificantToken(rawTokenWindow);
+    if (previous != nullptr && previous->is(clang::tok::coloncolon))
+      return false;
+  }
+
+  if (requiresCudaCompatHeader(name))
+    needsCudaCompatHeader = true;
+
   FindAndReplace(name, tok.getLocation(), CUDA_RENAMES_MAP());
   return false;
 }
@@ -456,6 +1044,16 @@ void AscifyAction::InclusionDirective(clang::SourceLocation hash_loc,
                                         outs() << "File included: " << file_name << "\n";
   auto &SM = getCompilerInstance().getSourceManager();
   if (!SM.isWrittenInMainFile(hash_loc)) return;
+  if (file_name == "ascify/ascify_cuda_compat.hpp")
+    hasCudaCompatHeader = true;
+  if (file_name == ascify::DavC310TargetRecipe::TargetHeader)
+    hasDavC310TargetHeader = true;
+  if (file_name == "cub/cub.cuh" ||
+      file_name == "acl_cub/aclcub.hpp") {
+    hasCubCompatHeader = true;
+    if (firstCubCompatHeaderLoc.isInvalid())
+      firstCubCompatHeaderLoc = hash_loc;
+  }
   if (!firstHeader) {
     firstHeader = true;
     firstHeaderLoc = hash_loc;
@@ -489,7 +1087,13 @@ void AscifyAction::InclusionDirective(clang::SourceLocation hash_loc,
   const char *B = SM.getCharacterData(sl);
   const char *E = SM.getCharacterData(filename_range.getEnd());
   ct::Replacement Rep(SM, sl, E - B, newInclude.str());
-  insertReplacement(Rep, clang::FullSourceLoc{sl, SM});
+  const clang::SourceLocation replacementEnd =
+      sl.getLocWithOffset(static_cast<int>(E - B));
+  // The raw identifier pass also sees tokens inside include spellings (for
+  // example both `cub` tokens in <cub/cub.cuh>).  Make the preprocessor's
+  // include rewrite the sole owner of that span.
+  insertSemanticReplacement(
+      Rep, clang::FullSourceLoc{sl, SM}, sl, replacementEnd);
 }
 
 void AscifyAction::PragmaDirective(clang::SourceLocation Loc, clang::PragmaIntroducerKind Introducer) {
@@ -497,6 +1101,200 @@ void AscifyAction::PragmaDirective(clang::SourceLocation Loc, clang::PragmaIntro
 }
 
 bool AscifyAction::cudaLaunchKernel(const mat::MatchFinder::MatchResult &Result) {
+  return true;
+}
+
+bool AscifyAction::lowerCudaGlobalScalarDoubleParam(
+    const mat::MatchFinder::MatchResult &Result) {
+  const auto *param =
+      Result.Nodes.getNodeAs<clang::ParmVarDecl>(sCudaGlobalScalarDoubleParam);
+  if (param == nullptr)
+    return false;
+
+  const auto *function =
+      llvm::dyn_cast<clang::FunctionDecl>(param->getDeclContext());
+  if (function == nullptr || !function->hasAttr<clang::CUDAGlobalAttr>())
+    return false;
+
+  const clang::TypeSourceInfo *typeSource = param->getTypeSourceInfo();
+  if (typeSource == nullptr)
+    return false;
+
+  const clang::BuiltinTypeLoc builtinTypeLoc =
+      typeSource->getTypeLoc().getUnqualifiedLoc().getAs<clang::BuiltinTypeLoc>();
+  if (!builtinTypeLoc ||
+      builtinTypeLoc.getTypePtr()->getKind() != clang::BuiltinType::Double)
+    return false;
+
+  auto &SM = getCompilerInstance().getSourceManager();
+  const clang::LangOptions &LO = getCompilerInstance().getLangOpts();
+  const clang::SourceLocation doubleLoc = builtinTypeLoc.getBuiltinLoc();
+  if (doubleLoc.isInvalid() || doubleLoc.isMacroID() ||
+      !SM.isWrittenInMainFile(doubleLoc))
+    return false;
+
+  const llvm::StringRef spelling = clang::Lexer::getSourceText(
+      clang::CharSourceRange::getTokenRange(
+          clang::SourceRange(doubleLoc, doubleLoc)),
+      SM, LO);
+  if (spelling != "double")
+    return false;
+
+  const unsigned offset = SM.getFileOffset(doubleLoc);
+  if (!loweredDeviceDoubleParamOffsets.insert(offset).second)
+    return true;
+
+  static const dppCounter counter = {
+      "float", CONV_DEVICE_TYPE, API_RUNTIME, 0, FULL};
+  Statistics::current().incrementCounter(
+      counter, "CUDA __global__ by-value scalar double parameter");
+
+  clang::DiagnosticsEngine &DE = getCompilerInstance().getDiagnostics();
+  const auto ID = DE.getCustomDiagID(
+      clang::DiagnosticsEngine::Warning,
+      "lowering by-value scalar double parameter '%0' of CUDA __global__ "
+      "function '%1' to float for Ascend SIMT; use "
+      "'-no-lower-device-double-params' to disable");
+  DE.Report(doubleLoc, ID)
+      << param->getName() << function->getQualifiedNameAsString();
+
+  ct::Replacement Rep(SM, doubleLoc, spelling.size(), "float");
+  const clang::SourceLocation doubleEnd =
+      clang::Lexer::getLocForEndOfToken(doubleLoc, 0, SM, LO);
+  if (!insertSemanticReplacement(
+          Rep, clang::FullSourceLoc(doubleLoc, SM), doubleLoc, doubleEnd)) {
+    loweredDeviceDoubleParamOffsets.erase(offset);
+    return false;
+  }
+  return true;
+}
+
+bool AscifyAction::rewriteCanonicalWarpAddReduction(
+    const mat::MatchFinder::MatchResult &Result) {
+  const auto *loop =
+      Result.Nodes.getNodeAs<clang::ForStmt>(sCanonicalWarpAddReduction);
+  if (loop == nullptr || Result.Context == nullptr ||
+      Result.SourceManager == nullptr)
+    return false;
+
+  const clang::VarDecl *accumulator = nullptr;
+  if (!matchCanonicalWarpAddReduction(
+          loop, *Result.Context, *Result.SourceManager, accumulator) ||
+      accumulator == nullptr || accumulator->getName().empty())
+    return false;
+
+  auto &SM = *Result.SourceManager;
+  const clang::LangOptions &LO = getCompilerInstance().getLangOpts();
+  const auto *function =
+      llvm::dyn_cast<clang::FunctionDecl>(accumulator->getDeclContext());
+  if (function == nullptr)
+    return false;
+  const clang::Stmt *ownedStatement =
+      directFunctionBodyStatement(loop, function);
+  if (ownedStatement == nullptr)
+    return false;
+  const clang::SourceLocation begin =
+      canonicalWarpReductionReplacementBegin(
+          ownedStatement, loop, SM, LO);
+  const clang::SourceLocation endToken =
+      SM.getFileLoc(ownedStatement->getEndLoc());
+  const clang::SourceLocation end =
+      clang::Lexer::getLocForEndOfToken(endToken, 0, SM, LO);
+  if (begin.isInvalid() || end.isInvalid())
+    return false;
+
+  const unsigned offset = SM.getFileOffset(begin);
+  if (!rewrittenWarpAddReductionOffsets.insert(offset).second)
+    return true;
+
+  const unsigned endOffset = SM.getFileOffset(end);
+  if (endOffset <= offset) {
+    rewrittenWarpAddReductionOffsets.erase(offset);
+    return false;
+  }
+
+  const std::string name = accumulator->getNameAsString();
+  std::string indentation;
+  if (begin != SM.getFileLoc(loop->getBeginLoc())) {
+    const unsigned loopColumn =
+        SM.getSpellingColumnNumber(loop->getBeginLoc());
+    if (loopColumn > 1)
+      indentation.assign(loopColumn - 1, ' ');
+  }
+  const std::string replacementText =
+      indentation + name + " = ascify::warp_reduce_add(" + name + ");";
+  ct::Replacement Rep(SM, begin, endOffset - offset, replacementText);
+  if (!insertSemanticReplacement(
+          Rep, clang::FullSourceLoc(begin, SM), begin, end)) {
+    rewrittenWarpAddReductionOffsets.erase(offset);
+    return false;
+  }
+
+  static const dppCounter counter = {
+      "ascify::warp_reduce_add", CONV_DEVICE_FUNC, API_RUNTIME, 0, FULL};
+  Statistics::current().incrementCounter(
+      counter, "canonical full-warp add reduction");
+  needsCudaCompatHeader = true;
+  return true;
+}
+
+bool AscifyAction::tagCanonicalBinaryReducer(
+    const mat::MatchFinder::MatchResult &Result) {
+  const auto *record =
+      Result.Nodes.getNodeAs<clang::CXXRecordDecl>(sCanonicalBinaryReducer);
+  if (!hasCubCompatHeader || record == nullptr || Result.Context == nullptr ||
+      Result.SourceManager == nullptr)
+    return false;
+
+  const CanonicalReducerKind kind = classifyCanonicalBinaryReducer(
+      record, *Result.Context, *Result.SourceManager);
+  const llvm::StringRef tag = canonicalReducerTagName(kind);
+  if (tag.empty())
+    return false;
+
+  auto &SM = *Result.SourceManager;
+  const clang::SourceLocation includeLoc =
+      SM.getFileLoc(firstCubCompatHeaderLoc);
+  const clang::SourceLocation recordLoc =
+      SM.getFileLoc(record->getBeginLoc());
+  const clang::SourceLocation closeBrace =
+      SM.getFileLoc(record->getBraceRange().getEnd());
+  if (includeLoc.isInvalid() || recordLoc.isInvalid() ||
+      closeBrace.isInvalid() ||
+      SM.getFileID(includeLoc) != SM.getFileID(recordLoc) ||
+      SM.getFileOffset(includeLoc) >= SM.getFileOffset(recordLoc) ||
+      !SM.isWrittenInMainFile(closeBrace))
+    return false;
+  const unsigned offset = SM.getFileOffset(closeBrace);
+  if (!taggedCanonicalReducerOffsets.insert(offset).second)
+    return true;
+
+  std::string annotation =
+      "\n public:\n"
+      "  using ascify_reduction_tag = ::aclcub::";
+  annotation += tag.str();
+  annotation += ";\n"
+                "  using ascify_reduction_value_type = ";
+  annotation += record->getDescribedClassTemplate()
+                    ->getTemplateParameters()
+                    ->getParam(0)
+                    ->getNameAsString();
+  annotation += ";\n"
+                "  using ascify_reduction_owner_type = ";
+  annotation += record->getNameAsString();
+  annotation += ";\n";
+  ct::Replacement Rep(SM, closeBrace, 0, annotation);
+  if (!insertReplacement(
+          Rep, clang::FullSourceLoc(closeBrace, SM))) {
+    taggedCanonicalReducerOffsets.erase(offset);
+    return false;
+  }
+
+  static const dppCounter counter = {
+      "aclcub semantic reduction tag",
+      CONV_DEVICE_FUNC, API_CUB, 0, FULL};
+  Statistics::current().incrementCounter(
+      counter, "canonical pure binary reduction functor");
   return true;
 }
 
@@ -532,18 +1330,86 @@ bool AscifyAction::dataTypeSelection(const mat::MatchFinder::MatchResult &Result
   return false;
 }
 
-void AscifyAction::insertReplacement(const ct::Replacement &rep, const clang::FullSourceLoc &fullSL) {
-  llcompat::insertReplacement(*replacements, rep);
+bool AscifyAction::insertReplacement(const ct::Replacement &rep,
+                                     const clang::FullSourceLoc &fullSL) {
+  std::string errorMessage;
+  if (!llcompat::insertReplacement(*replacements, rep, &errorMessage)) {
+    clang::DiagnosticsEngine &DE = getCompilerInstance().getDiagnostics();
+    const auto ID = DE.getCustomDiagID(
+        clang::DiagnosticsEngine::Error,
+        "cannot apply Ascify source replacement: %0");
+    DE.Report(fullSL, ID) << errorMessage;
+    return false;
+  }
   if (PrintStats || PrintStatsCSV) {
     rep.getLength();
     Statistics::current().lineTouched(fullSL.getExpansionLineNumber());
     Statistics::current().bytesChanged(rep.getLength());
   }
+  return true;
+}
+
+bool AscifyAction::insertSemanticReplacement(
+    const ct::Replacement &rep,
+    const clang::FullSourceLoc &fullSL,
+    clang::SourceLocation begin,
+    clang::SourceLocation end) {
+  auto &SM = getCompilerInstance().getSourceManager();
+  begin = SM.getFileLoc(begin);
+  end = SM.getFileLoc(end);
+  if (begin.isInvalid() || end.isInvalid())
+    return false;
+  const std::pair<clang::FileID, unsigned> decomposedBegin =
+      SM.getDecomposedLoc(begin);
+  const std::pair<clang::FileID, unsigned> decomposedEnd =
+      SM.getDecomposedLoc(end);
+  if (decomposedBegin.first != decomposedEnd.first ||
+      decomposedEnd.second <= decomposedBegin.second)
+    return false;
+  for (const SemanticRewriteRange &range : SemanticRewriteRanges) {
+    if (range.file == decomposedBegin.first &&
+        decomposedBegin.second < range.endOffset &&
+        range.beginOffset < decomposedEnd.second) {
+      clang::DiagnosticsEngine &DE = getCompilerInstance().getDiagnostics();
+      const auto ID = DE.getCustomDiagID(
+          clang::DiagnosticsEngine::Warning,
+          "skipping overlapping Ascify semantic rewrite");
+      DE.Report(fullSL, ID);
+      return false;
+    }
+  }
+  if (!insertReplacement(rep, fullSL))
+    return false;
+  SemanticRewriteRanges.push_back(
+      {decomposedBegin.first, decomposedBegin.second, decomposedEnd.second});
+  return true;
 }
 std::unique_ptr<clang::ASTConsumer> AscifyAction::CreateASTConsumer(clang::CompilerInstance &CI, StringRef) {
   Finder.reset(new mat::MatchFinder);
+  davC310TargetRecipe.reset();
   // Replace the <<<...>>> language extension with a hip kernel launch
   Finder->addMatcher(mat::cudaKernelCallExpr(mat::isExpansionInMainFile()).bind(sCudaLaunchKernel), this);
+  if (!NoLowerDeviceDoubleParams) {
+    Finder->addMatcher(
+        mat::parmVarDecl(mat::isExpansionInMainFile())
+            .bind(sCudaGlobalScalarDoubleParam),
+        this);
+  }
+  if (TargetPolicy == "dav-c310-vec" && SimtMathMode == "fast") {
+    // Keep the matcher broad and perform the semantic proof in the callback.
+    // This prevents source-name coupling and makes every failed proof a
+    // no-op that falls back to the translated shuffle loop.
+    Finder->addMatcher(
+        mat::forStmt(mat::isExpansionInMainFile())
+            .bind(sCanonicalWarpAddReduction),
+        this);
+    Finder->addMatcher(
+        mat::cxxRecordDecl(mat::isDefinition(),
+                           mat::isExpansionInMainFile())
+            .bind(sCanonicalBinaryReducer),
+        this);
+    davC310TargetRecipe.registerMatchers(*Finder, this);
+  }
   return Finder->newASTConsumer();
 }
 
@@ -551,6 +1417,23 @@ void AscifyAction::Ifndef(clang::SourceLocation Loc, const clang::Token &MacroNa
 }
 
 void AscifyAction::EndSourceFileAction() {
+  std::string includes;
+  if (needsCudaCompatHeader && !hasCudaCompatHeader)
+    includes += "#include <ascify/ascify_cuda_compat.hpp>\n";
+  if (needsDavC310TargetHeader && !hasDavC310TargetHeader) {
+    includes += "#include <";
+    includes += ascify::DavC310TargetRecipe::TargetHeader;
+    includes += ">\n";
+  }
+  if (includes.empty())
+    return;
+
+  auto &SM = getCompilerInstance().getSourceManager();
+  const clang::FileID mainFile = SM.getMainFileID();
+  const clang::SourceLocation insertLoc =
+      firstHeader ? firstHeaderLoc : SM.getLocForStartOfFile(mainFile);
+  ct::Replacement Rep(SM, insertLoc, 0, includes);
+  insertReplacement(Rep, clang::FullSourceLoc(insertLoc, SM));
 }
 
 namespace {
@@ -606,6 +1489,22 @@ public:
 }
 
 bool AscifyAction::BeginInvocation(clang::CompilerInstance &CI) {
+  clang::DiagnosticsEngine &DE = CI.getDiagnostics();
+  if (TargetPolicy != "portable" && TargetPolicy != "dav-c310-vec") {
+    const auto ID = DE.getCustomDiagID(
+        clang::DiagnosticsEngine::Error,
+        "unsupported --target-policy value '%0'; expected 'portable' or "
+        "'dav-c310-vec'");
+    DE.Report(ID) << TargetPolicy;
+    return false;
+  }
+  if (SimtMathMode != "precise" && SimtMathMode != "fast") {
+    const auto ID = DE.getCustomDiagID(
+        clang::DiagnosticsEngine::Error,
+        "unsupported --simt-math value '%0'; expected 'precise' or 'fast'");
+    DE.Report(ID) << SimtMathMode;
+    return false;
+  }
   llcompat::RetainExcludedConditionalBlocks(CI);
   return true;
 }
@@ -621,6 +1520,30 @@ void AscifyAction::ExecuteAction() {
   // Now we're done futzing with the lexer, have the subclass proceeed with Sema and AST matching.
   clang::ASTFrontendAction::ExecuteAction();
   auto &SM = getCompilerInstance().getSourceManager();
+  if (TargetPolicy == "dav-c310-vec" && SimtMathMode == "fast") {
+    const ascify::DavC310TargetRecipe::FinalizedEdits recipeEdits =
+        davC310TargetRecipe.finalize(
+            getCompilerInstance().getASTContext(), SM, PP.getLangOpts());
+    unsigned insertedRecipeEdits = 0;
+    for (const ascify::DavC310TargetRecipe::Edit &edit :
+         recipeEdits.edits) {
+      ct::Replacement replacement(SM, edit.location, 0, edit.text);
+      if (insertReplacement(
+              replacement, clang::FullSourceLoc(edit.location, SM)))
+        ++insertedRecipeEdits;
+    }
+    needsDavC310TargetHeader =
+        recipeEdits.needsTargetHeader && insertedRecipeEdits != 0;
+    if (insertedRecipeEdits != 0) {
+      llvm::errs()
+          << "Ascify dav-c310 recipe: adapters(load="
+          << recipeEdits.directLoadAdapters << ",store="
+          << recipeEdits.directStoreAdapters
+          << "), direct_wrappers(softmax="
+          << recipeEdits.softmaxDirectWrappers << ",rmsnorm="
+          << recipeEdits.rmsNormDirectWrappers << ")\n";
+    }
+  }
   // Start lexing the specified input file.
   llcompat::Memory_Buffer FromFile = llcompat::getMemoryBuffer(SM);
   clang::Lexer RawLex(SM.getMainFileID(), FromFile, SM, PP.getLangOpts());
@@ -646,13 +1569,25 @@ void AscifyAction::AddSkippedSourceRange(clang::SourceRange Range) {
 }
 
 void AscifyAction::run(const mat::MatchFinder::MatchResult &Result) {
-  if (cudaLaunchKernel(Result)) return;
-  if (cudaHostFuncCall(Result)) return;
-  if (cudaOverloadedHostFuncCall(Result)) return;
-  if (cudaDeviceFuncCall(Result)) return;
-  if (cubNamespacePrefix(Result)) return;
-  if (cubFunctionTemplateDecl(Result)) return;
-  if (cubUsingNamespaceDecl(Result)) return;
-  if (!NoUndocumented && half2Member(Result)) return;
+  if (davC310TargetRecipe.collect(Result))
+    return;
+  if (Result.Nodes.getNodeAs<clang::CUDAKernelCallExpr>(sCudaLaunchKernel) != nullptr) {
+    (void)cudaLaunchKernel(Result);
+    return;
+  }
+  if (Result.Nodes.getNodeAs<clang::ParmVarDecl>(
+          sCudaGlobalScalarDoubleParam) != nullptr) {
+    (void)lowerCudaGlobalScalarDoubleParam(Result);
+    return;
+  }
+  if (Result.Nodes.getNodeAs<clang::ForStmt>(
+          sCanonicalWarpAddReduction) != nullptr) {
+    (void)rewriteCanonicalWarpAddReduction(Result);
+    return;
+  }
+  if (Result.Nodes.getNodeAs<clang::CXXRecordDecl>(
+          sCanonicalBinaryReducer) != nullptr) {
+    (void)tagCanonicalBinaryReducer(Result);
+    return;
+  }
 }
-

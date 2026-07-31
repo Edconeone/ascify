@@ -1,0 +1,229 @@
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+#include "kernels/softmax_native_kernel.cce"
+#endif
+#include "oneflow/core/cuda/softmax.cuh"
+#include "common/runner_common.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <string>
+#include <vector>
+
+#ifndef ASCIFY950_MATH_MODE
+#define ASCIFY950_MATH_MODE "unspecified"
+#endif
+
+namespace sm = oneflow::cuda::softmax;
+namespace b950 = ascify950;
+
+static aclError LaunchSoftmax(aclrtStream stream, const half* input, half* output, int64_t rows,
+                              int64_t cols) {
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+  if (rows <= 0 || cols <= 0 || cols > std::numeric_limits<int>::max()) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  return softmax_native_dispatch(stream, input, output, rows,
+                                 static_cast<int>(cols), 0, 0);
+#else
+  sm::DirectLoad<half, float> load(input, cols);
+  sm::DirectStore<float, half> store(output, cols);
+  return sm::DispatchSoftmax<decltype(load), decltype(store), float>(stream, load, store, rows,
+                                                                     cols);
+#endif
+}
+
+int main(int argc, char** argv) {
+  const std::string shapes_path =
+      b950::GetArg(argc, argv, "--shapes", "shapes/correctness.csv");
+  const std::string output_path =
+      b950::GetArg(argc, argv, "--out", "perf_history.csv");
+  const std::string runtime_config_path =
+      b950::GetArg(argc, argv, "--runtime-config-out", "");
+  const std::string run_id = b950::GetArg(argc, argv, "--run-id", "manual");
+  const std::string requested_tier = b950::GetArg(argc, argv, "--tier", "smoke");
+  const int device_id = std::atoi(b950::GetArg(argc, argv, "--device", "0"));
+  const int warmup = std::atoi(b950::GetArg(argc, argv, "--warmup", "5"));
+  const int samples = std::atoi(b950::GetArg(argc, argv, "--samples", "20"));
+  const int inner_repeats = std::atoi(b950::GetArg(argc, argv, "--inner-repeats", "10"));
+  const int limit = std::atoi(b950::GetArg(argc, argv, "--limit", "0"));
+  const double max_memory_fraction =
+      std::strtod(b950::GetArg(argc, argv, "--max-frac", "0.80"), nullptr);
+  const uint64_t seed =
+      std::strtoull(b950::GetArg(argc, argv, "--seed", "0x9505a17"), nullptr, 0);
+
+  const std::vector<b950::Case> cases = b950::ReadCases(shapes_path);
+  b950::PerfCsvWriter csv(output_path);
+  b950::AclSession session;
+  const aclError init_error = session.Init(device_id);
+  if (init_error != ACL_SUCCESS) {
+    std::fprintf(stderr, "%s\n", b950::AclErrorReason("ACL session initialization", init_error).c_str());
+    return 1;
+  }
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+#ifdef ASCIFY950_USE_BLOCK_SOFTMAX
+  const std::string runtime_variant = "native_half2_hybrid";
+#else
+  const std::string runtime_variant = "native_half2_compact";
+#endif
+  const std::string target_entry = "softmax_fp16_explicit_grid0";
+#else
+  const std::string runtime_variant = "converted_dispatch";
+  const std::string target_entry = "try_softmax_default_grid";
+#endif
+  std::string runtime_config_reason;
+  if (!b950::WriteRuntimeGridConfig(
+          runtime_config_path, run_id, "softmax", runtime_variant, target_entry,
+          "adaptive", device_id, &runtime_config_reason)) {
+    std::fprintf(stderr, "runtime grid config: %s\n", runtime_config_reason.c_str());
+    return 1;
+  }
+
+  int selected = 0;
+  int measured = 0;
+  int failed = 0;
+  int skipped = 0;
+  for (const b950::Case& test_case : cases) {
+    if (test_case.op != "softmax" || test_case.dtype != "fp16" || !test_case.run_bench
+        || !b950::TierEnabled(test_case.tier, requested_tier)) {
+      continue;
+    }
+    if (limit > 0 && selected >= limit) { break; }
+    ++selected;
+
+    b950::PerfRecord record;
+    record.run_id = run_id;
+    record.op = "softmax";
+    record.dtype = "fp16";
+    record.math_mode = ASCIFY950_MATH_MODE;
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+#ifdef ASCIFY950_USE_BLOCK_SOFTMAX
+    record.variant = runtime_variant;
+#else
+    record.variant = "native_half2_compact";
+#endif
+#else
+    record.variant = runtime_variant;
+#endif
+    record.test_case = test_case;
+    record.device_id = device_id;
+    record.warmup = warmup;
+    record.samples = samples;
+    record.inner_repeats = inner_repeats;
+
+    size_t elements = 0;
+    size_t tensor_bytes = 0;
+    std::string size_reason;
+    if (!b950::CheckedTensorSize(test_case.rows, test_case.cols, sizeof(half), &elements,
+                                 &tensor_bytes, &size_reason)) {
+      record.status = "error";
+      record.reason = size_reason;
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    if (tensor_bytes > std::numeric_limits<size_t>::max() / 2) {
+      record.status = "error";
+      record.reason = "input+output byte count overflows size_t";
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    aclError error = aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes);
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("aclrtGetMemInfo", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    const size_t required_bytes = tensor_bytes * 2;
+    if (free_bytes > 0
+        && static_cast<double>(required_bytes)
+               > static_cast<double>(free_bytes) * max_memory_fraction) {
+      record.status = "skip";
+      record.reason = "predicted OOM under --max-frac";
+      csv.Write(record);
+      ++skipped;
+      continue;
+    }
+
+    b950::DeviceBuffer device_input;
+    b950::DeviceBuffer device_output;
+    error = device_input.Allocate(tensor_bytes);
+    if (error == ACL_SUCCESS) { error = device_output.Allocate(tensor_bytes); }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("aclrtMalloc", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    const b950::InputPatternCode pattern = b950::PatternCode(test_case.input_pattern);
+    const uint64_t case_seed = seed ^ static_cast<uint64_t>(test_case.idx + 1);
+    error = b950::FillDeviceHalf(device_input.As<half>(), elements, test_case.cols, pattern,
+                                 case_seed, session.Stream());
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemset(device_output.Get(), tensor_bytes, 0xa5, tensor_bytes);
+    }
+    if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(session.Stream()); }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("deterministic device initialization", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    auto launch = [&]() {
+      return LaunchSoftmax(session.Stream(), device_input.As<const half>(),
+                           device_output.As<half>(), test_case.rows, test_case.cols);
+    };
+    error = launch();
+    if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(session.Stream()); }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("validation launch", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    const b950::TimingResult timing =
+        b950::TimeKernel(launch, session.Stream(), warmup, samples, inner_repeats);
+    if (!timing.ok || timing.stats.median_ms <= 0.0) {
+      record.status = "error";
+      record.reason = timing.reason.empty() ? "non-positive median latency" : timing.reason;
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    record.latency = timing.stats;
+    record.logical_bytes = static_cast<uint64_t>(tensor_bytes) * 2;
+    record.gbps = static_cast<double>(record.logical_bytes)
+                  / (record.latency.median_ms * 1.0e-3) / 1.0e9;
+    record.status = "pass";
+    csv.Write(record);
+    ++measured;
+    std::fprintf(stderr,
+                 "[pass] rows=%lld cols=%lld median=%.6f ms p90=%.6f ms %.2f GB/s\n",
+                 static_cast<long long>(test_case.rows),
+                 static_cast<long long>(test_case.cols), record.latency.median_ms,
+                 record.latency.p90_ms, record.gbps);
+  }
+
+  std::fprintf(stderr, "softmax benchmark: selected=%d measured=%d fail=%d skip=%d\n", selected,
+               measured, failed, skipped);
+  if (selected == 0) { return 3; }
+  if (measured == 0) {
+    std::fprintf(stderr, "softmax benchmark did not produce any measurements\n");
+    return 3;
+  }
+  return failed == 0 ? 0 : 2;
+}

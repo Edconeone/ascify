@@ -1,46 +1,69 @@
-# Prerequisites
-*.d
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
 
-# Compiled Object files
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# CMake, Ninja, and install trees
+/build/
+/build-*/
+/cmake-build-*/
+/ascify_install/
+/dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+build.ninja
+.ninja_*
+compile_commands.json
+
+# Project-generated conversion, benchmark, and evidence artifacts
+/.work/
+
+# Compiled and packaged artifacts
+*.d
 *.slo
 *.lo
 *.o
 *.obj
-
-# Precompiled Headers
 *.gch
 *.pch
-
-# Linker files
 *.ilk
-
-# Debugger Files
 *.pdb
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
 *.mod
 *.smod
-
-# Compiled Static libraries
 *.lai
 *.la
 *.a
 *.lib
-
-# Executables
 *.exe
 *.out
 *.app
 *.log
-
-# debug information files
 *.dwo
-build/
-.vscode
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.deb
+*.rpm
+
+# Tool caches
 .cache/
-.clangd
+.clangd/
+.pytest_cache/
+.coverage
+.coverage.*
+__pycache__/
+*.py[cod]

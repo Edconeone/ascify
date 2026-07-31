@@ -27,6 +27,7 @@ THE SOFTWARE.
 #endif
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "llvm/Support/Error.h"
 
 const std::string sAscify = "[ASCIFY] ", sConflict = "conflict: ", sError = "error: ", sWarning = "warning: ";
 
@@ -52,14 +53,26 @@ ct::Replacements &getReplacements(ct::RefactoringTool &Tool, StringRef file) {
 #endif
 }
 
-void insertReplacement(ct::Replacements &replacements, const ct::Replacement &rep) {
+bool insertReplacement(ct::Replacements &replacements,
+                       const ct::Replacement &rep,
+                       std::string *errorMessage) {
 #if LLVM_VERSION_MAJOR > 3
-  // New clang added error checking to Replacements, and *insists* that you explicitly check it.
-  llvm::consumeError(replacements.add(rep));
+  // New clang added error checking to Replacements.  Surface conflicts to the
+  // caller instead of consuming them and silently dropping one transformation.
+  if (llvm::Error error = replacements.add(rep)) {
+    if (errorMessage != nullptr)
+      *errorMessage = llvm::toString(std::move(error));
+    else
+      llvm::errs() << sAscify << sError
+                   << "failed to add source replacement: "
+                   << llvm::toString(std::move(error)) << "\n";
+    return false;
+  }
 #else
   // In older versions, it's literally an std::set<Replacement>
   replacements.insert(rep);
 #endif
+  return true;
 }
 
 void EnterPreprocessorTokenStream(clang::Preprocessor &_pp, const clang::Token *start, size_t len, bool DisableMacroExpansion) {

@@ -1,0 +1,10 @@
+# portable + precise: semantic reducer tagging is disabled.
++#include <acl_cub/aclcub.hpp>
++struct CanonicalSumReducer {
++struct CanonicalMaxReducer {
++struct CanonicalMinReducer {
+
+-ascify_reduction_tag
+-ascify_reduction_value_type
+-ascify_reduction_owner_type
+-oneflow

@@ -8,8 +8,12 @@
  *
  * Two execution paths, dispatched at compile time so unused paths are not
  * instantiated:
- *   * Fast path: when Op publicly derives from aclcub::Sum/Max/Min OR is
- *       registered in the recognizer map list at the bottom of this file:
+ *   * Fast path: when Op publicly derives from aclcub::Sum/Max/Min OR exposes
+ *       the public `ascify_reduction_tag`, `ascify_reduction_value_type`, and
+ *       `ascify_reduction_owner_type` aliases produced by semantic conversion.
+ *       The value and owner markers must exactly match the BlockReduce value
+ *       and reducer types; inherited or mismatched markers fall back to the
+ *       generic path:
  *         (1) intra-warp AllReduce via asc_reduce_add / asc_reduce_max /
  *             asc_reduce_min
  *         (2) lane 0 of each warp publishes its warp aggregate to UB
@@ -88,13 +92,98 @@ __aicore__ inline uint32_t AscShflXor(uint32_t v, int mask, int width = kWarpSiz
 template <bool C, typename T, typename F> struct Cond { using type = T; };
 template <typename T, typename F> struct Cond<false, T, F> { using type = F; };
 
+template <typename A, typename B> struct IsSame { static constexpr bool value = false; };
+template <typename A> struct IsSame<A, A> { static constexpr bool value = true; };
+template <typename...> struct MakeVoid { using type = void; };
+template <typename T> struct RemoveCV { using type = T; };
+template <typename T> struct RemoveCV<const T> { using type = T; };
+template <typename T> struct RemoveCV<volatile T> { using type = T; };
+template <typename T> struct RemoveCV<const volatile T> { using type = T; };
+
+template <typename Op, typename = void>
+struct DeclaredOpTag {
+  using type = void;
+  using value_type = void;
+  using owner_type = void;
+};
 template <typename Op>
-struct OpTagOf {
+struct DeclaredOpTag<
+    Op, typename MakeVoid<typename Op::ascify_reduction_tag,
+                          typename Op::ascify_reduction_value_type,
+                          typename Op::ascify_reduction_owner_type>::type> {
+ private:
+  using Candidate = typename Op::ascify_reduction_tag;
+ public:
+  using type =
+      typename Cond<IsSame<Candidate, Sum>::value, Sum,
+      typename Cond<IsSame<Candidate, Max>::value, Max,
+      typename Cond<IsSame<Candidate, Min>::value, Min,
+                    void>::type>::type>::type;
+  using value_type = typename Op::ascify_reduction_value_type;
+  using owner_type = typename Op::ascify_reduction_owner_type;
+};
+
+template <typename Op> struct BaseOpTagOf {
   using type =
       typename Cond<__is_base_of(Sum, Op), Sum,
       typename Cond<__is_base_of(Max, Op), Max,
       typename Cond<__is_base_of(Min, Op), Min,
                     void>::type>::type>::type;
+};
+
+template <typename Op>
+struct OpTagOf {
+ private:
+  using Declared = typename DeclaredOpTag<Op>::type;
+  using DeclaredOwner =
+      typename RemoveCV<typename DeclaredOpTag<Op>::owner_type>::type;
+  using Reducer = typename RemoveCV<Op>::type;
+  static constexpr bool kMarkerOwned =
+      !IsSame<Declared, void>::value &&
+      IsSame<DeclaredOwner, Reducer>::value;
+ public:
+  using type = typename Cond<kMarkerOwned,
+                             Declared,
+                             typename BaseOpTagOf<Op>::type>::type;
+};
+
+template <typename T> struct IsAscReduceType {
+  static constexpr bool value = false;
+};
+template <> struct IsAscReduceType<float> {
+  static constexpr bool value = true;
+};
+template <> struct IsAscReduceType<int32_t> {
+  static constexpr bool value = true;
+};
+template <> struct IsAscReduceType<uint32_t> {
+  static constexpr bool value = true;
+};
+template <typename T> struct IsAscReduceType<const T> : IsAscReduceType<T> {};
+template <typename T> struct IsAscReduceType<volatile T> : IsAscReduceType<T> {};
+template <typename T> struct IsAscReduceType<const volatile T>
+    : IsAscReduceType<T> {};
+
+template <typename T, typename Op>
+struct DispatchTagOf {
+ private:
+  using DeclaredTag = typename DeclaredOpTag<Op>::type;
+  using DeclaredValue =
+      typename RemoveCV<typename DeclaredOpTag<Op>::value_type>::type;
+  using DeclaredOwner =
+      typename RemoveCV<typename DeclaredOpTag<Op>::owner_type>::type;
+  using BlockValue = typename RemoveCV<T>::type;
+  using Reducer = typename RemoveCV<Op>::type;
+  static constexpr bool kMarkerMatches =
+      !IsSame<DeclaredTag, void>::value &&
+      IsSame<DeclaredValue, BlockValue>::value &&
+      IsSame<DeclaredOwner, Reducer>::value;
+  using Candidate =
+      typename Cond<kMarkerMatches, DeclaredTag,
+                    typename BaseOpTagOf<Op>::type>::type;
+ public:
+  using type = typename Cond<IsAscReduceType<T>::value,
+                             Candidate, void>::type;
 };
 
 template <typename Tag> struct TagHolder {};
@@ -136,19 +225,20 @@ class BlockReduce {
   // cub-compatible: any functor accepted. Result valid in thread 0.
   template <typename Op>
   __aicore__ inline T Reduce(T input, Op op) {
-    using OpTag = typename OpTagOf<Op>::type;
+    using OpTag = typename DispatchTagOf<T, Op>::type;
     return ReduceDispatch(input, op, TagHolder<OpTag>{});
   }
 
   __aicore__ inline T Sum(T input) {
-    return ReduceDispatch(input, ::aclcub::Sum{}, TagHolder<::aclcub::Sum>{});
+    using OpTag = typename DispatchTagOf<T, ::aclcub::Sum>::type;
+    return ReduceDispatch(input, ::aclcub::Sum{}, TagHolder<OpTag>{});
   }
 
   // AllReduce (single-buffer): result in EVERY thread, ONE barrier. The caller
   // must still guard TempStorage reuse across iterations with its own barrier.
   template <typename Op>
   __aicore__ inline T AllReduce(T input, Op op) {
-    using OpTag = typename OpTagOf<Op>::type;
+    using OpTag = typename DispatchTagOf<T, Op>::type;
     return AllReduceDispatch(input, op, TagHolder<OpTag>{});
   }
 
@@ -160,7 +250,7 @@ class BlockReduce {
   // Reduce()+broadcast-write+__syncthreads(), 2 barriers, with a single barrier).
   template <typename Op>
   __aicore__ inline T AllReduce(T input, Op op, int iter) {
-    using OpTag = typename OpTagOf<Op>::type;
+    using OpTag = typename DispatchTagOf<T, Op>::type;
     return AllReduceDB<0>(input, op, TagHolder<OpTag>{}, iter);
   }
 
@@ -168,12 +258,12 @@ class BlockReduce {
   // FOLD=2 warp). The auto AllReduce(.,.,iter) above (FOLD=0) is preferred.
   template <typename Op>
   __aicore__ inline T AllReduceSerial(T input, Op op, int iter) {
-    using OpTag = typename OpTagOf<Op>::type;
+    using OpTag = typename DispatchTagOf<T, Op>::type;
     return AllReduceDB<1>(input, op, TagHolder<OpTag>{}, iter);
   }
   template <typename Op>
   __aicore__ inline T AllReduceW(T input, Op op, int iter) {
-    using OpTag = typename OpTagOf<Op>::type;
+    using OpTag = typename DispatchTagOf<T, Op>::type;
     return AllReduceDB<2>(input, op, TagHolder<OpTag>{}, iter);
   }
  private:
@@ -343,20 +433,4 @@ class BlockReduce<T, BLOCK_DIM_X, ACLCUB_BLOCK_REDUCE_ASC_SHFL> {
 
 }  // namespace aclcub
 
-#ifndef ACLCUB_NO_THIRDPARTY_RECOGNIZERS
-
-namespace oneflow { namespace cuda { namespace softmax {
-template <typename T> struct SumOp;
-template <typename T> struct MaxOp;
-} } }  // namespace oneflow::cuda::softmax
-namespace aclcub {
-template <typename T>
-struct OpTagOf< ::oneflow::cuda::softmax::SumOp<T> > { using type = Sum; };
-template <typename T>
-struct OpTagOf< ::oneflow::cuda::softmax::MaxOp<T> > { using type = Max; };
-}  // namespace aclcub
-
-#endif  // ACLCUB_NO_THIRDPARTY_RECOGNIZERS
-
 #endif  // ACL_CUB_ACLCUB_HPP_
-

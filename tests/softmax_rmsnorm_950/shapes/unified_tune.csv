@@ -1,0 +1,16 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+sm_t001,100,softmax,fp16,tune,1,1,8192,128,saturation,random,warp,0,1e-5,aiv_saturation_small_row
+sm_t002,101,softmax,fp16,tune,1,1,8192,512,saturation,random,warp,0,1e-5,aiv_saturation_mid_row
+sm_t003,102,softmax,fp16,tune,1,1,8192,1024,saturation,wide,block_smem,0,1e-5,aiv_saturation_dispatch_edge
+sm_t004,103,softmax,fp16,tune,1,1,1024,4096,saturation,random,block_smem,0,1e-5,aiv_saturation_smem
+sm_t005,104,softmax,fp16,tune,1,1,128,8192,saturation,random,block_smem,0,1e-5,long_row_controlled_memory
+rn_t001p,1100,rms_norm,fp16,tune,1,1,8192,128,saturation,random,warp,0,1e-5,plain_aiv_saturation_small_row
+rn_t001a,1101,rms_norm,fp16,tune,1,1,8192,128,saturation,random,warp,1,1e-5,affine_aiv_saturation_small_row
+rn_t002p,1102,rms_norm,fp16,tune,1,1,8192,512,saturation,random,warp,0,1e-5,plain_aiv_saturation_mid_row
+rn_t002a,1103,rms_norm,fp16,tune,1,1,8192,512,saturation,random,warp,1,1e-5,affine_aiv_saturation_mid_row
+rn_t003p,1104,rms_norm,fp16,tune,1,1,8192,1024,saturation,wide,warp,0,1e-5,plain_aiv_saturation_dispatch_edge
+rn_t003a,1105,rms_norm,fp16,tune,1,1,8192,1024,saturation,wide,warp,1,1e-5,affine_aiv_saturation_dispatch_edge
+rn_t004p,1106,rms_norm,fp16,tune,1,1,1024,4096,saturation,random,block_smem,0,1e-5,plain_aiv_saturation_smem
+rn_t004a,1107,rms_norm,fp16,tune,1,1,1024,4096,saturation,random,block_smem,1,1e-5,affine_aiv_saturation_smem
+rn_t005p,1108,rms_norm,fp16,tune,1,1,128,8192,saturation,random,block_smem,0,1e-5,plain_long_row_controlled_memory
+rn_t005a,1109,rms_norm,fp16,tune,1,1,128,8192,saturation,random,block_smem,1,1e-5,affine_long_row_controlled_memory

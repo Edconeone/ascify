@@ -1,0 +1,35 @@
+# Lines prefixed with '+' must occur in translated output.
+# Lines prefixed with '-' must not occur in translated output.
++#include <ascify/ascify_cuda_compat.hpp>
++ascify::shfl_xor_sync(0xffffffffu, value, 1, 32)
++ASCIFY_ALIGN(16)
++ascify::syncwarp()
++expf(value)
++logf(value)
++sqrtf(value)
++rsqrtf(value)
++ascify::fdividef(value, 2.0f)
++ascify::cudaDeviceGetAttribute(value, ACL_DEV_ATTR_VECTOR_CORE_NUM, device)
++ascify::cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++ascify::cudaFuncAttributes attributes{}
++ascify::cudaFuncGetAttributes(&attributes, SimtCompatKernel)
++ascify::cudaFuncSetAttribute(
++ascify::cudaFuncAttributeMaxDynamicSharedMemorySize
++ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE
++ascify::cudaPeekAtLastError()
++__global__ void NarrowScalarDoubleParams(float* output, const float eps, float scale,
++const double* pointer, double values[])
++__aicore__ double KeepDeviceDoubleParam(double value)
++double KeepHostDoublePrecision(double value)
++std::is_same<double, double>
+-asc_shfl_xor(0xffffffffu,
+-aclrtGetDeviceInfo(value,
+-aclrtPeekAtLastError()
+-__builtin_expf
+-__builtin_logf
+-__builtin_sqrtf
+-float KeepHostDoublePrecision(float value)
+-const double eps, double scale
+-const float* pointer
+-float values[]
+-std::is_same<float, float>

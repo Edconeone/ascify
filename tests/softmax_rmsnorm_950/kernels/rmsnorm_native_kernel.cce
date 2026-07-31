@@ -1,0 +1,29 @@
+// Compatibility wrapper for the historical native RMSNorm benchmark.
+// Keep the standalone self-test switch visible to the installed implementation.
+#ifndef ASCIFY950_RMSNORM_NATIVE_KERNEL_CCE_
+#define ASCIFY950_RMSNORM_NATIVE_KERNEL_CCE_
+
+#ifndef ASCIFY_DAV_C310_USE_CALLER_RMSNORM_FEATURE_FLAGS
+#define ASCIFY_DAV_C310_USE_CALLER_RMSNORM_FEATURE_FLAGS
+#define ASCIFY_DAV_C310_UNDEF_CALLER_RMSNORM_FEATURE_FLAGS
+#endif
+#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+#ifdef ASCIFY_DAV_C310_UNDEF_CALLER_RMSNORM_FEATURE_FLAGS
+#undef ASCIFY_DAV_C310_USE_CALLER_RMSNORM_FEATURE_FLAGS
+#undef ASCIFY_DAV_C310_UNDEF_CALLER_RMSNORM_FEATURE_FLAGS
+#endif
+
+namespace ascify950 {
+namespace native_rmsnorm {
+
+static inline aclError Launch(
+    aclrtStream stream, const half* input, half* output, const half* weight,
+    float* inverse_rms, int64_t rows, int64_t columns, double epsilon) {
+  return ::ascify::target::dav_c310::v1::detail::rmsnorm_fp16::Launch(
+      stream, input, output, weight, inverse_rms, rows, columns, epsilon, 0, 0);
+}
+
+}  // namespace native_rmsnorm
+}
+
+#endif  // ASCIFY950_RMSNORM_NATIVE_KERNEL_CCE_

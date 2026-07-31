@@ -69,8 +69,14 @@ ct::Replacements &getReplacements(ct::RefactoringTool &Tool, StringRef file);
 
 /**
   * Add a Replacement to a Replacements.
+  *
+  * Returns false when clang rejects an overlapping or otherwise invalid
+  * replacement.  Newer clang versions return llvm::Error here; do not silently
+  * consume it because doing so can leave a partially translated source file.
   */
-void insertReplacement(ct::Replacements &replacements, const ct::Replacement &rep);
+bool insertReplacement(ct::Replacements &replacements,
+                       const ct::Replacement &rep,
+                       std::string *errorMessage = nullptr);
 
 /**
   * Version-agnostic version of Preprocessor::EnterTokenStream().

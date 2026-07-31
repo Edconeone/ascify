@@ -45,6 +45,11 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_TYPE_NAME_MAP = [] {
   m["cudaDeviceAttr"]                                    = {"aclrtDevAttr",                                        CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDevAttrMaxThreadsPerBlock"]                  = {"ACL_DEV_ATTR_MAX_THREAD_PER_BLOCK",      CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDevAttrWarpSize"]                          = {"ACL_DEV_ATTR_WARP_SIZE",                  CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxSharedMemoryPerBlockOptin"]      = {"ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE",       CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // Minimal kernel-attribute surface used by layer_norm.cuh.
+  m["cudaFuncAttributes"]                            = {"ascify::cudaFuncAttributes",               CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaFuncAttribute"]                             = {"ascify::cudaFuncAttribute",                CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaFuncAttributeMaxDynamicSharedMemorySize"]  = {"ascify::cudaFuncAttributeMaxDynamicSharedMemorySize", CONV_DEFINE, API_RUNTIME, SEC::DEVICE_MGMT};
   // Memory copy enums
   m["cudaMemcpyHostToDevice"]    = {"ACL_MEMCPY_HOST_TO_DEVICE",        CONV_DEFINE, API_RUNTIME, SEC::MEMORY};
   m["cudaMemcpyDeviceToHost"]    = {"ACL_MEMCPY_DEVICE_TO_HOST",        CONV_DEFINE, API_RUNTIME, SEC::MEMORY};

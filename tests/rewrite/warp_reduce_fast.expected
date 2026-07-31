@@ -1,0 +1,23 @@
+# dav-c310-vec + fast: the three concrete canonical add loops use hardware.
++#include <ascify/ascify_cuda_compat.hpp>
++__aicore__ float CanonicalFloatAdd(float value) {
++__aicore__ int CanonicalIntAdd(int value) {
++__aicore__ unsigned int CanonicalUintAdd(unsigned int value) {
++value = ascify::warp_reduce_add(value);
+
+# All conservative negative cases retain the translated shuffle helper.
++__aicore__ float KeepSubwarpAdd(float value) {
++ascify::shfl_xor_sync(0xffffffffu, value, offset, 16)
++__aicore__ float KeepPartialMaskAdd(float value) {
++ascify::shfl_xor_sync(0x0000ffffu, value, offset, 32)
++__aicore__ float KeepNonCanonicalStepAdd(float value) {
++__aicore__ float KeepVolatileOffsetAdd(float value) {
++__aicore__ int KeepAccumulatorIsOffset() {
++__aicore__ float KeepQualifiedSameNameWrapper(float value) {
++__aicore__ float KeepUnknownFunctor(float value) {
++__aicore__ float KeepNestedCanonicalAdd(float value, bool enabled) {
++__aicore__ double KeepUnsupportedDoubleAdd(double value) {
++__aicore__ T KeepTemplateAdd(T value) {
+
+-__shfl_xor_sync(
+-#pragma unroll

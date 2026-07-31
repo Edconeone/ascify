@@ -1,0 +1,347 @@
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+#include "kernels/softmax_native_kernel.cce"
+#endif
+#include "oneflow/core/cuda/softmax.cuh"
+#include "common/runner_common.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifndef ASCIFY950_MATH_MODE
+#define ASCIFY950_MATH_MODE "unspecified"
+#endif
+
+namespace sm = oneflow::cuda::softmax;
+namespace b950 = ascify950;
+
+constexpr size_t kSoftmaxGuardBytes = 256;
+constexpr uint8_t kSoftmaxGuardByte = 0xd3;
+constexpr uint8_t kSoftmaxPayloadCanaryByte = 0xff;
+
+static aclError LaunchSoftmax(aclrtStream stream, const half* input, half* output, int64_t rows,
+                              int64_t cols) {
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+  if (rows <= 0 || cols <= 0 || cols > std::numeric_limits<int>::max()) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  return softmax_native_dispatch(stream, input, output, rows,
+                                 static_cast<int>(cols), 0, 0);
+#else
+  sm::DirectLoad<half, float> load(input, cols);
+  sm::DirectStore<float, half> store(output, cols);
+  return sm::DispatchSoftmax<decltype(load), decltype(store), float>(stream, load, store, rows,
+                                                                     cols);
+#endif
+}
+
+static uint64_t CountByteMismatches(const void* lhs, const void* rhs,
+                                    size_t bytes) {
+  const auto* left = static_cast<const uint8_t*>(lhs);
+  const auto* right = static_cast<const uint8_t*>(rhs);
+  uint64_t mismatches = 0;
+  for (size_t i = 0; i < bytes; ++i) {
+    if (left[i] != right[i]) { ++mismatches; }
+  }
+  return mismatches;
+}
+
+static aclError CountDeviceGuardMismatches(
+    b950::DeviceBuffer& buffer, size_t prefix_bytes, size_t payload_bytes,
+    uint8_t expected, uint64_t* mismatch_count) {
+  std::vector<uint8_t> prefix(prefix_bytes);
+  std::vector<uint8_t> suffix(kSoftmaxGuardBytes);
+  aclError error =
+      aclrtMemcpy(prefix.data(), prefix.size(), buffer.Get(), prefix.size(),
+                  ACL_MEMCPY_DEVICE_TO_HOST);
+  if (error == ACL_SUCCESS) {
+    const auto* suffix_source =
+        static_cast<const uint8_t*>(buffer.Get()) + prefix_bytes
+        + payload_bytes;
+    error = aclrtMemcpy(suffix.data(), suffix.size(), suffix_source,
+                        suffix.size(), ACL_MEMCPY_DEVICE_TO_HOST);
+  }
+  if (error != ACL_SUCCESS) { return error; }
+  for (uint8_t value : prefix) {
+    if (value != expected) { ++*mismatch_count; }
+  }
+  for (uint8_t value : suffix) {
+    if (value != expected) { ++*mismatch_count; }
+  }
+  return ACL_SUCCESS;
+}
+
+int main(int argc, char** argv) {
+  const std::string shapes_path =
+      b950::GetArg(argc, argv, "--shapes", "shapes/correctness.csv");
+  const std::string output_path =
+      b950::GetArg(argc, argv, "--out", "accuracy_history.csv");
+  const std::string run_id = b950::GetArg(argc, argv, "--run-id", "manual");
+  const std::string requested_tier = b950::GetArg(argc, argv, "--tier", "smoke");
+  const int device_id = std::atoi(b950::GetArg(argc, argv, "--device", "0"));
+  const uint64_t seed =
+      std::strtoull(b950::GetArg(argc, argv, "--seed", "0x9505a17"), nullptr, 0);
+  const size_t max_elements = static_cast<size_t>(
+      std::strtoull(b950::GetArg(argc, argv, "--max-elements", "4000000"), nullptr, 10));
+  const double abs_tolerance =
+      std::strtod(b950::GetArg(argc, argv, "--abs-tol", "5e-4"), nullptr);
+  const double scaled_rel_tolerance =
+      std::strtod(b950::GetArg(argc, argv, "--scaled-rel-tol", "2e-3"), nullptr);
+  const double row_sum_tolerance =
+      std::strtod(b950::GetArg(argc, argv, "--row-sum-tol", "2e-3"), nullptr);
+
+  const std::vector<b950::Case> cases = b950::ReadCases(shapes_path);
+  b950::AccuracyCsvWriter csv(output_path);
+  b950::AclSession session;
+  const aclError init_error = session.Init(device_id);
+  if (init_error != ACL_SUCCESS) {
+    std::fprintf(stderr, "%s\n", b950::AclErrorReason("ACL session initialization", init_error).c_str());
+    return 1;
+  }
+
+  int selected = 0;
+  int passed = 0;
+  int failed = 0;
+  int skipped = 0;
+  for (const b950::Case& test_case : cases) {
+    if (test_case.op != "softmax" || test_case.dtype != "fp16" || !test_case.run_check
+        || !b950::TierEnabled(test_case.tier, requested_tier)) {
+      continue;
+    }
+    ++selected;
+    b950::AccuracyRecord record;
+    record.run_id = run_id;
+    record.op = "softmax";
+    record.dtype = "fp16";
+    record.math_mode = ASCIFY950_MATH_MODE;
+#ifdef ASCIFY950_USE_TUNED_SOFTMAX
+#ifdef ASCIFY950_USE_BLOCK_SOFTMAX
+    record.variant = "native_half2_hybrid";
+#else
+    record.variant = "native_half2_compact";
+#endif
+#else
+    record.variant = "converted_dispatch";
+#endif
+    record.test_case = test_case;
+    record.device_id = device_id;
+
+    size_t elements = 0;
+    size_t bytes = 0;
+    std::string size_reason;
+    if (!b950::CheckedTensorSize(test_case.rows, test_case.cols, sizeof(uint16_t), &elements,
+                                 &bytes, &size_reason)) {
+      record.status = "error";
+      record.reason = size_reason;
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    if (elements > max_elements) {
+      record.status = "skip";
+      record.reason = "correctness case exceeds --max-elements";
+      csv.Write(record);
+      ++skipped;
+      continue;
+    }
+
+    const b950::InputPatternCode pattern = b950::PatternCode(test_case.input_pattern);
+    const uint64_t case_seed = seed ^ static_cast<uint64_t>(test_case.idx + 1);
+    std::vector<uint16_t> host_input(elements);
+    std::vector<uint16_t> host_input_after(elements);
+    std::vector<uint16_t> host_output(elements);
+    std::vector<float> quantized_input(elements);
+    for (size_t linear = 0; linear < elements; ++linear) {
+      const int64_t row = static_cast<int64_t>(linear / static_cast<size_t>(test_case.cols));
+      const int64_t col =
+          static_cast<int64_t>(linear - static_cast<size_t>(row) * test_case.cols);
+      const float value =
+          b950::HostInputValue(pattern, linear, row, col, test_case.cols, case_seed);
+      host_input[linear] = b950::FloatToHalfBits(value);
+      quantized_input[linear] = b950::HalfBitsToFloat(host_input[linear]);
+    }
+
+    b950::DeviceBuffer device_input;
+    b950::DeviceBuffer device_output;
+    const size_t base_offset =
+        test_case.scenario == "misaligned_base" ? sizeof(half) : 0;
+    if (base_offset > std::numeric_limits<size_t>::max()
+                          - kSoftmaxGuardBytes
+        || bytes > std::numeric_limits<size_t>::max()
+                        - (kSoftmaxGuardBytes + base_offset)
+                        - kSoftmaxGuardBytes) {
+      record.status = "error";
+      record.reason = "guarded allocation byte count overflows size_t";
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    const size_t prefix_bytes = kSoftmaxGuardBytes + base_offset;
+    const size_t allocation_bytes =
+        prefix_bytes + bytes + kSoftmaxGuardBytes;
+    aclError error = device_input.Allocate(allocation_bytes);
+    if (error == ACL_SUCCESS) {
+      error = device_output.Allocate(allocation_bytes);
+    }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("aclrtMalloc", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    auto* input_data =
+        static_cast<uint8_t*>(device_input.Get()) + prefix_bytes;
+    auto* output_data =
+        static_cast<uint8_t*>(device_output.Get()) + prefix_bytes;
+    error = aclrtMemset(device_input.Get(), allocation_bytes,
+                        static_cast<int32_t>(kSoftmaxGuardByte),
+                        allocation_bytes);
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemset(device_output.Get(), allocation_bytes,
+                          static_cast<int32_t>(kSoftmaxGuardByte),
+                          allocation_bytes);
+    }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemcpy(input_data, bytes, host_input.data(), bytes,
+                          ACL_MEMCPY_HOST_TO_DEVICE);
+    }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemset(output_data, bytes,
+                          static_cast<int32_t>(kSoftmaxPayloadCanaryByte),
+                          bytes);
+    }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason = b950::AclErrorReason("input/output initialization", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+
+    error = LaunchSoftmax(session.Stream(),
+                          reinterpret_cast<const half*>(input_data),
+                          reinterpret_cast<half*>(output_data), test_case.rows,
+                          test_case.cols);
+    if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(session.Stream()); }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemcpy(host_output.data(), bytes, output_data, bytes,
+                          ACL_MEMCPY_DEVICE_TO_HOST);
+    }
+    if (error == ACL_SUCCESS) {
+      error = aclrtMemcpy(host_input_after.data(), bytes, input_data, bytes,
+                          ACL_MEMCPY_DEVICE_TO_HOST);
+    }
+    uint64_t guard_mismatches = 0;
+    if (error == ACL_SUCCESS) {
+      error = CountDeviceGuardMismatches(
+          device_input, prefix_bytes, bytes, kSoftmaxGuardByte,
+          &guard_mismatches);
+    }
+    if (error == ACL_SUCCESS) {
+      error = CountDeviceGuardMismatches(
+          device_output, prefix_bytes, bytes, kSoftmaxGuardByte,
+          &guard_mismatches);
+    }
+    if (error != ACL_SUCCESS) {
+      record.status = "error";
+      record.reason =
+          b950::AclErrorReason("softmax launch, payload, or guard copy", error);
+      csv.Write(record);
+      ++failed;
+      continue;
+    }
+    uint64_t canary_mismatches =
+        CountByteMismatches(host_input.data(), host_input_after.data(), bytes);
+    constexpr uint16_t output_canary =
+        static_cast<uint16_t>(kSoftmaxPayloadCanaryByte)
+        | (static_cast<uint16_t>(kSoftmaxPayloadCanaryByte) << 8);
+    for (uint16_t value : host_output) {
+      if (value == output_canary) { ++canary_mismatches; }
+    }
+
+    std::vector<double> exponentials(static_cast<size_t>(test_case.cols));
+    double max_abs_error = 0.0;
+    double max_scaled_rel_error = 0.0;
+    double max_row_sum_error = 0.0;
+    uint64_t nonfinite_count = 0;
+    for (int64_t row = 0; row < test_case.rows; ++row) {
+      const size_t row_offset = static_cast<size_t>(row) * test_case.cols;
+      double row_max = -std::numeric_limits<double>::infinity();
+      for (int64_t col = 0; col < test_case.cols; ++col) {
+        row_max = std::max(row_max, static_cast<double>(quantized_input[row_offset + col]));
+      }
+      double denominator = 0.0;
+      for (int64_t col = 0; col < test_case.cols; ++col) {
+        const double value =
+            std::exp(static_cast<double>(quantized_input[row_offset + col]) - row_max);
+        exponentials[static_cast<size_t>(col)] = value;
+        denominator += value;
+      }
+      double output_sum = 0.0;
+      for (int64_t col = 0; col < test_case.cols; ++col) {
+        const double reference = exponentials[static_cast<size_t>(col)] / denominator;
+        const double actual = b950::HalfBitsToFloat(host_output[row_offset + col]);
+        if (!std::isfinite(actual)) {
+          ++nonfinite_count;
+          continue;
+        }
+        output_sum += actual;
+        const double absolute_error = std::fabs(actual - reference);
+        const double scaled_relative_error =
+            absolute_error / std::max(std::fabs(reference), 1.0e-3);
+        max_abs_error = std::max(max_abs_error, absolute_error);
+        max_scaled_rel_error = std::max(max_scaled_rel_error, scaled_relative_error);
+      }
+      max_row_sum_error = std::max(max_row_sum_error, std::fabs(output_sum - 1.0));
+    }
+
+    record.max_abs_error = max_abs_error;
+    record.max_scaled_rel_error = max_scaled_rel_error;
+    record.max_row_sum_error = max_row_sum_error;
+    record.nonfinite_count = nonfinite_count;
+    record.guard_mismatch_count = guard_mismatches;
+    record.canary_mismatch_count = canary_mismatches;
+    if (nonfinite_count == 0 && max_abs_error <= abs_tolerance
+        && max_scaled_rel_error <= scaled_rel_tolerance
+        && max_row_sum_error <= row_sum_tolerance
+        && guard_mismatches == 0 && canary_mismatches == 0) {
+      record.status = "pass";
+      ++passed;
+    } else {
+      std::ostringstream reason;
+      reason << "tolerance failure: abs<=" << abs_tolerance
+             << " scaled_rel<=" << scaled_rel_tolerance
+             << " row_sum<=" << row_sum_tolerance
+             << " guard=0 canary=0";
+      record.status = "fail";
+      record.reason = reason.str();
+      ++failed;
+    }
+    csv.Write(record);
+    std::fprintf(stderr,
+                 "[%s] rows=%lld cols=%lld abs=%.3e scaled_rel=%.3e sum=%.3e "
+                 "nonfinite=%llu guard=%llu canary=%llu\n",
+                 record.status.c_str(), static_cast<long long>(test_case.rows),
+                 static_cast<long long>(test_case.cols), max_abs_error,
+                 max_scaled_rel_error, max_row_sum_error,
+                 static_cast<unsigned long long>(nonfinite_count),
+                 static_cast<unsigned long long>(guard_mismatches),
+                 static_cast<unsigned long long>(canary_mismatches));
+  }
+
+  std::fprintf(stderr, "softmax correctness: selected=%d pass=%d fail=%d skip=%d\n", selected,
+               passed, failed, skipped);
+  if (selected == 0) { return 3; }
+  if (passed == 0) {
+    std::fprintf(stderr, "softmax correctness did not execute any passing case\n");
+    return 3;
+  }
+  return failed == 0 ? 0 : 2;
+}

@@ -1,0 +1,11 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+rn_h2b001,1200,rms_norm,fp16,smoke,1,0,1,4096,block_half2,constant,block_smem,1,1e-5,single_row_4096
+rn_h2b002,1201,rms_norm,fp16,smoke,1,0,3,8192,block_half2,wide,block_smem,1,1e-6,odd_rows_8192
+rn_h2b003,1202,rms_norm,fp16,smoke,1,0,55,4096,block_half2,ramp,block_smem,1,1e-5,aiv_minus1
+rn_h2b004,1203,rms_norm,fp16,smoke,1,0,56,8192,block_half2,random,block_smem,1,1e-5,one_row_per_aiv
+rn_h2b005,1204,rms_norm,fp16,smoke,1,0,57,4096,block_half2,wide,block_smem,1,1e-6,aiv_plus1
+rn_h2b006,1205,rms_norm,fp16,smoke,1,0,127,8192,block_half2,random,block_smem,1,1e-5,route_rows_minus1
+rn_h2b007,1206,rms_norm,fp16,smoke,1,0,128,4096,block_half2,dominant,block_smem,1,1e-5,route_rows_control
+rn_h2b008,1207,rms_norm,fp16,smoke,1,0,255,8192,block_half2,ramp,block_smem,1,1e-5,block_route_max_minus1
+rn_h2b009,1208,rms_norm,fp16,smoke,1,0,256,4096,block_half2,random,block_smem,1,1e-5,block_route_max
+rn_h2b010,1209,rms_norm,fp16,smoke,1,0,257,8192,block_half2,wide,warp,1,1e-5,block_route_fallback

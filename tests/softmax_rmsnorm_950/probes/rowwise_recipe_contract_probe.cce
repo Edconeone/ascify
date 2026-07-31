@@ -1,0 +1,89 @@
+// Host runtime contract probe for dav-c310 row-wise recipe dispatch.
+//
+// Exact-float adapter calls with a null stream must remain a recoverable
+// NotHandled result without launching a kernel. Dispatcher/adapter compute
+// mismatches are isolated by the compile-only trait probe instead: a null
+// runtime precondition would mask a broken compute-type guard.
+#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+
+namespace {
+
+namespace target = ::ascify::target::dav_c310;
+
+struct DirectLoad {
+  using ascify_target_direct_load_tag = void;
+  using ascify_target_adapter_owner_type = DirectLoad;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+
+  const half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  const half* data;
+  int64_t stride;
+};
+
+struct DirectStore {
+  using ascify_target_direct_store_tag = void;
+  using ascify_target_adapter_owner_type = DirectStore;
+  using ascify_target_storage_type = half;
+  using ascify_target_compute_type = float;
+  static constexpr bool ascify_target_store_is_affine = false;
+
+  half* ascify_target_data() const { return data; }
+  int64_t ascify_target_row_stride() const { return stride; }
+
+  half* data;
+  int64_t stride;
+};
+
+bool ExpectNotHandled(const char* name, target::TryResult result) {
+  if (!result.handled && result.status == ACL_SUCCESS) {
+    return true;
+  }
+  std::fprintf(
+      stderr, "%s: expected NotHandled/ACL_SUCCESS, got handled=%d status=%d\n",
+      name, static_cast<int>(result.handled), static_cast<int>(result.status));
+  return false;
+}
+
+}  // namespace
+
+int main() {
+  constexpr int64_t kRows = 2;
+  constexpr int64_t kColumns = 64;
+  constexpr int64_t kFirstNarrowedRmsRow =
+      static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
+  const DirectLoad load{nullptr, kColumns};
+  const DirectStore store{nullptr, kColumns};
+  float* inverse_rms = nullptr;
+  bool passed = true;
+
+  if (target::v1::contract_detail::RmsNormDimensionsFitOriginalKernel(
+          kFirstNarrowedRmsRow, 1)) {
+    std::fputs(
+        "rms_range: intercepted rows narrowed by the original CUDA kernel\n",
+        stderr);
+    passed = false;
+  }
+  passed &= ExpectNotHandled(
+      "softmax_float_null_stream",
+      target::TrySoftmax(
+          nullptr, load, store, kRows, kColumns,
+          static_cast<float*>(nullptr)));
+  passed &= ExpectNotHandled(
+      "rms_float_null_stream",
+      target::TryRmsNorm(
+          nullptr, load, store, kRows, kColumns, 1.0e-5, inverse_rms,
+          static_cast<float*>(nullptr)));
+
+  if (!passed) {
+    return 1;
+  }
+  std::puts("rowwise recipe null-precondition contract: pass");
+  return 0;
+}

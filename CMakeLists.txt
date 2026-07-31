@@ -4,14 +4,12 @@ project(ascify-clang)
 
 include(GNUInstallDirs)
 
-option(ASCIFY_CLANG_TESTS "Build ASCIFY tests, if lit is installed" OFF)
-option(ASCIFY_CLANG_TESTS_ONLY "Build ASCIFY tests only, if lit is installed and ascify-clang binary is already produced" OFF)
+option(ASCIFY_CLANG_TESTS
+  "Build ascify-clang and register the release checks" OFF)
+option(ASCIFY_CLANG_TESTS_ONLY
+  "Register release checks without building ascify-clang" OFF)
 option(ASCIFY_INCLUDE_IN_ASCIFY_SDK "Include ASCIFY in ASCIFY SDK" OFF)
 option(ASCIFY_INSTALL_CLANG_HEADERS "Include clang headers in ASCIFY installation" ON)
-
-if(NOT WIN32)
-  set(CPACK_SET_DESTDIR ON CACHE BOOL "Installer package will install ascify-clang to CMAKE_INSTALL_PREFIX instead of CPACK_PACKAGING_INSTALL_PREFIX")
-endif()
 
 if(ASCIFY_CLANG_TESTS OR ASCIFY_CLANG_TESTS_ONLY)
   set(ASCIFY_TEST "ON")
@@ -31,25 +29,27 @@ message(STATUS "   - Test ascify-clang     : ${ASCIFY_TEST}")
 message(STATUS "   - Is part of ASCIFY SDK    : ${ASCIFY_INCLUDE_IN_ASCIFY_SDK}")
 message(STATUS "   - Install clang headers : ${ASCIFY_INSTALL_CLANG_HEADERS}")
 
-if(ASCIFY_INCLUDE_IN_ASCIFY_SDK)
-  if(NOT WIN32)
-    message(FATAL_ERROR "ASCIFY_INCLUDE_IN_ASCIFY_SDK is only supported on Windows")
-  elseif(CMAKE_GENERATOR MATCHES "Visual Studio")
-    message(FATAL_ERROR "ASCIFY_INCLUDE_IN_ASCIFY_SDK is not targeting Visual Studio")
+if(NOT ASCIFY_CLANG_TESTS_ONLY)
+  if(ASCIFY_INCLUDE_IN_ASCIFY_SDK)
+    if(NOT WIN32)
+      message(FATAL_ERROR "ASCIFY_INCLUDE_IN_ASCIFY_SDK is only supported on Windows")
+    elseif(CMAKE_GENERATOR MATCHES "Visual Studio")
+      message(FATAL_ERROR "ASCIFY_INCLUDE_IN_ASCIFY_SDK is not targeting Visual Studio")
+    endif()
+  else()
+    find_package(Clang REQUIRED CONFIG PATHS ${CMAKE_PREFIX_PATH})
+    find_package(LLVM REQUIRED CONFIG PATHS ${CMAKE_PREFIX_PATH})
+
+    message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}:")
+    message(STATUS "   - CMake module path     : ${LLVM_CMAKE_DIR}")
+    message(STATUS "   - Clang include path    : ${CLANG_INCLUDE_DIRS}")
+    message(STATUS "   - LLVM Include path     : ${LLVM_INCLUDE_DIRS}")
+    message(STATUS "   - Binary path           : ${LLVM_TOOLS_BINARY_DIR}")
   endif()
-else()
-  find_package(Clang REQUIRED CONFIG PATHS ${CMAKE_PREFIX_PATH})
-  find_package(LLVM REQUIRED CONFIG PATHS ${CMAKE_PREFIX_PATH})
 
-  message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}:")
-  message(STATUS "   - CMake module path     : ${LLVM_CMAKE_DIR}")
-  message(STATUS "   - Clang include path    : ${CLANG_INCLUDE_DIRS}")
-  message(STATUS "   - LLVM Include path     : ${LLVM_INCLUDE_DIRS}")
-  message(STATUS "   - Binary path           : ${LLVM_TOOLS_BINARY_DIR}")
+  list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
+  include(AddLLVM)
 endif()
-
-list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
-include(AddLLVM)
 
 if (NOT ASCIFY_CLANG_TESTS_ONLY)
   if(MSVC AND MSVC_VERSION VERSION_LESS "1900")
@@ -199,6 +199,15 @@ if (NOT ASCIFY_CLANG_TESTS_ONLY)
 
   install(TARGETS ascify-clang DESTINATION bin)
 
+  install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT ascify-compat-headers)
+
+  install(
+    FILES ${CMAKE_CURRENT_SOURCE_DIR}/acl_cub/aclcub.hpp
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/acl_cub
+    COMPONENT ascify-compat-headers)
 
   # Headers are already included in HIP SDK, so skip those if including ASCIFY in HIP SDK.
   if( ASCIFY_INSTALL_CLANG_HEADERS)
@@ -223,29 +232,13 @@ if (NOT ASCIFY_CLANG_TESTS_ONLY)
   endif()
 
   if(UNIX)
-    # Get rid of any RPATH definations already.
+    # Get rid of any RPATH definitions already.
     set_target_properties(ascify-clang PROPERTIES INSTALL_RPATH "")
-    # Set RPATH for the binary.
-    # For macOS, use this instead:
     if(APPLE)
         set_target_properties(ascify-clang PROPERTIES LINK_FLAGS "-Wl,-rpath,@loader_path/../lib")
     else()
         set_target_properties(ascify-clang PROPERTIES LINK_FLAGS "-Wl,--enable-new-dtags -Wl,--rpath,\\$ORIGIN/../lib")
     endif()
-
-    # set(BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/packages/ascify-clang)
-
-    # configure_file(packaging/ascify-clang.txt ${BUILD_DIR}/CMakeLists.txt @ONLY)
-    # configure_file(${CMAKE_SOURCE_DIR}/LICENSE.txt ${BUILD_DIR}/LICENSE.txt @ONLY)
-
-    add_custom_target(package_ascify-clang COMMAND ${CMAKE_COMMAND} .
-      WORKING_DIRECTORY ${PROJECT_BINARY_DIR}
-      COMMAND rm -rf *.deb *.rpm *.tar.gz
-      COMMAND make package
-      COMMAND cp *.deb ${PROJECT_BINARY_DIR}
-      COMMAND cp *.rpm ${PROJECT_BINARY_DIR}
-      COMMAND cp *.tar.gz ${PROJECT_BINARY_DIR}
-      WORKING_DIRECTORY ${BUILD_DIR})
   endif()
 
 endif() # if (NOT ASCIFY_CLANG_TESTS_ONLY)
@@ -254,197 +247,75 @@ if(ASCIFY_CLANG_TESTS OR ASCIFY_CLANG_TESTS_ONLY)
 
   message(STATUS "---- The below configuring for ascify-clang testing only ----")
 
-  set (ASCIFY_CLANG_RES "${LLVM_LIBRARY_DIRS}/clang/${LIB_CLANG_RES}")
+  include(CTest)
+  enable_testing()
 
-  if(${CMAKE_VERSION} VERSION_LESS "3.27.0")
-    find_package(PythonInterp 3.0 REQUIRED)
-  else()
-    find_package(Python 3.0...3.15 REQUIRED)
+  find_package(Python3 3.0 REQUIRED COMPONENTS Interpreter)
+  find_program(ASCIFY_TEST_SHELL sh)
+  if(NOT ASCIFY_TEST_SHELL)
+    message(FATAL_ERROR
+      "Can't find a POSIX sh executable required by tests/run_release_checks.sh")
   endif()
 
-  function (require_program PROGRAM_NAME)
-    find_program(FOUND_${PROGRAM_NAME} ${PROGRAM_NAME})
-    if(FOUND_${PROGRAM_NAME})
-       message(STATUS "Found ${PROGRAM_NAME}: ${FOUND_${PROGRAM_NAME}}")
-    else()
-       message(SEND_ERROR "Can't find ${PROGRAM_NAME}. Either set ASCIFY_CLANG_TESTS(_ONLY) to OFF to disable ASCIFY tests, or install the missing program.")
+  set(ASCIFY_TEST_BINARY "" CACHE FILEPATH
+    "Existing ascify-clang binary used with ASCIFY_CLANG_TESTS_ONLY")
+  set(ASCIFY_TEST_CUDA_PATH "" CACHE PATH
+    "CUDA parsing root used by translated-fixture release checks")
+  set(ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY "" CACHE PATH
+    "Clang resource directory used by translated-fixture release checks")
+
+  if(NOT ASCIFY_CLANG_TESTS_ONLY AND
+     ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY STREQUAL "")
+    set(ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY
+      "${LLVM_LIBRARY_DIRS}/clang/${LIB_CLANG_RES}")
+  endif()
+
+  set(ASCIFY_RELEASE_CHECK_ENV
+    "PYTHON=${Python3_EXECUTABLE}")
+  if(ASCIFY_CLANG_TESTS_ONLY AND NOT ASCIFY_TEST_BINARY STREQUAL "")
+    if(ASCIFY_TEST_CUDA_PATH STREQUAL "" OR
+       ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY STREQUAL "")
+      message(FATAL_ERROR
+        "ASCIFY_TEST_BINARY requires ASCIFY_TEST_CUDA_PATH and "
+        "ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY")
     endif()
-  endfunction()
-
-  require_program(lit)
-  require_program(FileCheck)
-
-  set(CUDA_TOOLKIT_ROOT_DIR "" CACHE PATH "Path to CUDA Toolkit to use in ascify-clang unit testing")
-  set(CUDA_SDK_ROOT_DIR     "" CACHE PATH "Path to CUDA Toolkit Samples")
-  set(CUDA_DNN_ROOT_DIR     "" CACHE PATH "Path to cuDNN")
-  set(CUDA_TENSOR_ROOT_DIR  "" CACHE PATH "Path to cuTENSOR")
-  set(CUDA_CUB_ROOT_DIR     "" CACHE PATH "Path to CUB")
-  set(CUDA_FILE_ROOT_DIR    "" CACHE PATH "Path to cuFile")
-
-  if(NOT CUDA_TOOLKIT_ROOT_DIR STREQUAL "" AND NOT CUDA_TOOLKIT_ROOT_DIR MATCHES "OFF")
-    if(NOT DEFINED CUDAToolkit_ROOT OR CUDAToolkit_ROOT MATCHES "OFF")
-      set(CUDAToolkit_ROOT "${CUDA_TOOLKIT_ROOT_DIR}")
-    endif()
-  else()
-    if(DEFINED CUDAToolkit_ROOT AND NOT CUDAToolkit_ROOT MATCHES "OFF")
-      set(CUDA_TOOLKIT_ROOT_DIR "${CUDAToolkit_ROOT}")
-    endif()
+    list(APPEND ASCIFY_RELEASE_CHECK_ENV
+      "ASCIFY_BINARY=${ASCIFY_TEST_BINARY}")
+  elseif(NOT ASCIFY_CLANG_TESTS_ONLY AND
+         NOT ASCIFY_TEST_CUDA_PATH STREQUAL "")
+    list(APPEND ASCIFY_RELEASE_CHECK_ENV
+      "ASCIFY_BINARY=$<TARGET_FILE:ascify-clang>")
+  endif()
+  if(NOT ASCIFY_TEST_CUDA_PATH STREQUAL "")
+    list(APPEND ASCIFY_RELEASE_CHECK_ENV
+      "ASCIFY_CUDA_PATH=${ASCIFY_TEST_CUDA_PATH}")
+  endif()
+  if(NOT ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY STREQUAL "")
+    list(APPEND ASCIFY_RELEASE_CHECK_ENV
+      "ASCIFY_CLANG_RESOURCE_DIRECTORY=${ASCIFY_TEST_CLANG_RESOURCE_DIRECTORY}")
   endif()
 
-  message(STATUS "Initial CUDA to configure:")
-  message(STATUS "   - CUDA Toolkit path     : ${CUDA_TOOLKIT_ROOT_DIR}")
-  message(STATUS "   - CUDA Samples path     : ${CUDA_SDK_ROOT_DIR}")
-  message(STATUS "   - cuDNN path            : ${CUDA_DNN_ROOT_DIR}")
-  message(STATUS "   - cuTENSOR path         : ${CUDA_TENSOR_ROOT_DIR}")
-  message(STATUS "   - CUB path              : ${CUDA_CUB_ROOT_DIR}")
-  message(STATUS "   - cuFile path           : ${CUDA_FILE_ROOT_DIR}")
+  add_test(
+    NAME ascify-release-checks
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${ASCIFY_RELEASE_CHECK_ENV}
+      ${ASCIFY_TEST_SHELL}
+      ${CMAKE_CURRENT_LIST_DIR}/tests/run_release_checks.sh)
+  set_tests_properties(ascify-release-checks PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR})
 
-  if(${CMAKE_VERSION} VERSION_LESS "3.27.0")
-    find_package(CUDA REQUIRED)
-    set(CUDA_VERSION_FULL     "${CUDA_VERSION}")
-  else()
-    find_package(CUDAToolkit REQUIRED)
-    set(CUDA_VERSION_MAJOR    "${CUDAToolkit_VERSION_MAJOR}")
-    set(CUDA_VERSION_MINOR    "${CUDAToolkit_VERSION_MINOR}")
-    set(CUDA_VERSION_PATCH    "${CUDAToolkit_VERSION_PATCH}")
-    set(CUDA_VERSION_FULL     "${CUDAToolkit_VERSION}")
-    set(CUDA_VERSION          "${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}")
-    set(CUDA_TOOLKIT_ROOT_DIR "${CUDAToolkit_LIBRARY_ROOT}")
-  endif()
-
-  if(CUDA_SDK_ROOT_DIR STREQUAL "")
-    if(WIN32)
-      if(CUDA_VERSION VERSION_LESS "11.6")
-        set(NVCUDASAMPLES "NVCUDASAMPLES${CUDA_VERSION_MAJOR}_${CUDA_VERSION_MINOR}_ROOT")
-        if(DEFINED ENV{${NVCUDASAMPLES}})
-          set(CUDA_SDK_ROOT_DIR "$ENV{${NVCUDASAMPLES}}")
-          string(REPLACE "\\" "/" CUDA_SDK_ROOT_DIR ${CUDA_SDK_ROOT_DIR})
-        endif()
-      endif()
-    elseif(UNIX)
-      if(NOT CUDA_TOOLKIT_ROOT_DIR STREQUAL "" AND NOT CUDA_TOOLKIT_ROOT_DIR STREQUAL "OFF" AND CUDA_VERSION VERSION_LESS "10.1")
-        set(CUDA_SDK_ROOT_DIR "${CUDA_TOOLKIT_ROOT_DIR}/samples")
-      endif()
-    endif()
-  endif()
-  if(CUDA_SDK_ROOT_DIR STREQUAL "")
-    set(CUDA_SDK_ROOT_DIR OFF)
-  endif()
-
-  if(CUDA_DNN_ROOT_DIR STREQUAL "")
-    set(CUDA_DNN_ROOT_DIR OFF)
-  else()
-    set(CUDNN_VERSION_FILE_NAMES
-        cudnn_version.h
-        cudnn_version_v9.h
-        cudnn_version_v999.h
-    )
-    unset(CUDNN_VERSION_FILE CACHE)
-    find_file(CUDNN_VERSION_FILE NAMES ${CUDNN_VERSION_FILE_NAMES} PATHS ${CUDA_DNN_ROOT_DIR} NO_DEFAULT_PATH)
-    if(NOT DEFINED CUDNN_VERSION_FILE OR CUDNN_VERSION_FILE STREQUAL "CUDNN_VERSION_FILE-NOTFOUND")
-      unset(CUDNN_VERSION_FILE CACHE)
-      find_file(CUDNN_VERSION_FILE NAMES ${CUDNN_VERSION_FILE_NAMES} PATHS ${CUDA_DNN_ROOT_DIR}/include NO_DEFAULT_PATH)
-      if(DEFINED CUDNN_VERSION_FILE)
-        set(CUDA_DNN_ROOT_DIR "${CUDA_DNN_ROOT_DIR}/include")
-      endif()
-    endif()
-  endif()
-
-  if(CUDA_TENSOR_ROOT_DIR STREQUAL "")
-    set(CUDA_TENSOR_ROOT_DIR OFF)
-  else()
-    unset(CUDA_TENSOR_FILE CACHE)
-    find_file(CUDA_TENSOR_FILE NAMES cutensor.h PATHS ${CUDA_TENSOR_ROOT_DIR} NO_DEFAULT_PATH)
-    if(NOT DEFINED CUDA_TENSOR_FILE OR CUDA_TENSOR_FILE STREQUAL "CUDA_TENSOR_FILE-NOTFOUND")
-      unset(CUDA_TENSOR_FILE CACHE)
-      find_file(CUDA_TENSOR_FILE NAMES cutensor.h PATHS ${CUDA_TENSOR_ROOT_DIR}/include NO_DEFAULT_PATH)
-      if(DEFINED CUDA_TENSOR_FILE)
-        set(CUDA_TENSOR_ROOT_DIR "${CUDA_TENSOR_ROOT_DIR}/include")
-      endif()
-    endif()
-  endif()
-
-  if(CUDA_CUB_ROOT_DIR STREQUAL "")
-    if(CUDA_VERSION VERSION_GREATER_EQUAL "11.0")
-      if(WIN32 OR (UNIX AND CUDA_VERSION VERSION_LESS "11.4" OR CUDA_VERSION VERSION_GREATER_EQUAL "11.6"))
-        if (CUDA_VERSION VERSION_GREATER_EQUAL "13.0")
-          set(CUDA_CUB_ROOT_DIR "${CUDA_TOOLKIT_ROOT_DIR}/include/cccl")
-        else()
-          set(CUDA_CUB_ROOT_DIR "${CUDA_TOOLKIT_ROOT_DIR}/include")
-        endif()
-      else()
-        set(CUDA_CUB_ROOT_DIR OFF)
-      endif()
-    else()
-      set(CUDA_CUB_ROOT_DIR OFF)
-    endif()
-  endif()
-
-  if(CUDA_FILE_ROOT_DIR STREQUAL "")
-    set(CUDA_FILE_ROOT_DIR OFF)
-  else()
-    set(CUDA_FILE_ROOT_DIR "${CUDA_FILE_ROOT_DIR}/include")
-  endif()
-
-  message(STATUS "Found CUDA config:")
-  message(STATUS "   - CUDA Toolkit path     : ${CUDA_TOOLKIT_ROOT_DIR}")
-  message(STATUS "   - CUDA Samples path     : ${CUDA_SDK_ROOT_DIR}")
-  message(STATUS "   - cuDNN path            : ${CUDA_DNN_ROOT_DIR}")
-  message(STATUS "   - cuTENSOR path         : ${CUDA_TENSOR_ROOT_DIR}")
-  message(STATUS "   - CUB path              : ${CUDA_CUB_ROOT_DIR}")
-  message(STATUS "   - cuFile path           : ${CUDA_FILE_ROOT_DIR}")
-
-  if((CUDA_VERSION VERSION_LESS "7.0") OR (LLVM_PACKAGE_VERSION VERSION_LESS "3.8") OR
-     (CUDA_VERSION VERSION_GREATER "7.5" AND LLVM_PACKAGE_VERSION VERSION_LESS "4.0") OR
-     (CUDA_VERSION VERSION_GREATER "8.0" AND LLVM_PACKAGE_VERSION VERSION_LESS "6.0") OR
-     (CUDA_VERSION VERSION_GREATER "9.0" AND LLVM_PACKAGE_VERSION VERSION_LESS "7.0") OR
-     (CUDA_VERSION VERSION_GREATER "9.2" AND LLVM_PACKAGE_VERSION VERSION_LESS "8.0") OR
-     (CUDA_VERSION VERSION_GREATER "10.0" AND LLVM_PACKAGE_VERSION VERSION_LESS "9.0") OR
-     (CUDA_VERSION VERSION_GREATER "10.1" AND LLVM_PACKAGE_VERSION VERSION_LESS "10.0"))
-    message(SEND_ERROR "CUDA ${CUDA_VERSION} is not supported by LLVM ${LLVM_PACKAGE_VERSION}.")
-    if(CUDA_VERSION_MAJOR VERSION_LESS "7")
-      message(STATUS "Please install CUDA 7.0 or higher.")
-    elseif(CUDA_VERSION_MAJOR VERSION_LESS "8")
-      message(STATUS "Please install LLVM + clang 3.8 or higher.")
-    elseif(CUDA_VERSION_MAJOR VERSION_LESS "9")
-      message(STATUS "Please install LLVM + clang 4.0 or higher.")
-    elseif(CUDA_VERSION VERSION_EQUAL "9.0")
-      message(STATUS "Please install LLVM + clang 6.0 or higher.")
-    elseif(CUDA_VERSION_MAJOR VERSION_LESS "10")
-      message(STATUS "Please install LLVM + clang 7.0 or higher.")
-    elseif(CUDA_VERSION VERSION_EQUAL "10.0")
-      message(STATUS "Please install LLVM + clang 8.0 or higher.")
-    elseif(CUDA_VERSION VERSION_EQUAL "10.1")
-      message(STATUS "Please install LLVM + clang 9.0 or higher.")
-    elseif(CUDA_VERSION VERSION_EQUAL "10.2" OR CUDA_VERSION VERSION_EQUAL "11.0")
-      message(STATUS "Please install LLVM + clang 10.0 or higher.")
-    endif()
-  endif()
-
-  configure_file(
-    ${CMAKE_CURRENT_LIST_DIR}/tests/lit.site.cfg.in
-    ${CMAKE_CURRENT_BINARY_DIR}/tests/lit.site.cfg
-    @ONLY)
-
-  if(NOT LIT_ARGS)
-    set(LIT_ARGS -v)
-  endif()
-
-  if(ASCIFY_CLANG_TESTS_ONLY)
-    add_lit_testsuite(test-ascify "Running ASCIFY regression tests"
-      ${CMAKE_CURRENT_LIST_DIR}/tests
-      PARAMS site_config=${CMAKE_CURRENT_BINARY_DIR}/tests/lit.site.cfg
-      ARGS ${LIT_ARGS})
-  else()
-    add_lit_testsuite(test-ascify "Running ASCIFY regression tests"
-      ${CMAKE_CURRENT_LIST_DIR}/tests
-      PARAMS site_config=${CMAKE_CURRENT_BINARY_DIR}/tests/lit.site.cfg
-      ARGS ${LIT_ARGS}
-      DEPENDS ascify-clang)
+  add_custom_target(test-ascify
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+      -R "^ascify-release-checks$"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    USES_TERMINAL)
+  if(NOT ASCIFY_CLANG_TESTS_ONLY)
+    add_dependencies(test-ascify ascify-clang)
   endif()
 
   add_custom_target(test-ascify-clang)
   add_dependencies(test-ascify-clang test-ascify)
-  set_target_properties(test-ascify-clang PROPERTIES FOLDER "Tests")
+  set_target_properties(test-ascify test-ascify-clang PROPERTIES
+    FOLDER "Tests")
 
 endif() # if(ASCIFY_CLANG_TESTS OR ASCIFY_CLANG_TESTS_ONLY)

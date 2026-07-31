@@ -61,22 +61,20 @@ void cleanupAscifyOptions(std::vector<const char*> &args) {
     args.erase(std::remove(args.begin(), args.end(), "-" + a), args.end());
   }
   for (const auto &a : ascifyOptionsWithTwoArgs) {
-    // remove all "-option=value" and "--option=value"
-    args.erase(
-      std::remove_if(args.begin(), args.end(),
-        [a](const std::string &s) { return s.find("--" + a + "=") == 0 || s.find("-" + a + "=") == 0; }
-      ),
-      args.end()
-    );
-    // remove all pairs of arguments "--option value" and "-option value"
-    auto it = args.erase(
-      std::remove_if(args.begin(), args.end(),
-        [a](const std::string &s) { return s.find("--" + a) == 0 || s.find("-" + a) == 0; }
-      ),
-      args.end()
-    );
-    if (it != args.end()) {
-        args.erase(it);
+    const std::string longOption = "--" + a;
+    const std::string shortOption = "-" + a;
+    for (auto it = args.begin(); it != args.end();) {
+      const std::string current(*it);
+      if (current == longOption || current == shortOption) {
+        it = args.erase(it);
+        if (it != args.end())
+          it = args.erase(it);
+      } else if (current.find(longOption + "=") == 0 ||
+                 current.find(shortOption + "=") == 0) {
+        it = args.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 }
@@ -306,8 +304,7 @@ bool generatePython() {
 }
 
 void printVersions() {
-  // TODO: add ascend simt support version instead of ROC
-  llvm::errs() << "\n" << sAscify << "Supports ROCm DPP from " << Statistics::getDppVersion(dppVersions::DPP_1050) << " up to " << Statistics::getDppVersion(dppVersions::DPP_LATEST);
+  llvm::errs() << "\n" << sAscify << "Supports DPP compatibility versions from " << Statistics::getDppVersion(dppVersions::DPP_1050) << " up to " << Statistics::getDppVersion(dppVersions::DPP_LATEST);
   llvm::errs() << "\n" << sAscify << "Supports CUDA Toolkit from " << Statistics::getCudaVersion(cudaVersions::CUDA_70) << " up to " << Statistics::getCudaVersion(cudaVersions::CUDA_LATEST);
   llvm::errs() << "\n" << sAscify << "Supports cuDNN from " << Statistics::getCudaVersion(cudaVersions::CUDNN_705) << " up to " << Statistics::getCudaVersion(cudaVersions::CUDNN_LATEST) << " \n";
 }

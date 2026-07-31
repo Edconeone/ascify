@@ -1,0 +1,2 @@
+case_id,idx,op,dtype,tier,run_check,run_bench,rows,cols,scenario,input_pattern,cuda_pred_path,affine,eps,notes
+rn_t005a,1109,rms_norm,fp16,tune,1,1,128,8192,saturation,random,block_smem,1,1e-5,affine_long_row_controlled_memory

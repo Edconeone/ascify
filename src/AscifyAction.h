@@ -23,11 +23,15 @@ THE SOFTWARE.
 #pragma once
 
 #include <deque>
+#include <set>
+#include <vector>
+#include "clang/Basic/SourceLocation.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Tooling/Tooling.h"
 #include "clang/Tooling/Core/Replacement.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "DavC310TargetRecipe.h"
 #include "ReplacementsFrontendActionFactory.h"
 #include "Statistics.h"
 
@@ -41,10 +45,18 @@ using namespace llvm;
 class AscifyAction : public clang::ASTFrontendAction,
                      public mat::MatchFinder::MatchCallback {
 private:
+  struct SemanticRewriteRange {
+    clang::FileID file;
+    unsigned beginOffset;
+    unsigned endOffset;
+  };
+
   ct::Replacements *replacements = nullptr;
   std::map<std::string, clang::SourceLocation> Ifndefs;
   std::vector<clang::SourceRange> SkippedSourceRanges;
+  std::vector<SemanticRewriteRange> SemanticRewriteRanges;
   std::unique_ptr<mat::MatchFinder> Finder;
+  ascify::DavC310TargetRecipe davC310TargetRecipe;
   // CUDA implicitly adds its runtime header. We rewrite explicitly-provided CUDA includes with equivalent
   // ones, and track - using this flag - if the result led to us including the hip runtime header. If it did
   // not, we insert it at the top of the file when we finish processing it.
@@ -62,10 +74,19 @@ private:
   bool insertedSOLVERHeader = false;
   bool insertedFILEHeader = false;
   bool firstHeader = false;
+  bool needsCudaCompatHeader = false;
+  bool hasCudaCompatHeader = false;
+  bool needsDavC310TargetHeader = false;
+  bool hasDavC310TargetHeader = false;
+  bool hasCubCompatHeader = false;
   bool pragmaOnce = false;
   clang::SourceLocation firstHeaderLoc;
+  clang::SourceLocation firstCubCompatHeaderLoc;
   clang::SourceLocation pragmaOnceLoc;
   std::deque<clang::Token> rawTokenWindow;
+  std::set<unsigned> loweredDeviceDoubleParamOffsets;
+  std::set<unsigned> rewrittenWarpAddReductionOffsets;
+  std::set<unsigned> taggedCanonicalReducerOffsets;
   static constexpr std::size_t kRawTokenWindowCap = 128;
   // Rewrite a string literal to refer to hip, not CUDA.
   void RewriteString(StringRef s, clang::SourceLocation start);
@@ -73,6 +94,7 @@ private:
   // Returns true if the raw lexer was advanced past rewritten text; the caller must not
   // call LexFromRawLexer for the current token again.
   bool RewriteToken(clang::Lexer &rawLex, clang::Token &tok);
+  bool isInSemanticRewriteRange(clang::SourceLocation loc);
   // `double *C = (double*)malloc(bytes);` -> `double *C;\naclrtMalloc(C, bytes);`
   bool tryRewriteMallocDeviceAllocDecl(clang::Lexer &lex, clang::Token &tok);
   // Calculate str's SourceLocation in SourceRange sr
@@ -83,6 +105,11 @@ public:
     replacements(replacements) {}
   // MatchCallback listeners
   bool cudaLaunchKernel(const mat::MatchFinder::MatchResult &Result);
+  bool lowerCudaGlobalScalarDoubleParam(const mat::MatchFinder::MatchResult &Result);
+  bool rewriteCanonicalWarpAddReduction(
+      const mat::MatchFinder::MatchResult &Result);
+  bool tagCanonicalBinaryReducer(
+      const mat::MatchFinder::MatchResult &Result);
   bool cudaDeviceFuncCall(const mat::MatchFinder::MatchResult &Result);
   bool cudaHostFuncCall(const mat::MatchFinder::MatchResult &Result);
   bool cudaOverloadedHostFuncCall(const mat::MatchFinder::MatchResult &Result);
@@ -112,7 +139,12 @@ public:
 
 protected:
   // Add a Replacement for the current file. These will all be applied after executing the FrontendAction.
-  void insertReplacement(const ct::Replacement &rep, const clang::FullSourceLoc &fullSL);
+  bool insertReplacement(const ct::Replacement &rep,
+                         const clang::FullSourceLoc &fullSL);
+  bool insertSemanticReplacement(const ct::Replacement &rep,
+                                 const clang::FullSourceLoc &fullSL,
+                                 clang::SourceLocation begin,
+                                 clang::SourceLocation end);
   // FrontendAction entry point.
   void ExecuteAction() override;
   // Callback before starting processing a single input; used by ascify-clang for setting Preprocessor options.

@@ -1,0 +1,23 @@
+# dav-c310-vec + fast: only exact, pure reducer bodies receive semantic tags.
++#include <acl_cub/aclcub.hpp>
++struct CanonicalSumReducer {
++struct CanonicalMaxReducer {
++struct CanonicalMinReducer {
++using ascify_reduction_tag = ::aclcub::Sum;
++using ascify_reduction_tag = ::aclcub::Max;
++using ascify_reduction_tag = ::aclcub::Min;
++using ascify_reduction_value_type = T;
++using ascify_reduction_owner_type = CanonicalSumReducer;
++using ascify_reduction_owner_type = CanonicalMaxReducer;
++using ascify_reduction_owner_type = CanonicalMinReducer;
+
+# Dependent call/ADL, side effects, extra statements, non-const and overloads
+# are deliberately left untagged.
++struct KeepReducerDeclaredBeforeCub {
++struct KeepCallBasedMaxReducer {
++struct KeepSideEffectReducer {
++struct KeepExtraStatementReducer {
++struct KeepNonConstReducer {
++struct KeepOverloadedReducer {
+
+-oneflow

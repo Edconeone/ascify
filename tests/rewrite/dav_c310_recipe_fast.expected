@@ -1,0 +1,17 @@
+# The synthetic kernels are deliberately not coverage-complete.  The target
+# policy may recognize their exact direct adapters, but emits no rowwise recipe.
+-#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
++using ascify_target_direct_load_tag = void;
++using ascify_target_direct_store_tag = void;
++using ascify_target_storage_type = Wire;
++using ascify_target_compute_type = Accumulator;
++ascify_target_data() const -> decltype(base_)
++ascify_target_row_stride() const -> decltype(pitch_)
+-::ascify::target::dav_c310::TrySoftmax(
+-::ascify::target::dav_c310::TryRmsNorm(
+
+# All spelling-independent negative fixtures remain present and unmarked.
++struct SkipLoadLike {
++struct ShiftedInput {
++RouteLogarithmic(
++RouteDoubleFallback(
