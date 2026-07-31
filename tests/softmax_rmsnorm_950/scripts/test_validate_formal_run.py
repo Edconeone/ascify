@@ -336,11 +336,13 @@ class FormalSourceContractTest(unittest.TestCase):
             "FORMAL_WARMUP=20",
             "FORMAL_SAMPLES=50",
             "FORMAL_INNER_REPEATS=20",
+            "FORMAL_PROCESS_SETTLE_ATTEMPTS=30",
             'FORMAL_STAGE="${ASCIFY_FORMAL_STAGE:-prepare}"',
             "measure stage requires the inherited prepare-stage result lock",
             "preflight_args+=(--prepared)",
             "immutable binaries verified; selecting a fresh idle device",
             "exec env -u DEVICE -u ASCIFY_DEVICE -u ASCIFY_DEVICE_LOCK",
+            'wait_for_device_process_cleanup "${phase}"',
         ):
             self.assertIn(fixed_contract, formal_runner)
         for override in (

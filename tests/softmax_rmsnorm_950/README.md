@@ -162,6 +162,8 @@ The formal run fixes:
 - direct and native `unified_tune.csv`: 5 Softmax and 10 RMSNorm cases each;
 - `WARMUP=20`, `SAMPLES=50`, `INNER_REPEATS=20`;
 - direct-A, native, direct-B ordering with no interleaved build or correctness;
+- a bounded process-cleanup poll between phases, followed by the unchanged
+  strict idle pre-snapshot;
 - direct A/B spread at most `1.05`;
 - every shape direct/native geometric center at least `0.90`;
 - Softmax, RMSNorm plain, and RMSNorm affine group geomean at least `0.95`.

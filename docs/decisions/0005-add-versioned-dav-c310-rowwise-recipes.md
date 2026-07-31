@@ -179,7 +179,9 @@ selection and enters `measure` with the inherited result and device locks.
 `measure` rechecks the frozen inputs and bundle, uses `SKIP_BUILD=1`, runs 42
 Softmax plus 18 RMSNorm boundary cases and all tuning shapes, isolates preheat,
 and executes direct-A/native/direct-B without interleaved build or correctness
-work. `resume` is permitted only for an already prepared set and skips
+work. While retaining the same device lock, it polls only for delayed runtime
+process cleanup between phases; each phase still begins with the complete
+strict-idle snapshot. `resume` is permitted only for an already prepared set and skips
 rebuilding before fresh selection.
 
 Binary-bundle schema v2 records the canonical build-input snapshot path and

@@ -34,6 +34,7 @@ PREHEAT_INNER_REPEATS=5
 FORMAL_WARMUP=20
 FORMAL_SAMPLES=50
 FORMAL_INNER_REPEATS=20
+FORMAL_PROCESS_SETTLE_ATTEMPTS=30
 
 SOFTMAX_BLOCK_THREADS="${SOFTMAX_BLOCK_THREADS:-adaptive}"
 SOFTMAX_BLOCK_ROW_MAX="${SOFTMAX_BLOCK_ROW_MAX:-2048}"
@@ -126,7 +127,8 @@ fi
 for numeric_value in \
   "${BOUNDARY_CHECK_MAX_ELEMENTS}" "${TUNE_CHECK_MAX_ELEMENTS}" \
   "${PREHEAT_WARMUP}" "${PREHEAT_SAMPLES}" "${PREHEAT_INNER_REPEATS}" \
-  "${FORMAL_WARMUP}" "${FORMAL_SAMPLES}" "${FORMAL_INNER_REPEATS}"; do
+  "${FORMAL_WARMUP}" "${FORMAL_SAMPLES}" "${FORMAL_INNER_REPEATS}" \
+  "${FORMAL_PROCESS_SETTLE_ATTEMPTS}"; do
   if [[ ! "${numeric_value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "formal limits and timing parameters must be positive integers" >&2
     exit 2
@@ -412,6 +414,29 @@ validate_completed_run() {
     --ascify-binary-sha256 "${ASCIFY_BINARY_SHA256}"
 }
 
+wait_for_device_process_cleanup() {
+  local phase="$1"
+  local attempt=1
+  local process_text=""
+  while [[ "${attempt}" -le "${FORMAL_PROCESS_SETTLE_ATTEMPTS}" ]]; do
+    if process_text="$(
+      npu-smi info -t proc-mem -i "${ASCIFY_DEVICE}" 2>/dev/null
+    )" && grep -Eiq 'no[[:space:]].*process' <<<"${process_text}"; then
+      if [[ "${attempt}" -gt 1 ]]; then
+        echo "[formal] ${phase}: device process state settled after $((attempt - 1))s"
+      fi
+      return 0
+    fi
+    if [[ "${attempt}" -eq "${FORMAL_PROCESS_SETTLE_ATTEMPTS}" ]]; then
+      echo "[formal] ${phase}: device process state did not settle" >&2
+      printf '%s\n' "${process_text}" >&2
+      return 1
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+}
+
 run_one() {
   local execution_kind="$1"
   local run_id="$2"
@@ -451,6 +476,7 @@ run_one() {
   else
     skip_check=1
   fi
+  wait_for_device_process_cleanup "${phase}"
   echo "[formal] ${phase}: run_id=${run_id} device=${ASCIFY_DEVICE}"
   env "${common_env[@]}" \
     BIN_DIR="${FORMAL_BINARY_BUNDLE_DIR}" \
