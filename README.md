@@ -37,6 +37,10 @@ export ASCIFY_CXX=/usr/bin/clang++
 ./build.sh
 ```
 
+Set `ASCIFY_LINKER` only when a specific linker is required. If it is unset,
+`build.sh` uses `${LLVM_BUILD_DIR}/bin/lld` when present and otherwise lets the
+compiler select the system linker.
+
 Install (optional):
 
 ```bash
