@@ -145,9 +145,9 @@ if [ -n "$fast_output" ]; then
   count_fixed 'using ascify_target_direct_load_tag = void;' \
     "$fast_output" 1
   count_fixed 'using ascify_target_direct_store_tag = void;' \
-    "$fast_output" 1
-  count_fixed 'using ascify_target_storage_type = ' "$fast_output" 2
-  count_fixed 'using ascify_target_compute_type = ' "$fast_output" 2
+    "$fast_output" 2
+  count_fixed 'using ascify_target_storage_type = ' "$fast_output" 3
+  count_fixed 'using ascify_target_compute_type = ' "$fast_output" 3
   count_fixed '::ascify::target::dav_c310::TrySoftmax(' "$fast_output" 0
   count_fixed '::ascify::target::dav_c310::TryRmsNorm(' "$fast_output" 0
 fi

@@ -3,10 +3,15 @@
 -#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
 +using ascify_target_direct_load_tag = void;
 +using ascify_target_direct_store_tag = void;
++using ascify_target_adapter_owner_type = PackedInput;
++using ascify_target_adapter_owner_type = PackedOutput;
++using ascify_target_adapter_owner_type = AffinePackedOutput;
 +using ascify_target_storage_type = Wire;
 +using ascify_target_compute_type = Accumulator;
 +ascify_target_data() const -> decltype(base_)
 +ascify_target_row_stride() const -> decltype(pitch_)
++static constexpr bool ascify_target_store_is_affine = affine;
++ascify_target_weight() const -> decltype(weight_)
 -::ascify::target::dav_c310::TrySoftmax(
 -::ascify::target::dav_c310::TryRmsNorm(
 
