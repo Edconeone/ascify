@@ -255,6 +255,163 @@ def rms_geometry_callee_namespace_drift(text: str) -> str:
 
 
 class FormalSourceContractTest(unittest.TestCase):
+    def test_device_selector_handles_races_and_reserved_target_exits(
+        self,
+    ) -> None:
+        repo_root = MODULE_PATH.parents[3]
+        selector = (
+            repo_root
+            / "tests/softmax_rmsnorm_950/scripts/select_device.sh"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_npu_smi = fake_bin / "npu-smi"
+            fake_npu_smi.write_text(
+                """#!/usr/bin/env bash
+set -eu
+if [[ "$*" == "info -m" ]]; then
+  printf 'NPU Chip Logic Name\\n'
+  printf '0 0 0 Ascend950PR\\n'
+  printf '1 1 0 Ascend950PR\\n'
+  exit 0
+fi
+device_id=""
+for argument in "$@"; do device_id="${argument}"; done
+case "$*" in
+  *"-t health"*)
+    printf 'Health : OK\\n'
+    ;;
+  *"-t usages"*)
+    printf 'NPU Utilization : 0\\n'
+    printf 'Aicore Usage Rate : 0\\n'
+    printf 'Aivector Usage Rate : 0\\n'
+    printf 'HBM Bandwidth Usage Rate : 0\\n'
+    ;;
+  *"-t proc-mem"*)
+    count_file="${FAKE_NPU_STATE}/proc-${device_id}.count"
+    count=0
+    if [[ -f "${count_file}" ]]; then read -r count < "${count_file}"; fi
+    count=$((count + 1))
+    printf '%s\\n' "${count}" > "${count_file}"
+    if [[ "${FAKE_NPU_MODE}" == "race"
+          && "${device_id}" == "0" && "${count}" -ge 2 ]]; then
+      printf 'Process id : 123\\n'
+    else
+      printf 'No process in device.\\n'
+    fi
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_flock = fake_bin / "flock"
+            fake_flock.write_text(
+                "#!/usr/bin/env bash\nexit 0\n",
+                encoding="utf-8",
+            )
+            target = fake_bin / "capture-device"
+            target.write_text(
+                """#!/usr/bin/env bash
+printf '%s\\n' "${ASCIFY_DEVICE:?}" >> "${CAPTURE_PATH:?}"
+exit "${TARGET_EXIT:-0}"
+""",
+                encoding="utf-8",
+            )
+            for executable in (fake_npu_smi, fake_flock, target):
+                executable.chmod(0o755)
+
+            base_environment = os.environ.copy()
+            base_environment["PATH"] = (
+                str(fake_bin) + os.pathsep + base_environment["PATH"]
+            )
+            base_environment["WORK_ROOT"] = str(root / "work")
+
+            def run_selector(
+                name: str, mode: str, target_exit: int
+            ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+                state = root / f"state-{name}"
+                state.mkdir()
+                capture = root / f"capture-{name}.txt"
+                environment = base_environment.copy()
+                environment.update(
+                    {
+                        "FAKE_NPU_STATE": str(state),
+                        "FAKE_NPU_MODE": mode,
+                        "CAPTURE_PATH": str(capture),
+                        "TARGET_EXIT": str(target_exit),
+                    }
+                )
+                completed = subprocess.run(
+                    ["bash", str(selector), str(target)],
+                    cwd=str(repo_root),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                )
+                captured = (
+                    capture.read_text(encoding="utf-8").splitlines()
+                    if capture.exists()
+                    else []
+                )
+                return completed, captured
+
+            raced, raced_devices = run_selector("race", "race", 0)
+            self.assertEqual(0, raced.returncode, raced.stderr)
+            self.assertEqual(["1"], raced_devices)
+            self.assertIn("state changed while acquiring lock", raced.stderr)
+
+            for reserved_exit in (200, 201):
+                with self.subTest(reserved_exit=reserved_exit):
+                    completed, devices = run_selector(
+                        f"reserved-{reserved_exit}",
+                        "idle",
+                        reserved_exit,
+                    )
+                    self.assertEqual(199, completed.returncode)
+                    self.assertEqual(["0"], devices)
+                    self.assertNotIn(
+                        "state changed while acquiring lock",
+                        completed.stderr,
+                    )
+
+    def test_device_selector_retries_lock_time_state_changes(self) -> None:
+        repo_root = MODULE_PATH.parents[3]
+        selector = (
+            repo_root
+            / "tests/softmax_rmsnorm_950/scripts/select_device.sh"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            "readonly LOCK_BUSY_EXIT=200",
+            "readonly LOCKED_RECHECK_BUSY_EXIT=201",
+            "readonly TARGET_RESERVED_EXIT=199",
+            'exit "${LOCKED_RECHECK_BUSY_EXIT}"',
+            '--busy-exit "${LOCK_BUSY_EXIT}"',
+            "if (( lock_status == LOCKED_RECHECK_BUSY_EXIT )); then",
+            "state changed while acquiring lock",
+            "command_status == LOCK_BUSY_EXIT",
+            "command_status == LOCKED_RECHECK_BUSY_EXIT",
+            'command_status="${TARGET_RESERVED_EXIT}"',
+        ):
+            self.assertIn(contract, selector)
+        self.assertNotEqual(
+            re.search(
+                r"^readonly LOCK_BUSY_EXIT=(\d+)$",
+                selector,
+                re.MULTILINE,
+            ).group(1),
+            re.search(
+                r"^readonly LOCKED_RECHECK_BUSY_EXIT=(\d+)$",
+                selector,
+                re.MULTILINE,
+            ).group(1),
+        )
+
     def test_boundary_extrema_case_and_exact_counts_are_in_formal_gate(self) -> None:
         repo_root = MODULE_PATH.parents[3]
         boundary_shapes = (

@@ -9,6 +9,9 @@ LOCK_DIR="${WORK_ROOT}/locks"
 LOCK_HELPER="${SCRIPT_DIR}/safe_lock_exec.py"
 UTIL_MAX="${UTIL_MAX:-0}"
 HBM_BW_MAX="${HBM_BW_MAX:-${HBM_UTIL_MAX:-0}}"
+readonly LOCK_BUSY_EXIT=200
+readonly LOCKED_RECHECK_BUSY_EXIT=201
+readonly TARGET_RESERVED_EXIT=199
 
 LOCKED_STAGE=0
 LOCKED_DEVICE_ID=""
@@ -161,7 +164,7 @@ if [[ "${LOCKED_STAGE}" == "1" ]]; then
   fi
   if ! device_is_idle_and_healthy "${LOCKED_DEVICE_ID}"; then
     echo "[device] reject id=${LOCKED_DEVICE_ID} after lock: ${DEVICE_REJECTION_REASON}" >&2
-    exit 1
+    exit "${LOCKED_RECHECK_BUSY_EXIT}"
   fi
   if (( $# == 0 )); then
     echo "${LOCKED_DEVICE_ID}"
@@ -175,8 +178,11 @@ if [[ "${LOCKED_STAGE}" == "1" ]]; then
   "$@"
   command_status=$?
   set -e
-  # Exit 200 is reserved for the parent helper's lock-busy signal.
-  if (( command_status == 200 )); then command_status=199; fi
+  # Keep target exits from impersonating the selector's two retry signals.
+  if (( command_status == LOCK_BUSY_EXIT
+        || command_status == LOCKED_RECHECK_BUSY_EXIT )); then
+    command_status="${TARGET_RESERVED_EXIT}"
+  fi
   exit "${command_status}"
 fi
 
@@ -219,12 +225,16 @@ for device_id in "${candidate_ids[@]}"; do
   lock_path="${LOCK_DIR}/device-${device_id}.lock"
   set +e
   python3 -B "${LOCK_HELPER}" \
-    --fd 9 --path "${lock_path}" --busy-exit 200 -- \
+    --fd 9 --path "${lock_path}" --busy-exit "${LOCK_BUSY_EXIT}" -- \
     "$0" --locked-device "${device_id}" "${lock_path}" -- "$@"
   lock_status=$?
   set -e
-  if (( lock_status == 200 )); then
+  if (( lock_status == LOCK_BUSY_EXIT )); then
     echo "[device] skip id=${device_id}: project lock is held" >&2
+    continue
+  fi
+  if (( lock_status == LOCKED_RECHECK_BUSY_EXIT )); then
+    echo "[device] skip id=${device_id}: state changed while acquiring lock" >&2
     continue
   fi
   exit "${lock_status}"

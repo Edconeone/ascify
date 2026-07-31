@@ -154,7 +154,9 @@ tests/softmax_rmsnorm_950/scripts/run_formal_recipe_v3.sh
 ```
 
 Do not set `DEVICE`. After building, the script selects and locks a healthy
-device with zero compute and HBM-bandwidth utilization.
+device with zero compute and HBM-bandwidth utilization. If a candidate becomes
+busy between the initial check and the check made under its project lock, the
+selector rejects that candidate and continues with the next discovered device.
 
 The formal run fixes:
 
