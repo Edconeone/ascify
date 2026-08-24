@@ -78,6 +78,7 @@ private:
   bool hasCudaCompatHeader = false;
   bool needsDavC310TargetHeader = false;
   bool hasDavC310TargetHeader = false;
+  bool hasDavC310SimdTargetHeader = false;
   bool hasCubCompatHeader = false;
   bool pragmaOnce = false;
   clang::SourceLocation firstHeaderLoc;
@@ -87,6 +88,9 @@ private:
   std::set<unsigned> loweredDeviceDoubleParamOffsets;
   std::set<unsigned> rewrittenWarpAddReductionOffsets;
   std::set<unsigned> taggedCanonicalReducerOffsets;
+  std::set<std::string> rowwiseSimdMacrosEverDefined;
+  std::set<unsigned> rowwiseSimdRawScannedFiles;
+  std::string rowwiseSimdRawConflictingDeclaration;
   static constexpr std::size_t kRawTokenWindowCap = 128;
   // Rewrite a string literal to refer to hip, not CUDA.
   void RewriteString(StringRef s, clang::SourceLocation start);
@@ -134,6 +138,7 @@ public:
   // Called by the preprocessor for each ifndef directive during the non-raw lexing pass.
   // Found ifndef will be used in EndSourceFileAction() for catching include guard controlling macro.
   void Ifndef(clang::SourceLocation Loc, const clang::Token &MacroNameTok, const clang::MacroDefinition &MD);
+  void MacroDefined(const clang::Token &MacroNameTok);
   //
   void AddSkippedSourceRange(clang::SourceRange Range);
 

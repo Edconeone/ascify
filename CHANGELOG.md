@@ -4,10 +4,22 @@
 
 ### Added
 
-- Opt-in `dav-c310-vec + fast` AST-gated row-wise recipes for FP16 Softmax and
-  RMSNorm, including affine RMSNorm.
+- Opt-in `dav-c310-vec + fast` AST-gated row-wise recipes for FP16 Softmax,
+  RMSNorm, and LayerNorm, including affine RMSNorm.
 - Versioned dav-c310 target headers, thin CUDA-to-ACL compatibility helpers,
   fail-close mutation coverage, and 950PR correctness/performance gates.
+- Explicit `--target-recipe=dav-3510-rowwise-simd-v1` AST-gated dispatch for
+  proved Softmax, RMSNorm, and LayerNorm wrappers. The option is disabled by
+  default and requires `--target-policy=dav-c310-vec --simt-math=fast`.
+- Version 1 row-wise hybrid ABI and separately built dav-3510 target support for
+  Softmax recompute, RMSNorm cached, RMSNorm plain row-batch, and LayerNorm
+  cached routes. The canonical facade returns `HybridTryResult`; the four C
+  entries and DSO linker names use explicit `_v1` suffixes, and the libraries use
+  `VERSION 1.0.0` / `SOVERSION 1` SONAMEs.
+- An operator-independent compile-time mixed-stage recipe registry and generic
+  `RowwiseHybridFacadeV1::Try<Recipe>` entry. LayerNorm is the third semantic
+  family to exercise the registry end to end, with name-independent AST proof,
+  fail-closed mutations, a selector, runtime DSO, and device harness.
 - Versioned OneFlow conversion fixtures with source hashes and third-party
   licensing metadata.
 - One host-only release-check entry point and CTest integration.
@@ -16,5 +28,47 @@
 
 - Device/SIMT mappings now preserve unsupported semantics conservatively and
   use AST context for device scalar-double lowering.
+- Explicit row-wise Hybrid calls retain the original whole-SIMT launch for
+  selector misses. A selected launch owns the call and executes row-wise math
+  through a registered SIMD-to-SIMT stage split inside the same kernel. The
+  current SIMT regions cover contiguous output staging and, for LayerNorm,
+  centered element-wise normalization; a selected call returns its status
+  without a second launch, including on error.
+- Explicit SIMD semantic proof no longer trusts `ascify.semantic.*`
+  annotations for primitive semantics or wrapper status types; it checks the
+  complete raw FP32 primitive-specialization body and requires every textual
+  conditional branch in that body to contain only the same exact primitive
+  return. Reserved semantic-callee and injected-name macros fail closed.
+  Generation reports use the v3 structural dispatch/ownership/fallback
+  validator, require every recipe call to have a later direct-scope fallback
+  in a distinct wrapper, require input/output launch counts to match, and
+  ignore marker text in comments, literals, preprocessor directives, and
+  unproved conditional-preprocessor regions. The publisher rejects raw
+  invalid UTF-8, NUL bytes, UTF-8 BOMs, and trigraph spellings, handles standard and Clang
+  whitespace-extended line splices, and normalizes digraph tokens before
+  structural scope analysis. Its C/C++ lexical pass also preserves numeric
+  digit separators and treats only CR/LF as physical line endings.
+  Reports expose canonical `try_*_hybrid_count` fields and retain the v3
+  `try_*_simd_count` fields as compatibility aliases.
+- Explicit row-wise conversion rejects non-system GNU/MS assembler, including
+  skipped-source tokens, and protects the closed facade, launch ABI, injected
+  header guards, and ABI version from source-level redefinition. Injected
+  headers preserve conventional outer-guard state even for valued defines.
+- Softmax SIMD launch geometry now queries the current device, vector-core
+  count, and maximum threads per vector core on every call, propagating each
+  runtime error without a fixed fallback or cross-device cache.
+- Each `_launch_v1` DSO entry repeats its v1 selector-domain check and rejects
+  an invalid direct ABI call before launching a kernel. The 950PR harness uses
+  `ROWWISE_SIMD_RUNTIME_DIR` for both versioned link lookup and process-local
+  runtime loading.
 - All conversion, build, benchmark, and evidence outputs are confined to one
   ignored `.work/softmax_rmsnorm_950` tree.
+
+### Fixed
+
+- Mixed-kernel launches now pass the full dynamic UB capacity required by
+  their `TPipe` allocations: 163,904 bytes for Softmax recompute, 65,600 bytes
+  for RMSNorm cached, 147,520 bytes for RMSNorm plain row-batch, and 32,832
+  bytes for LayerNorm cached. A second launch argument of `0` or `nullptr` is
+  invalid; both forms are covered by the host static gate and selected-route
+  device correctness tests.

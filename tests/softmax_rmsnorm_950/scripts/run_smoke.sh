@@ -10,6 +10,48 @@ GENERATED_ROOT="${GENERATED_ROOT:-${WORK_ROOT}/generated}"
 BIN_DIR="${BIN_DIR:-${WORK_ROOT}/bin}"
 RESULT_DIR="${RESULT_DIR:-${WORK_ROOT}/results}"
 CANN_ROOT="${CANN_ROOT:-}"
+ROWWISE_SIMD_RUNTIME_DIR="${ROWWISE_SIMD_RUNTIME_DIR:-}"
+
+validate_rowwise_runtime_dir() {
+  local runtime_dir="$1"
+  local base
+  local linker_file
+  local soname_file
+  local actual_soname
+  if ! command -v readelf >/dev/null 2>&1; then
+    echo "readelf is required to validate the row-wise SIMD runtime" >&2
+    return 1
+  fi
+  for base in \
+    libascify950_softmax_reg_recompute_v1 \
+    libascify950_rmsnorm_reg_cached_v1 \
+    libascify950_rmsnorm_reg_plain_rowbatch_v1 \
+    libascify950_layernorm_reg_cached_v1; do
+    linker_file="${runtime_dir}/${base}.so"
+    soname_file="${runtime_dir}/${base}.so.1"
+    if [[ ! -f "${linker_file}" || ! -f "${soname_file}" ]]; then
+      echo "missing row-wise SIMD linker-name or SONAME file:" >&2
+      echo "  ${linker_file}" >&2
+      echo "  ${soname_file}" >&2
+      return 1
+    fi
+    actual_soname="$(
+      readelf -d -- "${linker_file}" |
+        sed -n 's/^.*(SONAME).*\[\([^]]*\)\].*$/\1/p'
+    )"
+    if [[ "${actual_soname}" != "${base}.so.1" ]]; then
+      echo "unexpected row-wise SIMD SONAME in ${linker_file}: ${actual_soname}" >&2
+      return 1
+    fi
+    if [[ "$(readlink -f -- "${linker_file}")" != \
+          "$(readlink -f -- "${soname_file}")" ]]; then
+      echo "row-wise SIMD linker-name and SONAME files resolve differently:" >&2
+      echo "  ${linker_file}" >&2
+      echo "  ${soname_file}" >&2
+      return 1
+    fi
+  done
+}
 SHAPES="${SHAPES:-${TEST_ROOT}/shapes/correctness.csv}"
 MATH_MODE="${MATH_MODE:-production-fast}"
 SOFTMAX_VARIANT="${SOFTMAX_VARIANT:-converted}"
@@ -64,6 +106,15 @@ esac
 if [[ -z "${CANN_ROOT}" ]]; then
   echo "CANN_ROOT must point to a user-owned CANN installation" >&2
   exit 2
+fi
+
+if [[ -n "${ROWWISE_SIMD_RUNTIME_DIR}" ]]; then
+  validate_rowwise_runtime_dir "${ROWWISE_SIMD_RUNTIME_DIR}"
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="${ROWWISE_SIMD_RUNTIME_DIR}:${LD_LIBRARY_PATH}"
+  else
+    export LD_LIBRARY_PATH="${ROWWISE_SIMD_RUNTIME_DIR}"
+  fi
 fi
 
 if [[ -z "${ASCIFY_DEVICE:-}" || -z "${ASCIFY_DEVICE_LOCK:-}" ]]; then
@@ -414,6 +465,9 @@ GENERATED_RMSNORM_ADAPTER="${GENERATED_ROOT}/ascify950/rmsnorm_affine_store.cuh"
 TARGET_RECIPE_HEADER="${REPO_ROOT}/include/ascify/target/dav_c310/rowwise_norm_recipes.hpp"
 TARGET_SOFTMAX_IMPL="${REPO_ROOT}/include/ascify/target/dav_c310/detail/softmax_fp16_impl.hpp"
 TARGET_RMSNORM_IMPL="${REPO_ROOT}/include/ascify/target/dav_c310/detail/rmsnorm_fp16_impl.hpp"
+ROWWISE_SIMD_ABI_HEADER="${REPO_ROOT}/include/ascify/target/dav_c310/rowwise_simd_abi.h"
+ROWWISE_SIMD_SELECTORS_HEADER="${REPO_ROOT}/include/ascify/target/dav_c310/rowwise_simd_selectors_v1.hpp"
+ROWWISE_SIMD_RECIPES_HEADER="${REPO_ROOT}/include/ascify/target/dav_c310/rowwise_simd_recipes.hpp"
 ACLCUB_HEADER="${REPO_ROOT}/acl_cub/aclcub.hpp"
 ASCIFY_RECIPE_SOURCE="${REPO_ROOT}/src/DavC310TargetRecipe.cpp"
 ASCIFY_RECIPE_HEADER="${REPO_ROOT}/src/DavC310TargetRecipe.h"
@@ -567,6 +621,17 @@ fi
   manifest_common_file dav_c310_recipe_header "${TARGET_RECIPE_HEADER}"
   manifest_common_file dav_c310_softmax_impl "${TARGET_SOFTMAX_IMPL}"
   manifest_common_file dav_c310_rmsnorm_impl "${TARGET_RMSNORM_IMPL}"
+  manifest_common_file rowwise_simd_abi_header "${ROWWISE_SIMD_ABI_HEADER}"
+  manifest_common_file rowwise_simd_selectors_header "${ROWWISE_SIMD_SELECTORS_HEADER}"
+  manifest_common_file rowwise_simd_recipes_header "${ROWWISE_SIMD_RECIPES_HEADER}"
+  if [[ -n "${ROWWISE_SIMD_RUNTIME_DIR}" ]]; then
+    manifest_common_file rowwise_simd_softmax_runtime_dso \
+      "$(readlink -f -- "${ROWWISE_SIMD_RUNTIME_DIR}/libascify950_softmax_reg_recompute_v1.so")"
+    manifest_common_file rowwise_simd_rmsnorm_cached_runtime_dso \
+      "$(readlink -f -- "${ROWWISE_SIMD_RUNTIME_DIR}/libascify950_rmsnorm_reg_cached_v1.so")"
+    manifest_common_file rowwise_simd_rmsnorm_plain_runtime_dso \
+      "$(readlink -f -- "${ROWWISE_SIMD_RUNTIME_DIR}/libascify950_rmsnorm_reg_plain_rowbatch_v1.so")"
+  fi
   manifest_common_file ascify_recipe_source "${ASCIFY_RECIPE_SOURCE}"
   manifest_common_file ascify_recipe_header "${ASCIFY_RECIPE_HEADER}"
   manifest_common_file runner_common_header "${RUNNER_COMMON_HEADER}"

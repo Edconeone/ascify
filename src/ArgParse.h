@@ -61,6 +61,7 @@ extern cl::opt<bool> Experimental;
 extern cl::opt<bool> NoLowerDeviceDoubleParams;
 extern cl::opt<std::string> TargetPolicy;
 extern cl::opt<std::string> SimtMathMode;
+extern cl::opt<std::string> TargetRecipe;
 extern cl::opt<bool> CudaKernelExecutionSyntax;
 extern cl::opt<bool> DPPKernelExecutionSyntax;
 extern const std::vector<std::string> ascifyOptions;

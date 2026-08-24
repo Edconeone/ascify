@@ -48,6 +48,7 @@ public:
       AdapterMarker,
       SoftmaxDirectWrapperPrologue,
       RmsNormDirectWrapperPrologue,
+      LayerNormDirectWrapperPrologue,
     };
 
     clang::SourceLocation location;
@@ -62,10 +63,15 @@ public:
     unsigned directStoreAdapters = 0;
     unsigned softmaxDirectWrappers = 0;
     unsigned rmsNormDirectWrappers = 0;
+    unsigned layerNormDirectWrappers = 0;
   };
 
   static constexpr const char *TargetHeader =
       "ascify/target/dav_c310/rowwise_norm_recipes.hpp";
+  static constexpr const char *SimdTargetHeader =
+      "ascify/target/dav_c310/rowwise_simd_recipes.hpp";
+  static constexpr const char *SimdRecipeName =
+      "dav-3510-rowwise-simd-v1";
   static constexpr const char *FunctionBinding =
       "davC310TargetRecipeFunction";
   static constexpr const char *RecordBinding =
@@ -86,7 +92,8 @@ public:
 
   FinalizedEdits finalize(clang::ASTContext &context,
                           clang::SourceManager &sourceManager,
-                          const clang::LangOptions &langOptions);
+                          const clang::LangOptions &langOptions,
+                          bool useSimdEntryPoints);
 
 private:
   std::vector<const clang::FunctionDecl *> functions;

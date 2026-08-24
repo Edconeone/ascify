@@ -1,0 +1,368 @@
+// dav-3510 intra-kernel SIMD+SIMT implementation for plain RMSNorm batching.
+//
+// One SIMD VF call performs square reduction, sqrt/divide, and normalization
+// for up to eight contiguous rows.  A SIMT VF then performs the contiguous
+// output staging copy from the normalized UB batch.  Unsupported calls
+// still miss before launch and use the retained whole-operator DPP fallback.
+
+#include "acl/acl.h"
+#include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
+#include <ascify/target/dav_c310/rowwise_simd_selectors_v1.hpp>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+namespace ascify950_reg_rmsnorm_plain_rowbatch {
+
+static_assert(
+    sizeof(half)
+        == ascify::target::dav_c310::rowwise_simd_v1::kHalfStorageBytes,
+    "runtime and selector must agree on fp16 storage width");
+
+constexpr uint32_t kMaxColumns = 3072;
+constexpr uint32_t kRowsPerBatch = 8;
+constexpr uint32_t kPipelineDepth = 1;
+constexpr uint32_t kAdapterSimtThreads = 1024;
+constexpr uint32_t kScalarBytesPerBatch =
+    kRowsPerBatch * sizeof(float);
+constexpr uint32_t kElementsPerBatch = kRowsPerBatch * kMaxColumns;
+constexpr uint32_t kTensorBytesPerBatch =
+    kElementsPerBatch * sizeof(half);
+constexpr uint32_t kConservativeUbBytes = 196608;
+constexpr uint32_t kMaximumUbBytes =
+    3 * kTensorBytesPerBatch + 2 * kScalarBytesPerBatch;
+constexpr int kDefaultAivCount = 56;
+
+static_assert(kScalarBytesPerBatch == 32,
+              "eight dense FP32 scalars must occupy one 32-byte block");
+static_assert(kTensorBytesPerBatch == 49152,
+              "unexpected row-batch tensor size");
+static_assert(kMaximumUbBytes == 147520,
+              "unexpected plain row-batch UB budget");
+static_assert(kMaximumUbBytes <= kConservativeUbBytes,
+              "plain row-batch exceeds conservative UB budget");
+
+__simd_vf__ inline void RmsPlainRowBatchVF(
+    __ubuf__ half* output, __ubuf__ half* input,
+    __ubuf__ float* sumSlot, __ubuf__ float* inverseSlot,
+    uint32_t rowCount, uint32_t columns, uint32_t chunkCount,
+    float inverseColumns, float epsilon) {
+  static constexpr AscendC::Reg::CastTrait kHalfToFloat = {
+      AscendC::Reg::RegLayout::ZERO,
+      AscendC::Reg::SatMode::UNKNOWN,
+      AscendC::Reg::MaskMergeMode::ZEROING,
+      AscendC::RoundMode::UNKNOWN};
+  static constexpr AscendC::Reg::CastTrait kFloatToHalf = {
+      AscendC::Reg::RegLayout::ZERO,
+      AscendC::Reg::SatMode::NO_SAT,
+      AscendC::Reg::MaskMergeMode::ZEROING,
+      AscendC::RoundMode::CAST_RINT};
+  constexpr uint32_t kVectorLength =
+      AscendC::VECTOR_REG_WIDTH / sizeof(float);
+
+  AscendC::Reg::RegTensor<half> inputHalf;
+  AscendC::Reg::RegTensor<half> outputHalf;
+  AscendC::Reg::RegTensor<float> inputFloat;
+  AscendC::Reg::RegTensor<float> squareFloat;
+  AscendC::Reg::RegTensor<float> squareSum;
+  AscendC::Reg::RegTensor<float> meanSquare;
+  AscendC::Reg::RegTensor<float> rootMeanSquare;
+  AscendC::Reg::RegTensor<float> oneFloat;
+  AscendC::Reg::RegTensor<float> inverseRms;
+  AscendC::Reg::RegTensor<float> normalizedFloat;
+  AscendC::Reg::MaskReg fullMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::ALL>();
+  AscendC::Reg::MaskReg oneMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::VL1>();
+
+  // Phase 1: reduce all rows into a dense FP32 UB scratch.  The public
+  // FIRST_ELEMENT_B32 distribution is the same dense bsIdx pattern used by
+  // the shipped dav-3510 RMSNorm implementation.
+  for (uint32_t row = 0; row < rowCount; ++row) {
+    AscendC::Reg::Duplicate<float>(squareSum, 0.0F, fullMask);
+    uint32_t remaining = columns;
+    const uint32_t rowBase = row * columns;
+    for (uint32_t chunk = 0; chunk < chunkCount; ++chunk) {
+      const uint32_t offset = rowBase + chunk * kVectorLength;
+      AscendC::Reg::MaskReg tailMask =
+          AscendC::Reg::UpdateMask<float>(remaining);
+      AscendC::Reg::LoadAlign<
+          half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(
+          inputHalf, input + offset);
+      AscendC::Reg::Cast<float, half, kHalfToFloat>(
+          inputFloat, inputHalf, tailMask);
+      AscendC::Reg::Mul<float>(
+          squareFloat, inputFloat, inputFloat, tailMask);
+      AscendC::Reg::Add<float>(
+          squareSum, squareSum, squareFloat, fullMask);
+    }
+    AscendC::Reg::Reduce<AscendC::Reg::ReduceType::SUM>(
+        squareSum, squareSum, fullMask);
+    AscendC::Reg::StoreAlign<
+        float, AscendC::Reg::StoreDist::DIST_FIRST_ELEMENT_B32>(
+        sumSlot + row, squareSum, oneMask);
+  }
+
+  AscendC::Reg::LocalMemBar<
+      AscendC::Reg::MemType::VEC_STORE,
+      AscendC::Reg::MemType::VEC_LOAD>();
+
+  // Phase 2: reload each dense sum by broadcast, emit dense inverse_rms, and
+  // normalize all rows.  Sqrt+Div keeps the proven public beta3 Reg surface.
+  for (uint32_t row = 0; row < rowCount; ++row) {
+    AscendC::Reg::LoadAlign<
+        float, AscendC::Reg::LoadDist::DIST_BRC_B32>(
+        meanSquare, sumSlot + row);
+    AscendC::Reg::Muls<float>(
+        meanSquare, meanSquare, inverseColumns, fullMask);
+    AscendC::Reg::Adds<float>(
+        meanSquare, meanSquare, epsilon, fullMask);
+    AscendC::Reg::Sqrt<float>(
+        rootMeanSquare, meanSquare, fullMask);
+    AscendC::Reg::Duplicate<float>(oneFloat, 1.0F, fullMask);
+    AscendC::Reg::Div<float>(
+        inverseRms, oneFloat, rootMeanSquare, fullMask);
+    AscendC::Reg::StoreAlign<
+        float, AscendC::Reg::StoreDist::DIST_FIRST_ELEMENT_B32>(
+        inverseSlot + row, inverseRms, oneMask);
+
+    uint32_t remaining = columns;
+    const uint32_t rowBase = row * columns;
+    for (uint32_t chunk = 0; chunk < chunkCount; ++chunk) {
+      const uint32_t offset = rowBase + chunk * kVectorLength;
+      AscendC::Reg::MaskReg tailMask =
+          AscendC::Reg::UpdateMask<float>(remaining);
+      AscendC::Reg::LoadAlign<
+          half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(
+          inputHalf, input + offset);
+      AscendC::Reg::Cast<float, half, kHalfToFloat>(
+          inputFloat, inputHalf, tailMask);
+      AscendC::Reg::Mul<float>(
+          normalizedFloat, inputFloat, inverseRms, tailMask);
+      AscendC::Reg::Cast<half, float, kFloatToHalf>(
+          outputHalf, normalizedFloat, tailMask);
+      AscendC::Reg::StoreAlign<
+          half, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+          output + offset, outputHalf, tailMask);
+    }
+  }
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(kAdapterSimtThreads) inline void
+RmsPlainStoreAdapterSimtVF(
+    __ubuf__ half* output, __ubuf__ half* normalized,
+    uint32_t elementCount) {
+  for (uint32_t index = static_cast<uint32_t>(threadIdx.x);
+       index < elementCount;
+       index += static_cast<uint32_t>(blockDim.x)) {
+    output[index] = normalized[index];
+  }
+}
+
+__aicore__ inline uint32_t ChunkCount(uint32_t count) {
+  constexpr uint32_t kVectorLength =
+      AscendC::VECTOR_REG_WIDTH / sizeof(float);
+  return (count + kVectorLength - 1) / kVectorLength;
+}
+
+__aicore__ inline void ComputePlainRowBatch(
+    const AscendC::LocalTensor<half>& output,
+    const AscendC::LocalTensor<half>& input,
+    const AscendC::LocalTensor<float>& sumSlot,
+    const AscendC::LocalTensor<float>& inverseSlot,
+    uint32_t rowCount, uint32_t columns,
+    float inverseColumns, float epsilon) {
+  asc_vf_call<RmsPlainRowBatchVF>(
+      (__ubuf__ half*)output.GetPhyAddr(),
+      (__ubuf__ half*)input.GetPhyAddr(),
+      (__ubuf__ float*)sumSlot.GetPhyAddr(),
+      (__ubuf__ float*)inverseSlot.GetPhyAddr(),
+      rowCount, columns, ChunkCount(columns), inverseColumns, epsilon);
+}
+
+__aicore__ inline void ApplyStoreAdapterSimt(
+    const AscendC::LocalTensor<half>& output,
+    const AscendC::LocalTensor<half>& normalized,
+    uint32_t elementCount) {
+  asc_vf_call<RmsPlainStoreAdapterSimtVF>(
+      dim3(kAdapterSimtThreads),
+      (__ubuf__ half*)output.GetPhyAddr(),
+      (__ubuf__ half*)normalized.GetPhyAddr(), elementCount);
+}
+
+class RmsNormRegPlainRowBatchKernel {
+ public:
+  __aicore__ inline void Init(
+      GM_ADDR input, GM_ADDR output, GM_ADDR inverseRms,
+      int64_t rows, uint32_t columns,
+      float inverseColumns, float epsilon) {
+    inputGm_.SetGlobalBuffer((__gm__ half*)input);
+    outputGm_.SetGlobalBuffer((__gm__ half*)output);
+    inverseRmsGm_.SetGlobalBuffer((__gm__ float*)inverseRms);
+    pipe_.InitBuffer(inputQueue_, kPipelineDepth, kTensorBytesPerBatch);
+    pipe_.InitBuffer(outputQueue_, kPipelineDepth, kTensorBytesPerBatch);
+    pipe_.InitBuffer(normalizedBuffer_, kTensorBytesPerBatch);
+    pipe_.InitBuffer(inverseQueue_, kPipelineDepth, kScalarBytesPerBatch);
+    pipe_.InitBuffer(sumBuffer_, kScalarBytesPerBatch);
+    rows_ = rows;
+    columns_ = columns;
+    inverseColumns_ = inverseColumns;
+    epsilon_ = epsilon;
+  }
+
+  __aicore__ inline void Process() {
+    const int64_t batchCount =
+        (rows_ + static_cast<int64_t>(kRowsPerBatch) - 1)
+        / static_cast<int64_t>(kRowsPerBatch);
+    const int64_t firstBatch =
+        static_cast<int64_t>(AscendC::GetBlockIdx());
+    const int64_t batchStride =
+        static_cast<int64_t>(AscendC::GetBlockNum());
+    for (int64_t batch = firstBatch; batch < batchCount;
+         batch += batchStride) {
+      ProcessBatch(batch);
+    }
+  }
+
+ private:
+  __aicore__ inline void CopyIntoLocal(
+      const AscendC::LocalTensor<half>& local,
+      const AscendC::GlobalTensor<half>& global,
+      uint32_t elementCount) {
+    AscendC::DataCopyExtParams params{
+        1, static_cast<uint32_t>(elementCount * sizeof(half)), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<half> pad{false, 0, 0, 0};
+    AscendC::DataCopyPad(local, global, params, pad);
+  }
+
+  __aicore__ inline void ProcessBatch(int64_t batch) {
+    const int64_t firstRow =
+        batch * static_cast<int64_t>(kRowsPerBatch);
+    const int64_t remainingRows = rows_ - firstRow;
+    const uint32_t rowCount = static_cast<uint32_t>(
+        remainingRows < static_cast<int64_t>(kRowsPerBatch)
+            ? remainingRows : static_cast<int64_t>(kRowsPerBatch));
+    const uint32_t elementCount = rowCount * columns_;
+    const int64_t elementOffset =
+        firstRow * static_cast<int64_t>(columns_);
+
+    AscendC::LocalTensor<half> inputLocal =
+        inputQueue_.AllocTensor<half>();
+    CopyIntoLocal(inputLocal, inputGm_[elementOffset], elementCount);
+    inputQueue_.EnQue(inputLocal);
+    inputLocal = inputQueue_.DeQue<half>();
+
+    AscendC::LocalTensor<half> outputLocal =
+        outputQueue_.AllocTensor<half>();
+    AscendC::LocalTensor<half> normalizedLocal =
+        normalizedBuffer_.Get<half>();
+    AscendC::LocalTensor<float> inverseLocal =
+        inverseQueue_.AllocTensor<float>();
+    AscendC::LocalTensor<float> sumLocal = sumBuffer_.Get<float>();
+    ComputePlainRowBatch(
+        normalizedLocal, inputLocal, sumLocal, inverseLocal,
+        rowCount, columns_, inverseColumns_, epsilon_);
+    AscendC::PipeBarrier<PIPE_V>();
+    ApplyStoreAdapterSimt(outputLocal, normalizedLocal, elementCount);
+
+    inputQueue_.FreeTensor(inputLocal);
+    outputQueue_.EnQue(outputLocal);
+    inverseQueue_.EnQue(inverseLocal);
+
+    inverseLocal = inverseQueue_.DeQue<float>();
+    AscendC::DataCopyExtParams inverseCopy{
+        1, static_cast<uint32_t>(rowCount * sizeof(float)), 0, 0, 0};
+    AscendC::DataCopyPad(
+        inverseRmsGm_[static_cast<uint64_t>(firstRow)],
+        inverseLocal, inverseCopy);
+    inverseQueue_.FreeTensor(inverseLocal);
+
+    outputLocal = outputQueue_.DeQue<half>();
+    AscendC::DataCopyExtParams outputCopy{
+        1, static_cast<uint32_t>(elementCount * sizeof(half)), 0, 0, 0};
+    AscendC::DataCopyPad(outputGm_[elementOffset], outputLocal, outputCopy);
+    outputQueue_.FreeTensor(outputLocal);
+  }
+
+  AscendC::TPipe pipe_;
+  AscendC::GlobalTensor<half> inputGm_;
+  AscendC::GlobalTensor<half> outputGm_;
+  AscendC::GlobalTensor<float> inverseRmsGm_;
+  AscendC::TQue<AscendC::TPosition::VECIN, kPipelineDepth> inputQueue_;
+  AscendC::TQue<AscendC::TPosition::VECOUT, kPipelineDepth> outputQueue_;
+  AscendC::TQue<AscendC::TPosition::VECOUT, kPipelineDepth> inverseQueue_;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> normalizedBuffer_;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> sumBuffer_;
+  int64_t rows_ = 0;
+  uint32_t columns_ = 0;
+  float inverseColumns_ = 0.0F;
+  float epsilon_ = 0.0F;
+};
+
+extern "C" __global__ __aicore__ void
+rmsnorm_reg_plain_rowbatch_kernel(
+    GM_ADDR input, GM_ADDR output, GM_ADDR inverseRms,
+    int64_t rows, uint32_t columns,
+    float inverseColumns, float epsilon) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  RmsNormRegPlainRowBatchKernel kernel;
+  kernel.Init(
+      input, output, inverseRms, rows, columns,
+      inverseColumns, epsilon);
+  kernel.Process();
+}
+
+inline bool IsAligned16(const void* pointer) {
+  return (reinterpret_cast<uintptr_t>(pointer) & 15U) == 0;
+}
+
+inline bool IsAligned4(const void* pointer) {
+  return (reinterpret_cast<uintptr_t>(pointer) & 3U) == 0;
+}
+
+extern "C" aclError ascify950_rmsnorm_reg_plain_rowbatch_launch_v1(
+    aclrtStream stream, const half* input, half* output,
+    float* inverseRms, int64_t rows, int64_t columns, double epsilon) {
+  if (!ascify::target::dav_c310::rowwise_simd_v1::
+          IsRmsNormPlainRowBatchSimdDomain(
+              stream, input, output, nullptr, inverseRms, rows, columns,
+              epsilon, 0, 0)) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  if (stream == nullptr || input == nullptr || output == nullptr
+      || inverseRms == nullptr || rows <= 0 || columns <= 0
+      || columns > static_cast<int64_t>(kMaxColumns)
+      // Rows are packed in one UB tensor.  Aligned Reg loads/stores require
+      // every row start to remain 32-byte aligned, hence 16 FP16 elements.
+      || columns % 16 != 0
+      || rows > std::numeric_limits<int64_t>::max() / columns
+      || !(epsilon > 0.0) || !std::isfinite(epsilon)
+      || !IsAligned16(input) || !IsAligned16(output)
+      || !IsAligned4(inverseRms)) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+
+  const uint32_t narrowColumns = static_cast<uint32_t>(columns);
+  const float inverseColumns = 1.0F / static_cast<float>(narrowColumns);
+  const float narrowEpsilon = static_cast<float>(epsilon);
+  if (!(narrowEpsilon > 0.0F) || !std::isfinite(narrowEpsilon)) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  const int64_t batchCount =
+      (rows + static_cast<int64_t>(kRowsPerBatch) - 1)
+      / static_cast<int64_t>(kRowsPerBatch);
+  const int gridBlocks = static_cast<int>(
+      batchCount < kDefaultAivCount
+          ? batchCount : kDefaultAivCount);
+  rmsnorm_reg_plain_rowbatch_kernel
+      <<<gridBlocks, kMaximumUbBytes, stream>>>(
+          (GM_ADDR)input, (GM_ADDR)output, (GM_ADDR)inverseRms,
+          rows, narrowColumns, inverseColumns, narrowEpsilon);
+  return aclrtPeekAtLastError(static_cast<aclrtLastErrLevel>(0));
+}
+
+}  // namespace ascify950_reg_rmsnorm_plain_rowbatch

@@ -1,6 +1,7 @@
 # The synthetic kernels are deliberately not coverage-complete.  The target
 # policy may recognize their exact direct adapters, but emits no rowwise recipe.
 -#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+-#include <ascify/target/dav_c310/rowwise_simd_recipes.hpp>
 +using ascify_target_direct_load_tag = void;
 +using ascify_target_direct_store_tag = void;
 +using ascify_target_adapter_owner_type = PackedInput;
@@ -14,6 +15,8 @@
 +ascify_target_weight() const -> decltype(weight_)
 -::ascify::target::dav_c310::TrySoftmax(
 -::ascify::target::dav_c310::TryRmsNorm(
+-::ascify::target::dav_c310::rowwise_simd_v1::RowwiseHybridFacadeV1::TrySoftmaxHybrid(
+-::ascify::target::dav_c310::rowwise_simd_v1::RowwiseHybridFacadeV1::TryRmsNormHybrid(
 
 # All spelling-independent negative fixtures remain present and unmarked.
 +struct SkipLoadLike {

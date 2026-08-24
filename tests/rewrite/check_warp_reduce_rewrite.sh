@@ -80,12 +80,14 @@ check_static_contract() {
 
   require_fixed 'extern cl::opt<std::string> TargetPolicy' "$argparse_header"
   require_fixed 'extern cl::opt<std::string> SimtMathMode' "$argparse_header"
+  require_fixed 'extern cl::opt<std::string> TargetRecipe' "$argparse_header"
   require_fixed '"target-policy"' "$argparse_cpp"
   require_fixed 'cl::init("portable")' "$argparse_cpp"
   require_fixed '"simt-math"' "$argparse_cpp"
   require_fixed 'cl::init("precise")' "$argparse_cpp"
   require_fixed 'std::string(TargetPolicy.ArgStr)' "$argparse_cpp"
   require_fixed 'std::string(SimtMathMode.ArgStr)' "$argparse_cpp"
+  require_fixed 'std::string(TargetRecipe.ArgStr)' "$argparse_cpp"
   require_fixed 'current == longOption || current == shortOption' "$main_cpp"
 
   require_fixed 'sCanonicalWarpAddReduction' "$action_cpp"

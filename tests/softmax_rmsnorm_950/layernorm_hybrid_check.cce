@@ -1,0 +1,293 @@
+#include "ascify/target/dav_c310/rowwise_simd_abi.h"
+#include "common/runner_common.hpp"
+#ifdef ASCIFY950_USE_GENERATED_LAYERNORM
+#include "oneflow/core/cuda/layer_norm.cuh"
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <vector>
+
+namespace b950 = ascify950;
+
+namespace {
+
+struct LayerNormCase {
+  int64_t rows;
+  int64_t columns;
+  double epsilon;
+  b950::InputPatternCode pattern;
+  bool in_place;
+};
+
+struct CaseResult {
+  double output_abs = 0.0;
+  double mean_abs = 0.0;
+  double inverse_abs = 0.0;
+  uint64_t nonfinite = 0;
+  uint64_t first_bad_index = std::numeric_limits<uint64_t>::max();
+  double first_bad_expected = 0.0;
+  double first_bad_actual = 0.0;
+};
+
+float InputValue(const LayerNormCase& test_case, size_t linear,
+                 int64_t row, int64_t column, uint64_t seed) {
+  return b950::HostInputValue(
+      test_case.pattern, linear, row, column, test_case.columns, seed);
+}
+
+aclError LaunchLayerNorm(
+    aclrtStream stream, const half* input, half* output, float* mean,
+    float* inverse, int64_t rows, int64_t columns, double epsilon) {
+#ifdef ASCIFY950_USE_GENERATED_LAYERNORM
+  using Load = oneflow::cuda::layer_norm::DirectLoad<half, float>;
+  using Store = oneflow::cuda::layer_norm::DirectStore<float, half>;
+  Load load(input, columns);
+  Store store(output, columns);
+  return oneflow::cuda::layer_norm::DispatchLayerNorm<
+      Load, Store, float>(
+      stream, load, store, rows, columns, epsilon, mean, inverse);
+#else
+  return ascify950_layernorm_reg_cached_launch_v1(
+      stream, input, output, mean, inverse, rows, columns, epsilon);
+#endif
+}
+
+bool RunCase(const LayerNormCase& test_case, uint64_t seed,
+             aclrtStream stream, CaseResult* result) {
+  const size_t elements =
+      static_cast<size_t>(test_case.rows * test_case.columns);
+  const size_t tensor_bytes = elements * sizeof(uint16_t);
+  const size_t auxiliary_bytes =
+      static_cast<size_t>(test_case.rows) * sizeof(float);
+
+  std::vector<uint16_t> host_input(elements);
+  std::vector<float> quantized_input(elements);
+  for (size_t linear = 0; linear < elements; ++linear) {
+    const int64_t row =
+        static_cast<int64_t>(linear / static_cast<size_t>(test_case.columns));
+    const int64_t column = static_cast<int64_t>(
+        linear - static_cast<size_t>(row) * test_case.columns);
+    host_input[linear] = b950::FloatToHalfBits(
+        InputValue(test_case, linear, row, column, seed));
+    quantized_input[linear] = b950::HalfBitsToFloat(host_input[linear]);
+  }
+
+  b950::DeviceBuffer input;
+  b950::DeviceBuffer output;
+  b950::DeviceBuffer mean;
+  b950::DeviceBuffer inverse;
+  ASCIFY950_ACL_CHECK(input.Allocate(tensor_bytes));
+  if (!test_case.in_place) {
+    ASCIFY950_ACL_CHECK(output.Allocate(tensor_bytes));
+  }
+  ASCIFY950_ACL_CHECK(mean.Allocate(auxiliary_bytes));
+  ASCIFY950_ACL_CHECK(inverse.Allocate(auxiliary_bytes));
+  ASCIFY950_ACL_CHECK(aclrtMemcpy(
+      input.Get(), tensor_bytes, host_input.data(), tensor_bytes,
+      ACL_MEMCPY_HOST_TO_DEVICE));
+
+  half* output_pointer =
+      test_case.in_place ? input.As<half>() : output.As<half>();
+  aclError error = LaunchLayerNorm(
+      stream, input.As<const half>(), output_pointer, mean.As<float>(),
+      inverse.As<float>(), test_case.rows, test_case.columns,
+      test_case.epsilon);
+  if (error == ACL_SUCCESS) { error = aclrtSynchronizeStream(stream); }
+  if (error != ACL_SUCCESS) {
+    std::fprintf(stderr, "layer_norm launch failed: %s\n",
+                 b950::AclErrorReason("launch or synchronize", error).c_str());
+    return false;
+  }
+
+  std::vector<uint16_t> host_output(elements);
+  std::vector<float> host_mean(static_cast<size_t>(test_case.rows));
+  std::vector<float> host_inverse(static_cast<size_t>(test_case.rows));
+  void* output_storage = test_case.in_place ? input.Get() : output.Get();
+  ASCIFY950_ACL_CHECK(aclrtMemcpy(
+      host_output.data(), tensor_bytes, output_storage, tensor_bytes,
+      ACL_MEMCPY_DEVICE_TO_HOST));
+  ASCIFY950_ACL_CHECK(aclrtMemcpy(
+      host_mean.data(), auxiliary_bytes, mean.Get(), auxiliary_bytes,
+      ACL_MEMCPY_DEVICE_TO_HOST));
+  ASCIFY950_ACL_CHECK(aclrtMemcpy(
+      host_inverse.data(), auxiliary_bytes, inverse.Get(), auxiliary_bytes,
+      ACL_MEMCPY_DEVICE_TO_HOST));
+
+  for (int64_t row = 0; row < test_case.rows; ++row) {
+    const size_t row_offset = static_cast<size_t>(row * test_case.columns);
+    double sum = 0.0;
+    for (int64_t column = 0; column < test_case.columns; ++column) {
+      sum += quantized_input[row_offset + static_cast<size_t>(column)];
+    }
+    const double reference_mean = sum / test_case.columns;
+    double square_sum = 0.0;
+    for (int64_t column = 0; column < test_case.columns; ++column) {
+      const double centered =
+          quantized_input[row_offset + static_cast<size_t>(column)]
+          - reference_mean;
+      square_sum += centered * centered;
+    }
+    const double reference_inverse =
+        1.0 / std::sqrt(square_sum / test_case.columns + test_case.epsilon);
+    const float actual_mean = host_mean[static_cast<size_t>(row)];
+    const float actual_inverse = host_inverse[static_cast<size_t>(row)];
+    if (!std::isfinite(actual_mean) || !std::isfinite(actual_inverse)) {
+      ++result->nonfinite;
+    } else {
+      result->mean_abs = std::max(
+          result->mean_abs, std::fabs(actual_mean - reference_mean));
+      result->inverse_abs = std::max(
+          result->inverse_abs,
+          std::fabs(actual_inverse - reference_inverse));
+    }
+    for (int64_t column = 0; column < test_case.columns; ++column) {
+      const size_t linear = row_offset + static_cast<size_t>(column);
+      const double reference =
+          (quantized_input[linear] - reference_mean) * reference_inverse;
+      const double expected = b950::HalfBitsToFloat(
+          b950::FloatToHalfBits(static_cast<float>(reference)));
+      const double actual = b950::HalfBitsToFloat(host_output[linear]);
+      if (!std::isfinite(actual)) {
+        ++result->nonfinite;
+      } else {
+        const double absolute_error = std::fabs(actual - expected);
+        result->output_abs = std::max(result->output_abs, absolute_error);
+        if (absolute_error > 1.0e-2
+            && result->first_bad_index
+                   == std::numeric_limits<uint64_t>::max()) {
+          result->first_bad_index = static_cast<uint64_t>(linear);
+          result->first_bad_expected = expected;
+          result->first_bad_actual = actual;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  const int device_id =
+      std::atoi(b950::GetArg(argc, argv, "--device", "0"));
+  const uint64_t seed = std::strtoull(
+      b950::GetArg(argc, argv, "--seed", "0x1a9e950"), nullptr, 0);
+  b950::AclSession session;
+  const aclError init_error = session.Init(device_id);
+  if (init_error != ACL_SUCCESS) {
+    std::fprintf(stderr, "%s\n",
+                 b950::AclErrorReason("ACL session initialization", init_error)
+                     .c_str());
+    return 1;
+  }
+
+#ifdef ASCIFY950_USE_GENERATED_LAYERNORM
+  std::fprintf(stderr, "[path] layer_norm=generated-wrapper\n");
+#else
+  std::fprintf(stderr, "[path] layer_norm=direct-runtime-abi\n");
+#endif
+
+#ifdef ASCIFY950_USE_GENERATED_LAYERNORM
+  // Exercise the ordinary converted top-level dispatcher.  Its proved warp
+  // branch owns columns through 1024; wider direct-ABI runtime boundaries are
+  // covered by the companion binary below.
+  const std::vector<LayerNormCase> cases = {
+      {1, 8, 1.0e-5, b950::kConstant, false},
+      {3, 120, 1.0e-5, b950::kRamp, false},
+      {17, 1024, 1.0e-5, b950::kRandom, true},
+      {65, 512, 1.0e-5, b950::kWide, false},
+      {257, 1000, 1.0e-5, b950::kRandom, false},
+  };
+  constexpr int64_t kProfileColumns = 1024;
+#else
+  const std::vector<LayerNormCase> cases = {
+      {1, 8, 1.0e-5, b950::kConstant, false},
+      {3, 120, 1.0e-5, b950::kRamp, false},
+      {17, 1024, 1.0e-5, b950::kRandom, true},
+      {65, 4096, 1.0e-5, b950::kWide, false},
+      {4, 8192, 1.0e-5, b950::kRandom, false},
+  };
+  constexpr int64_t kProfileColumns = 4096;
+#endif
+  constexpr double kOutputTolerance = 1.0e-2;
+  constexpr double kMeanTolerance = 1.0e-3;
+  constexpr double kInverseTolerance = 3.0e-3;
+  int passed = 0;
+  for (size_t index = 0; index < cases.size(); ++index) {
+    CaseResult result;
+    const LayerNormCase& test_case = cases[index];
+    const bool launched = RunCase(
+        test_case, seed ^ static_cast<uint64_t>(index), session.Stream(),
+        &result);
+    const bool ok = launched && result.output_abs <= kOutputTolerance
+        && result.mean_abs <= kMeanTolerance
+        && result.inverse_abs <= kInverseTolerance
+        && result.nonfinite == 0;
+    if (ok) { ++passed; }
+    std::fprintf(
+        stderr,
+        "[%s] layer_norm rows=%lld cols=%lld in_place=%d "
+        "out_abs=%.3e mean_abs=%.3e inv_abs=%.3e nonfinite=%llu",
+        ok ? "pass" : "fail", static_cast<long long>(test_case.rows),
+        static_cast<long long>(test_case.columns), test_case.in_place ? 1 : 0,
+        result.output_abs, result.mean_abs, result.inverse_abs,
+        static_cast<unsigned long long>(result.nonfinite));
+    if (result.first_bad_index != std::numeric_limits<uint64_t>::max()) {
+      std::fprintf(stderr, " first_bad=%llu expected=%.6g actual=%.6g",
+                   static_cast<unsigned long long>(result.first_bad_index),
+                   result.first_bad_expected, result.first_bad_actual);
+    }
+    std::fprintf(stderr, "\n");
+  }
+
+  b950::DeviceBuffer probe_input;
+  b950::DeviceBuffer probe_output;
+  b950::DeviceBuffer probe_mean;
+  b950::DeviceBuffer probe_inverse;
+  ASCIFY950_ACL_CHECK(probe_input.Allocate(256 * 4096 * sizeof(uint16_t)));
+  ASCIFY950_ACL_CHECK(probe_output.Allocate(256 * 4096 * sizeof(uint16_t)));
+  ASCIFY950_ACL_CHECK(probe_mean.Allocate(256 * sizeof(float)));
+  ASCIFY950_ACL_CHECK(probe_inverse.Allocate(256 * sizeof(float)));
+  const aclError rejected = ascify950_layernorm_reg_cached_launch_v1(
+      session.Stream(), probe_input.As<const half>(), probe_output.As<half>(),
+      probe_mean.As<float>(), probe_inverse.As<float>(), 1, 10, 1.0e-5);
+  const bool fail_closed = rejected != ACL_SUCCESS;
+  std::fprintf(stderr, "[%s] layer_norm invalid-domain cols=10 rejected=%d\n",
+               fail_closed ? "pass" : "fail", fail_closed ? 1 : 0);
+
+  const auto launch = [&]() {
+    return LaunchLayerNorm(
+        session.Stream(), probe_input.As<const half>(), probe_output.As<half>(),
+        probe_mean.As<float>(), probe_inverse.As<float>(), 256,
+        kProfileColumns,
+        1.0e-5);
+  };
+  const b950::TimingResult timing =
+      b950::TimeKernel(launch, session.Stream(), 5, 20, 10);
+  if (timing.ok) {
+    std::fprintf(stderr,
+                 "[profile] layer_norm rows=256 cols=%lld "
+                 "median_us=%.3f min_us=%.3f p90_us=%.3f\n",
+                 static_cast<long long>(kProfileColumns),
+                 timing.stats.median_ms * 1000.0,
+                 timing.stats.min_ms * 1000.0,
+                 timing.stats.p90_ms * 1000.0);
+  } else {
+    std::fprintf(stderr, "[fail] layer_norm profile: %s\n",
+                 timing.reason.c_str());
+  }
+
+  std::fprintf(stderr,
+               "layer_norm hybrid correctness: selected=%zu pass=%d fail=%zu "
+               "domain_reject=%s profile=%s\n",
+               cases.size(), passed, cases.size() - static_cast<size_t>(passed),
+               fail_closed ? "pass" : "fail", timing.ok ? "pass" : "fail");
+  return passed == static_cast<int>(cases.size()) && fail_closed && timing.ok
+      ? 0
+      : 2;
+}

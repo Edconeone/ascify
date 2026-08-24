@@ -94,6 +94,7 @@ Where `--clang-resource-directory` specifies `lib/clang/23`, which is in the **i
 | `-local-headers` / `-local-headers-recursive` | Process quoted local includes |
 | `--target-policy=portable\|dav-c310-vec` | Select conservative output or opt in to validated dav-c310 SIMT rewrites |
 | `--simt-math=precise\|fast` | Keep precise semantics or enable guarded fast-SIMT transformations |
+| `--target-recipe=none\|dav-3510-rowwise-simd-v1` | Explicitly enable the versioned, externally linked row-wise SIMD+SIMT hybrid dispatch; default `none` |
 | `--no-lower-device-double-params` | Preserve by-value scalar `double` parameters on CUDA `__global__` functions |
 | `-versions` | Print supported third-party version range |
 
@@ -117,28 +118,132 @@ pure binary sum/max/min functors for `aclcub::BlockReduce`. Partial masks,
 sub-warps, side effects, dependent calls, unsupported data types, and
 unproven functors retain the compatibility fallback.
 
-The same opt-in policy can emit the versioned dav-c310 FP16 row-wise recipe
+### Explicit row-wise SIMD+SIMT hybrid dispatch
+
+The dav-3510 row-wise hybrid path has an additional explicit opt-in:
+
+```bash
+ascify-clang input.cuh \
+  --target-policy=dav-c310-vec \
+  --simt-math=fast \
+  --target-recipe=dav-3510-rowwise-simd-v1 \
+  --cuda-path=/path/to/cuda \
+  --clang-resource-directory=/path/to/llvm/lib/clang/23 \
+  -o output.cuh
+```
+
+`--target-recipe=none` is the default and does not add the externally linked
+row-wise target ABI to generated code. The explicit recipe is rejected unless
+both `dav-c310-vec` and `fast` are selected.
+
+In explicit mode, Ascify inserts the closed `RowwiseHybridFacadeV1` entry only
 when it proves all of the following in the main-file AST:
 
 - an exact packed row-major FP16-to-FP32 load and FP32-to-FP16 direct or
   per-column affine store;
 - exact-owner adapter metadata, so derived classes cannot inherit the proof;
-- the complete Softmax or RMSNorm primitive/data-flow graph, including
+- the complete Softmax, RMSNorm, or LayerNorm primitive/data-flow graph, including
   resolved `exp`/divide/`rsqrt` semantics;
 - a supported shape/type contract at runtime.
 
-Here, “recipe direct” means an unedited generated header whose proved wrapper
-dispatches to the packaged `dav_c310::v1` target implementation. It is distinct
-from the legacy generic rewrite and does not claim to synthesize the validated
-16-byte, half2, cache, or block-per-row implementation from arbitrary CUDA.
+Explicit hybrid mode does not accept `ascify.semantic.*` annotations as the
+semantic or status-type proof. It inspects the FP32 helper specialization,
+reads the complete source body rather than only the preprocessor-selected AST
+branch, and requires every textual conditional branch in that body to contain
+only the corresponding `exp`, divide, or `rsqrt` return. It also verifies the
+wrapper return type and rejects identity or side-effecting helpers. Reserved
+macros, pre-instrumented adapter markers, input-defined dispatch declarations,
+and input-defined launch-ABI symbols fail closed. Feature macros that affect a
+proved source branch must match between conversion and CCE build. The recorded
+release evidence aligns both `OF_*_USE_FAST_MATH` values; unrelated toolkit
+version macros may differ only when they select the same validated branch. The
+v3 report records the converter arguments and frontend/generator digests.
+Non-system GNU/MS assembler is rejected, including assembler tokens in skipped
+dependencies, so source cannot alias a protected `_launch_v1` symbol. Injected
+headers are macro-shielded; a conventional main-file include guard is
+temporarily undefined only around the injected include and restored before the
+translated body.
 
-The generated Softmax prologue calls the target recipe at wrapper entry.
-RMSNorm preserves its proved launch-geometry block and error return, then calls
-the target recipe before the original launch. `NotHandled` preserves the
-remaining translated body as fallback. RMSNorm affine requires converting the
-caller file that defines its store adapter as well as `layer_norm.cuh` and
-`rms_norm.cuh`; an unknown external store is never inferred
-from field names or layout.
+The generated main CCE calls
+`RowwiseHybridFacadeV1::TrySoftmaxHybrid` or
+`RowwiseHybridFacadeV1::TryRmsNormHybrid` or
+`RowwiseHybridFacadeV1::TryLayerNormHybrid` and retains its original
+translated SIMT launch. The outer `handled` branch is a pre-launch support gate: a
+selector miss continues into that whole-SIMT launch, while a selected call is
+owned by one target kernel that uses both execution styles. It is not an
+all-SIMD versus all-SIMT operator choice. A selected error is returned and
+never launches the fallback a second time.
+
+Inside a selected Softmax kernel, SIMD performs row maximum,
+exponentiation/sum reduction, and normalization division. Inside selected
+RMSNorm kernels, SIMD performs square/sum reduction, square root, division,
+normalization, and the optional affine multiply. For LayerNorm, SIMD performs
+mean, centered variance, and reciprocal square root; SIMT applies centered
+normalization and output-local indexing. In Softmax and RMSNorm, SIMT performs
+contiguous normalized-value staging from UB to the output-local tile. None of
+the current recipes provides mask, gather, scatter, stride, or other
+non-contiguous adapter lowering.
+
+Mixed kernels require an explicit dynamic-UB launch capacity in the second
+launch argument, large enough for the complete `TPipe` allocation. The
+current budgets are 163,904 bytes for Softmax recompute, 65,600 bytes for
+RMSNorm cached, 147,520 bytes for RMSNorm plain row-batch, and 32,832 bytes for
+LayerNorm cached. `0` and `nullptr` are invalid; the host static gate rejects
+both forms, and selected-route device correctness covers the current budgets.
+
+The Softmax runtime queries the current device, vector-core count, and maximum
+threads per vector core on every selected call. Query failures are propagated
+unchanged; the runtime does not substitute a fixed core count or reuse a
+process-global result from another device.
+
+The facade reports that decision as `HybridTryResult`, an alias of the legacy
+`SimdTryResult { bool handled; aclError status; }` type. ABI v1 exports four C
+symbols: `ascify950_softmax_reg_recompute_launch_v1`,
+`ascify950_rmsnorm_reg_cached_launch_v1`,
+`ascify950_rmsnorm_reg_plain_rowbatch_launch_v1`, and
+`ascify950_layernorm_reg_cached_launch_v1`. Their respective DSO linker names
+are `libascify950_softmax_reg_recompute_v1.so`,
+`libascify950_rmsnorm_reg_cached_v1.so`,
+`libascify950_rmsnorm_reg_plain_rowbatch_v1.so`, and
+`libascify950_layernorm_reg_cached_v1.so`. Their SONAMEs append `.1` to those
+linker names (`VERSION 1.0.0`, `SOVERSION 1`). Each public DSO entry
+repeats the corresponding v1 selector-domain check before launching a kernel,
+so a direct ABI call cannot bypass the shape, alignment, extent, or aliasing
+guard.
+
+The mixed target-support device implementations are built separately from
+`runtime/dav_3510/rowwise/` and linked or deployed with the generated main CCE.
+Source conversion alone therefore does not establish CANN build, device
+correctness, hybrid routing, or performance. RMSNorm affine also requires
+converting the caller file that defines its store adapter together with
+`layer_norm.cuh` and `rms_norm.cuh`; an unknown external store is never
+inferred from field names or layout.
+
+The intra-kernel stage change invalidates predecessor build, correctness, and
+performance attribution. Current claims require regenerated Hybrid-facade
+output and freshly built, checked, and measured target-support binaries.
+
+For the existing 950PR harness, set `ROWWISE_SIMD_RUNTIME_DIR` to the
+unchanged CMake build/install `lib` directory containing all four versioned
+`.so` linker-name files, all four `.so.1` SONAME files, and their
+implementations. The harness verifies each ELF SONAME and that its linker and
+SONAME paths resolve to the same file. The build script links the Softmax check
+ELF only to the Softmax DSO and the RMSNorm check ELF only to the two RMSNorm
+DSOs; the dedicated LayerNorm check exposes only its LayerNorm launch symbol.
+The script rejects any extra or missing row-wise `_launch_v1` dynamic symbol.
+The smoke runner prepends the same directory to its process-local
+`LD_LIBRARY_PATH`.
+
+See [the explicit row-wise SIMD+SIMT conversion guide](docs/rowwise-simd-conversion.md)
+for the ABI, build/link steps, selector domains, verification gates, and
+conversion/performance reporting definitions. The explicit activation and AST
+proof are recorded in
+[ADR-0007](docs/decisions/0007-explicit-ast-gated-rowwise-simd-dispatch.md),
+and the same-kernel stage composition is recorded in
+[ADR-0008](docs/decisions/0008-compose-rowwise-simd-and-simt-stages-in-one-kernel.md).
+The common recipe registry and third-family LayerNorm extension are recorded
+in
+[ADR-0009](docs/decisions/0009-register-rowwise-hybrid-recipes-and-add-layernorm.md).
 
 ## Tests
 
@@ -148,13 +253,24 @@ Run the dependency-free host gate:
 sh tests/run_release_checks.sh
 ```
 
-It checks rewrite contracts and runs 49 Python tests. To re-translate and
+It checks rewrite contracts and runs the host Python suites. To re-translate and
 compare all golden fixtures, also set `ASCIFY_BINARY`, `ASCIFY_CUDA_PATH`, and
 `ASCIFY_CLANG_RESOURCE_DIRECTORY`; see [CONTRIBUTING.md](CONTRIBUTING.md).
+The binary-enabled gate also converts the complete OneFlow fixtures through
+the generation wrapper, validates the v3 dispatch/ownership/fallback report,
+rejects pre-instrumented input, and rejects annotated identity-helper and
+non-status-wrapper mutations. It also corrupts each side of a conditional
+primitive in turn and verifies that an invalid inactive branch cannot authorize
+hybrid conversion. Report acceptance structurally requires every recipe call to
+form the generated ownership contract in a distinct wrapper with a later
+direct-scope SIMT launch; the generated and input launch counts must match.
 
-The complete two-host 910C conversion and 950PR correctness/performance replay
-is documented in
+The shared 950PR harness and its legacy in-header row-wise recipe replay are
+documented in
 [tests/softmax_rmsnorm_950/README.md](tests/softmax_rmsnorm_950/README.md).
+That older replay is useful as a SIMT baseline but does not enable the new
+`--target-recipe` or build the four hybrid target-support DSOs. Use the
+explicit conversion guide above for the v1 SIMD+SIMT workflow.
 
 ## Examples
 
@@ -170,6 +286,7 @@ Use these to sanity-check your CUDA path, resource dir, and GPU arch flags.
 | `acl_cub/` | The ACL version of the cub library includes the reduction of Warps within the Block |
 | `src/` | Frontend action, CUDA→DPP maps, CLI, statistics |
 | `include/ascify/` | Thin CUDA-signature compatibility layer installed with Ascify |
+| `runtime/dav_3510/rowwise/` | Separately built versioned row-wise SIMD+SIMT target support |
 | `tests/rewrite/` | Positive/negative semantic rewrite and compatibility-header gates |
 | `tests/softmax_rmsnorm_950/` | Unified 950PR correctness, hardware probe, and benchmark harness |
 | `docs/decisions/` | Architecture decisions for conversion and target-policy boundaries |

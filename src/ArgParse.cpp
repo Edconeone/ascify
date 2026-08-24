@@ -188,6 +188,12 @@ cl::opt<std::string> SimtMathMode("simt-math",
   cl::init("precise"),
   cl::cat(ToolTemplateCategory));
 
+cl::opt<std::string> TargetRecipe("target-recipe",
+  cl::desc("Target recipe: none (default) or dav-3510-rowwise-simd-v1"),
+  cl::value_desc("recipe"),
+  cl::init("none"),
+  cl::cat(ToolTemplateCategory));
+
 cl::opt<bool> NoUndocumented("no-undocumented-features",
   cl::desc("Do not rely on undocumented features in code transformation"),
   cl::value_desc("no-undocumented-features"),
@@ -270,4 +276,5 @@ const std::vector<std::string> ascifyOptionsWithTwoArgs {
   std::string(ClangResourceDir.ArgStr),
   std::string(TargetPolicy.ArgStr),
   std::string(SimtMathMode.ArgStr),
+  std::string(TargetRecipe.ArgStr),
 };

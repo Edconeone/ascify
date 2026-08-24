@@ -24,11 +24,14 @@ THE SOFTWARE.
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTTypeTraits.h"
@@ -43,11 +46,14 @@ THE SOFTWARE.
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/Lexer.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
 namespace ascify {
 
 constexpr const char *DavC310TargetRecipe::TargetHeader;
+constexpr const char *DavC310TargetRecipe::SimdTargetHeader;
+constexpr const char *DavC310TargetRecipe::SimdRecipeName;
 constexpr const char *DavC310TargetRecipe::FunctionBinding;
 constexpr const char *DavC310TargetRecipe::RecordBinding;
 
@@ -1888,8 +1894,53 @@ AdapterProof proveDirectAdapter(const CXXRecordDecl *record,
 
 std::string adapterMarkerText(const AdapterProof &proof) {
   const bool load = proof.kind == AdapterKind::RowMajorInput;
-  std::string text =
-      "\n public:\n"
+  std::vector<std::string> protectedNames = {
+      "ascify_target_direct_load_tag",
+      "ascify_target_direct_store_tag",
+      "ascify_target_adapter_owner_type",
+      "ascify_target_storage_type",
+      "ascify_target_compute_type",
+      "ascify_target_store_is_affine",
+      "ascify_target_data",
+      "ascify_target_row_stride",
+      "ascify_target_weight",
+      "public",
+      "using",
+      "void",
+      "static",
+      "constexpr",
+      "bool",
+      "false",
+      "auto",
+      "const",
+      "decltype",
+      "return",
+  };
+  const auto protect = [&](const NamedDecl *declaration) {
+    if (declaration == nullptr || declaration->getIdentifier() == nullptr)
+      return;
+    const std::string name = declaration->getNameAsString();
+    if (std::find(protectedNames.begin(), protectedNames.end(), name) ==
+        protectedNames.end())
+      protectedNames.push_back(name);
+  };
+  protect(proof.record);
+  protect(proof.storageType);
+  protect(proof.computeType);
+  protect(proof.data);
+  protect(proof.stride);
+  protect(proof.weight);
+  protect(proof.affine);
+  std::string text = "\n";
+  for (const std::string &name : protectedNames) {
+    text += "#pragma push_macro(\"";
+    text += name;
+    text += "\")\n#undef ";
+    text += name;
+    text += "\n";
+  }
+  text +=
+      " public:\n"
       "  using ";
   text += load ? "ascify_target_direct_load_tag"
                : "ascify_target_direct_store_tag";
@@ -1932,6 +1983,11 @@ std::string adapterMarkerText(const AdapterProof &proof) {
     text += proof.weight->getNameAsString();
     text += "; }\n";
   }
+  for (std::size_t index = protectedNames.size(); index != 0; --index) {
+    text += "#pragma pop_macro(\"";
+    text += protectedNames[index - 1];
+    text += "\")\n";
+  }
   return text;
 }
 
@@ -1941,6 +1997,325 @@ enum class PrimitiveKind {
   Divide,
   Rsqrt,
 };
+
+bool asciiIdentifierStart(char character) {
+  return (character >= 'a' && character <= 'z') ||
+         (character >= 'A' && character <= 'Z') ||
+         character == '_';
+}
+
+bool asciiIdentifierContinue(char character) {
+  return asciiIdentifierStart(character) ||
+         (character >= '0' && character <= '9');
+}
+
+std::string splicePrimitiveBodyLines(llvm::StringRef source) {
+  std::string result;
+  result.reserve(source.size());
+  for (std::size_t index = 0; index < source.size(); ++index) {
+    if (source[index] == '\\' && index + 1 < source.size()) {
+      if (source[index + 1] == '\n') {
+        ++index;
+        continue;
+      }
+      if (source[index + 1] == '\r' &&
+          index + 2 < source.size() &&
+          source[index + 2] == '\n') {
+        index += 2;
+        continue;
+      }
+    }
+    if (source[index] == '\r') {
+      if (index + 1 < source.size() &&
+          source[index + 1] == '\n')
+        ++index;
+      result.push_back('\n');
+      continue;
+    }
+    result.push_back(source[index]);
+  }
+  return result;
+}
+
+enum class ConditionalDirectiveKind {
+  Invalid,
+  If,
+  Elif,
+  Else,
+  Endif,
+};
+
+bool horizontalWhitespace(char character) {
+  return character == ' ' || character == '\t' ||
+         character == '\v' || character == '\f';
+}
+
+bool conditionalDirective(
+    const std::string &source,
+    std::size_t hash,
+    std::size_t &afterDirective,
+    ConditionalDirectiveKind &kind) {
+  std::size_t index = hash + 1;
+  while (index < source.size()) {
+    while (index < source.size() &&
+           horizontalWhitespace(source[index]))
+      ++index;
+    if (index + 1 >= source.size() ||
+        source[index] != '/' || source[index + 1] != '*')
+      break;
+    const std::size_t close = source.find("*/", index + 2);
+    if (close == std::string::npos ||
+        source.find('\n', index + 2) < close)
+      return false;
+    index = close + 2;
+  }
+  if (index >= source.size() ||
+      !asciiIdentifierStart(source[index]))
+    return false;
+  const std::size_t nameBegin = index++;
+  while (index < source.size() &&
+         asciiIdentifierContinue(source[index]))
+    ++index;
+  const llvm::StringRef name(
+      source.data() + nameBegin, index - nameBegin);
+  if (name == "if" || name == "ifdef" || name == "ifndef")
+    kind = ConditionalDirectiveKind::If;
+  else if (name == "elif" || name == "elifdef" ||
+           name == "elifndef")
+    kind = ConditionalDirectiveKind::Elif;
+  else if (name == "else")
+    kind = ConditionalDirectiveKind::Else;
+  else if (name == "endif")
+    kind = ConditionalDirectiveKind::Endif;
+  else
+    return false;
+
+  const std::size_t newline = source.find('\n', index);
+  afterDirective = newline == std::string::npos
+                       ? source.size()
+                       : newline + 1;
+  return true;
+}
+
+bool exactPrimitiveReturnTokens(
+    const std::vector<std::string> &tokens,
+    PrimitiveKind kind,
+    const FunctionDecl *function,
+    std::size_t &returnCount) {
+  returnCount = 0;
+  const unsigned arity =
+      kind == PrimitiveKind::Divide ? 2 : 1;
+  if (function == nullptr || kind == PrimitiveKind::None ||
+      function->getNumParams() != arity)
+    return false;
+  std::vector<std::string> parameters;
+  for (const ParmVarDecl *parameter : function->parameters()) {
+    if (parameter->getIdentifier() == nullptr)
+      return false;
+    parameters.push_back(parameter->getNameAsString());
+  }
+
+  std::size_t index = 0;
+  const auto take = [&](const llvm::StringRef expected) {
+    if (index >= tokens.size() || tokens[index] != expected)
+      return false;
+    ++index;
+    return true;
+  };
+  const auto takeAny = [&](const char *first,
+                           const char *second,
+                           const char *third) {
+    if (index >= tokens.size())
+      return false;
+    const std::string &token = tokens[index];
+    if (token != first && token != second && token != third)
+      return false;
+    ++index;
+    return true;
+  };
+  while (index < tokens.size()) {
+    if (!take("return"))
+      return false;
+    if (kind == PrimitiveKind::Divide) {
+      if (index < tokens.size() &&
+          tokens[index] == "__fdividef") {
+        ++index;
+        if (!take("(") || !take(parameters[0]) ||
+            !take(",") || !take(parameters[1]) ||
+            !take(")") || !take(";"))
+          return false;
+      } else if (!take(parameters[0]) || !take("/") ||
+                 !take(parameters[1]) || !take(";")) {
+        return false;
+      }
+    } else {
+      const bool validCallee =
+          kind == PrimitiveKind::Exp
+              ? takeAny("exp", "expf", "__expf")
+              : takeAny("rsqrt", "rsqrtf", "__frsqrt_rn");
+      if (!validCallee || !take("(") ||
+          !take(parameters[0]) || !take(")") ||
+          !take(";"))
+        return false;
+    }
+    ++returnCount;
+  }
+  return true;
+}
+
+struct ConditionalPrimitiveFrame {
+  std::size_t prefixMinimum = 0;
+  std::size_t alternativeMinimum =
+      std::numeric_limits<std::size_t>::max();
+  bool sawElse = false;
+};
+
+bool completeSourcePrimitiveBody(
+    const FunctionDecl *function,
+    PrimitiveKind kind,
+    SourceManager &sourceManager) {
+  const auto *body = llvm::dyn_cast_or_null<clang::CompoundStmt>(
+      stripAttributedStmt(
+          function == nullptr ? nullptr : function->getBody()));
+  if (body == nullptr)
+    return false;
+  const SourceLocation rawLeft = body->getLBracLoc();
+  const SourceLocation rawRight = body->getRBracLoc();
+  if (rawLeft.isInvalid() || rawRight.isInvalid() ||
+      rawLeft.isMacroID() || rawRight.isMacroID())
+    return false;
+  const SourceLocation left = sourceManager.getFileLoc(rawLeft);
+  const SourceLocation right = sourceManager.getFileLoc(rawRight);
+  if (left.isInvalid() || right.isInvalid())
+    return false;
+  const std::pair<clang::FileID, unsigned> leftPosition =
+      sourceManager.getDecomposedLoc(left);
+  const std::pair<clang::FileID, unsigned> rightPosition =
+      sourceManager.getDecomposedLoc(right);
+  if (leftPosition.first != rightPosition.first ||
+      rightPosition.second <= leftPosition.second)
+    return false;
+  bool invalidLeft = false;
+  bool invalidRight = false;
+  const char *leftData =
+      sourceManager.getCharacterData(left, &invalidLeft);
+  const char *rightData =
+      sourceManager.getCharacterData(right, &invalidRight);
+  if (invalidLeft || invalidRight || leftData == nullptr ||
+      rightData == nullptr || rightData <= leftData)
+    return false;
+  const llvm::StringRef rawBody(
+      leftData + 1,
+      static_cast<std::size_t>(rightData - leftData - 1));
+  const std::string source = splicePrimitiveBodyLines(rawBody);
+
+  std::vector<std::string> tokens;
+  std::vector<ConditionalPrimitiveFrame> conditionals;
+  std::size_t minimumReturns = 0;
+  bool lineOnlyWhitespace = true;
+  const auto flushTokens = [&]() {
+    std::size_t count = 0;
+    if (!exactPrimitiveReturnTokens(
+            tokens, kind, function, count))
+      return false;
+    minimumReturns += count;
+    tokens.clear();
+    return true;
+  };
+  const auto enterDirective = [&](ConditionalDirectiveKind directive) {
+    if (directive == ConditionalDirectiveKind::If) {
+      ConditionalPrimitiveFrame frame;
+      frame.prefixMinimum = minimumReturns;
+      conditionals.push_back(frame);
+      minimumReturns = 0;
+      return true;
+    }
+    if (conditionals.empty())
+      return false;
+    ConditionalPrimitiveFrame &frame = conditionals.back();
+    if (directive == ConditionalDirectiveKind::Elif ||
+        directive == ConditionalDirectiveKind::Else) {
+      if (frame.sawElse)
+        return false;
+      frame.alternativeMinimum = std::min(
+          frame.alternativeMinimum, minimumReturns);
+      minimumReturns = 0;
+      if (directive == ConditionalDirectiveKind::Else)
+        frame.sawElse = true;
+      return true;
+    }
+    if (directive != ConditionalDirectiveKind::Endif)
+      return false;
+    frame.alternativeMinimum = std::min(
+        frame.alternativeMinimum, minimumReturns);
+    if (!frame.sawElse)
+      frame.alternativeMinimum = 0;
+    minimumReturns =
+        frame.prefixMinimum + frame.alternativeMinimum;
+    conditionals.pop_back();
+    return true;
+  };
+
+  for (std::size_t index = 0; index < source.size();) {
+    const char character = source[index];
+    if (character == '\n') {
+      lineOnlyWhitespace = true;
+      ++index;
+      continue;
+    }
+    if (horizontalWhitespace(character)) {
+      ++index;
+      continue;
+    }
+    if (character == '/' && index + 1 < source.size() &&
+        source[index + 1] == '/') {
+      const std::size_t newline = source.find('\n', index + 2);
+      index = newline == std::string::npos
+                  ? source.size()
+                  : newline;
+      continue;
+    }
+    if (character == '/' && index + 1 < source.size() &&
+        source[index + 1] == '*') {
+      const std::size_t close = source.find("*/", index + 2);
+      if (close == std::string::npos)
+        return false;
+      if (source.find('\n', index + 2) < close)
+        lineOnlyWhitespace = true;
+      index = close + 2;
+      continue;
+    }
+    // Accept only the canonical directive marker.  The %: digraph remains
+    // ordinary tokens and therefore fails closed instead of hiding a branch.
+    if (character == '#' && lineOnlyWhitespace) {
+      std::size_t afterDirective = index;
+      ConditionalDirectiveKind directive =
+          ConditionalDirectiveKind::Invalid;
+      if (!conditionalDirective(
+              source, index, afterDirective, directive) ||
+          !flushTokens() || !enterDirective(directive))
+        return false;
+      index = afterDirective;
+      lineOnlyWhitespace = true;
+      continue;
+    }
+    lineOnlyWhitespace = false;
+    if (character == '"' || character == '\'')
+      return false;
+    if (asciiIdentifierStart(character)) {
+      const std::size_t begin = index++;
+      while (index < source.size() &&
+             asciiIdentifierContinue(source[index]))
+        ++index;
+      tokens.push_back(source.substr(begin, index - begin));
+      continue;
+    }
+    tokens.push_back(std::string(1, character));
+    ++index;
+  }
+  return flushTokens() && conditionals.empty() &&
+         minimumReturns != 0;
+}
 
 bool primitiveSignature(const FunctionDecl *function,
                         PrimitiveKind kind,
@@ -1965,6 +2340,33 @@ bool primitiveSignature(const FunctionDecl *function,
         !context.hasSameType(
             result.getCanonicalType(),
             parameterType.getCanonicalType()))
+      return false;
+  }
+  return true;
+}
+
+bool floatPrimitiveTemplateSpecialization(
+    const FunctionDecl *function,
+    ASTContext &context) {
+  if (function == nullptr ||
+      (function->getNumParams() != 1 &&
+       function->getNumParams() != 2))
+    return false;
+  const QualType floatType = context.FloatTy;
+  const QualType result =
+      function->getReturnType()
+          .getNonReferenceType()
+          .getUnqualifiedType()
+          .getCanonicalType();
+  if (!context.hasSameType(result, floatType))
+    return false;
+  for (const ParmVarDecl *parameter : function->parameters()) {
+    const QualType parameterType =
+        parameter->getType()
+            .getNonReferenceType()
+            .getUnqualifiedType()
+            .getCanonicalType();
+    if (!context.hasSameType(parameterType, floatType))
       return false;
   }
   return true;
@@ -2027,18 +2429,20 @@ public:
   PrimitiveRegistry(
       ASTContext &context,
       SourceManager &sourceManager,
-      const std::vector<const FunctionDecl *> &functions)
-      : context(context), sourceManager(sourceManager) {
+      const std::vector<const FunctionDecl *> &functions,
+      bool allowAnnotatedPrimitives)
+      : context(context), sourceManager(sourceManager),
+        allowAnnotatedPrimitives(allowAnnotatedPrimitives) {
     for (const FunctionDecl *function : functions) {
-      if (function == nullptr)
+      if (function == nullptr || !function->hasBody() ||
+          !floatPrimitiveTemplateSpecialization(
+              function, context))
         continue;
       const FunctionTemplateDecl *primary =
           function->getPrimaryTemplate();
       if (primary == nullptr)
         continue;
       const PrimitiveKind kind = classify(function);
-      if (kind == PrimitiveKind::None)
-        continue;
       const FunctionDecl *key =
           primary->getTemplatedDecl()->getCanonicalDecl();
       auto inserted = templateKinds.emplace(key, kind);
@@ -2057,7 +2461,12 @@ public:
     if (!active.insert(key).second)
       return PrimitiveKind::None;
 
-    PrimitiveKind result = annotatedPrimitive(function);
+    // Explicit SIMD replacement must be justified by inspectable semantics.
+    // User annotations remain an opt-in compatibility mechanism for the
+    // legacy target recipe, but cannot prove a whole-kernel SIMD takeover.
+    PrimitiveKind result = allowAnnotatedPrimitives
+        ? annotatedPrimitive(function)
+        : PrimitiveKind::None;
     if (result != PrimitiveKind::None &&
         !primitiveSignature(function, result, context))
       result = PrimitiveKind::None;
@@ -2074,11 +2483,9 @@ public:
         function->hasBody(definition) &&
         definition != nullptr &&
         definition->hasAttr<clang::CUDADeviceAttr>()) {
-      const auto *returned =
-          llvm::dyn_cast_or_null<clang::ReturnStmt>(
-              stripAttributedStmt(
-                  onlyStatement(definition->getBody())));
-      if (returned != nullptr) {
+      const auto classifyReturn =
+          [&](const clang::ReturnStmt *returned) {
+        PrimitiveKind candidate = PrimitiveKind::None;
         const Expr *value = stripExpr(returned->getRetValue());
         if (const auto *division =
                 llvm::dyn_cast_or_null<BinaryOperator>(value)) {
@@ -2090,30 +2497,70 @@ public:
               directReferencedAs<ParmVarDecl>(
                   division->getRHS()) ==
                   definition->getParamDecl(1))
-            result = PrimitiveKind::Divide;
+            candidate = PrimitiveKind::Divide;
         } else if (const auto *call =
                        llvm::dyn_cast_or_null<clang::CallExpr>(
                            value)) {
-          const PrimitiveKind called = classifyCall(call);
+          const PrimitiveKind called = classifyCall(
+              call, true);
           const unsigned arity =
               called == PrimitiveKind::Divide ? 2 : 1;
           if (called != PrimitiveKind::None &&
               call->getNumArgs() == arity &&
               definition->getNumParams() == arity) {
-            result = called;
+            candidate = called;
             for (unsigned index = 0; index < arity; ++index) {
               if (directReferencedAs<ParmVarDecl>(
                       call->getArg(index)) !=
                   definition->getParamDecl(index)) {
-                result = PrimitiveKind::None;
+                candidate = PrimitiveKind::None;
                 break;
               }
             }
           }
         }
+        return candidate;
+      };
+
+      const auto *body =
+          llvm::dyn_cast_or_null<clang::CompoundStmt>(
+              stripAttributedStmt(definition->getBody()));
+      PrimitiveKind bodyKind = PrimitiveKind::None;
+      bool sawReturn = false;
+      bool allReturnsAgree = body != nullptr;
+      if (body != nullptr) {
+        for (const Stmt *statement : body->body()) {
+          const auto *returned =
+              llvm::dyn_cast_or_null<clang::ReturnStmt>(
+                  stripAttributedStmt(statement));
+          if (returned == nullptr) {
+            allReturnsAgree = false;
+            break;
+          }
+          const PrimitiveKind candidate =
+              classifyReturn(returned);
+          if (candidate == PrimitiveKind::None ||
+              (bodyKind != PrimitiveKind::None &&
+               bodyKind != candidate)) {
+            allReturnsAgree = false;
+            break;
+          }
+          bodyKind = candidate;
+          sawReturn = true;
+        }
       }
+      if (allReturnsAgree && sawReturn)
+        result = bodyKind;
       if (result != PrimitiveKind::None &&
           !primitiveSignature(definition, result, context))
+        result = PrimitiveKind::None;
+      // The AST contains only the active preprocessing branch.  A SIMD
+      // takeover also requires every spelling retained in the source buffer
+      // to be the same exact primitive forwarding operation.
+      if (result != PrimitiveKind::None &&
+          !allowAnnotatedPrimitives &&
+          !completeSourcePrimitiveBody(
+              definition, result, sourceManager))
         result = PrimitiveKind::None;
     }
 
@@ -2174,6 +2621,7 @@ private:
 
   ASTContext &context;
   SourceManager &sourceManager;
+  bool allowAnnotatedPrimitives;
   std::map<const FunctionDecl *, PrimitiveKind> functionKinds;
   std::map<const FunctionDecl *, PrimitiveKind> templateKinds;
   std::set<const FunctionDecl *> active;
@@ -3245,8 +3693,30 @@ public:
         allowedSemanticCalls(allowedSemanticCalls),
         inverseOutput(inverseOutput),
         allowedInverseWrite(allowedInverseWrite),
+        secondaryOutput(nullptr),
+        allowedSecondaryWrite(nullptr),
         choice(choice),
         context(context) {}
+
+  SemanticEffectVisitor(
+      const FunctionDecl *function,
+      PrimitiveRegistry &registry,
+      const std::set<const clang::CallExpr *> &allowedAdapterCalls,
+      const std::set<const clang::CallExpr *> &allowedSemanticCalls,
+      const ParmVarDecl *firstOutput,
+      const BinaryOperator *allowedFirstWrite,
+      const ParmVarDecl *secondOutput,
+      const BinaryOperator *allowedSecondWrite,
+      const SoftmaxChoiceKey *choice,
+      ASTContext &context)
+      : function(function), registry(registry),
+        allowedAdapterCalls(allowedAdapterCalls),
+        allowedSemanticCalls(allowedSemanticCalls),
+        inverseOutput(firstOutput),
+        allowedInverseWrite(allowedFirstWrite),
+        secondaryOutput(secondOutput),
+        allowedSecondaryWrite(allowedSecondWrite),
+        choice(choice), context(context) {}
 
   bool TraverseIfStmt(IfStmt *statement) {
     if (statement == nullptr)
@@ -3325,8 +3795,10 @@ public:
           !variable->hasAttr<
               clang::CUDASharedAttr>()) ||
          (llvm::isa<ParmVarDecl>(variable) &&
-          (variable != inverseOutput ||
-           operation != allowedInverseWrite))))
+          !((variable == inverseOutput &&
+             operation == allowedInverseWrite) ||
+            (variable == secondaryOutput &&
+             operation == allowedSecondaryWrite)))))
       safe = false;
     return safe;
   }
@@ -3436,6 +3908,8 @@ public:
       &allowedSemanticCalls;
   const ParmVarDecl *inverseOutput;
   const BinaryOperator *allowedInverseWrite;
+  const ParmVarDecl *secondaryOutput;
+  const BinaryOperator *allowedSecondaryWrite;
   const SoftmaxChoiceKey *choice;
   ASTContext &context;
   std::set<const FunctionDecl *> active;
@@ -3460,6 +3934,25 @@ bool semanticEffectsAllowed(
       allowedInverseWrite, choice, context);
   effects.TraverseStmt(
       const_cast<Stmt *>(function->getBody()));
+  return effects.safe;
+}
+
+bool semanticEffectsAllowedWithTwoOutputs(
+    const FunctionDecl *function,
+    PrimitiveRegistry &registry,
+    const std::set<const clang::CallExpr *> &allowedAdapterCalls,
+    const std::set<const clang::CallExpr *> &allowedSemanticCalls,
+    const ParmVarDecl *firstOutput,
+    const BinaryOperator *allowedFirstWrite,
+    const ParmVarDecl *secondOutput,
+    const BinaryOperator *allowedSecondWrite,
+    const SoftmaxChoiceKey *choice,
+    ASTContext &context) {
+  SemanticEffectVisitor effects(
+      function, registry, allowedAdapterCalls, allowedSemanticCalls,
+      firstOutput, allowedFirstWrite, secondOutput, allowedSecondWrite,
+      choice, context);
+  effects.TraverseStmt(const_cast<Stmt *>(function->getBody()));
   return effects.safe;
 }
 
@@ -4831,6 +5324,20 @@ const Decl *directStorageReadRoot(const Expr *expression) {
              : nullptr;
 }
 
+const Decl *directStorageReadRootThroughArithmeticCasts(
+    const Expr *expression) {
+  expression = stripExpr(expression);
+  while (const auto *cast =
+             llvm::dyn_cast_or_null<clang::ExplicitCastExpr>(expression)) {
+    if (cast->getCastKind() != clang::CK_Dependent &&
+        (!cast->getType()->isArithmeticType() ||
+         !cast->getSubExpr()->getType()->isArithmeticType()))
+      return nullptr;
+    expression = stripExpr(cast->getSubExpr());
+  }
+  return directStorageReadRoot(expression);
+}
+
 struct StorageCopyEdge {
   const Decl *from = nullptr;
   const Decl *to = nullptr;
@@ -4844,7 +5351,8 @@ public:
     if (operation->getOpcode() != clang::BO_Assign)
       return true;
     const Decl *from =
-        directStorageReadRoot(operation->getRHS());
+        directStorageReadRootThroughArithmeticCasts(
+            operation->getRHS());
     const Decl *to = storageRoot(operation->getLHS());
     if (from != nullptr && to != nullptr && from != to)
       edges.push_back({from, to, operation->getExprLoc()});
@@ -5427,6 +5935,57 @@ const Expr *canonicalAliasExpression(
       expression, context, active);
 }
 
+class CanonicalAliasMutationVisitor
+    : public clang::RecursiveASTVisitor<CanonicalAliasMutationVisitor> {
+public:
+  explicit CanonicalAliasMutationVisitor(const VarDecl *variable)
+      : variable(variable) {}
+
+  bool VisitBinaryOperator(BinaryOperator *operation) {
+    if (operation->isAssignmentOp() &&
+        storageRoot(operation->getLHS()) == variable)
+      mutated = true;
+    return !mutated;
+  }
+
+  bool VisitUnaryOperator(clang::UnaryOperator *operation) {
+    const clang::UnaryOperatorKind opcode = operation->getOpcode();
+    if ((opcode == clang::UO_PreInc || opcode == clang::UO_PostInc ||
+         opcode == clang::UO_PreDec || opcode == clang::UO_PostDec ||
+         opcode == clang::UO_AddrOf) &&
+        directReferencedDecl(operation->getSubExpr()) == variable)
+      mutated = true;
+    return !mutated;
+  }
+
+  const VarDecl *variable;
+  bool mutated = false;
+};
+
+const Expr *canonicalUnmodifiedIntegerAliasExpression(
+    const Expr *expression,
+    ASTContext &context) {
+  expression = canonicalAliasExpression(expression, context);
+  const auto *reference =
+      llvm::dyn_cast_or_null<DeclRefExpr>(expression);
+  const auto *variable = reference == nullptr
+                             ? nullptr
+                             : llvm::dyn_cast<VarDecl>(reference->getDecl());
+  const FunctionDecl *function =
+      reference == nullptr ? nullptr : enclosingFunction(reference, context);
+  if (variable == nullptr || function == nullptr ||
+      llvm::isa<ParmVarDecl>(variable) ||
+      !variable->isLocalVarDecl() || !variable->hasInit() ||
+      !variable->getType()->isIntegerType())
+    return expression;
+  CanonicalAliasMutationVisitor mutations(variable);
+  mutations.TraverseStmt(
+      const_cast<Stmt *>(function->getBody()));
+  return mutations.mutated
+             ? expression
+             : canonicalAliasExpression(variable->getInit(), context);
+}
+
 bool canonicalDeclReference(
     const Expr *expression,
     const Decl *declaration,
@@ -5600,6 +6159,14 @@ enum class CanonicalKernelFamily {
   SoftmaxWarp,
   RmsBlock,
   RmsWarp,
+  LayerNormBlock,
+  LayerNormWarp,
+};
+
+enum class CanonicalRowwiseOperation {
+  Softmax,
+  RmsNorm,
+  LayerNorm,
 };
 
 struct CanonicalKernelShape {
@@ -5616,15 +6183,21 @@ struct CanonicalKernelShape {
   const NonTypeTemplateParmDecl *algorithm = nullptr;
   const ParmVarDecl *rows = nullptr;
   const ParmVarDecl *columns = nullptr;
+  const ParmVarDecl *meanOutput = nullptr;
   const ParmVarDecl *inverseOutput = nullptr;
 
   bool softmax() const {
     return family == CanonicalKernelFamily::SoftmaxBlock ||
            family == CanonicalKernelFamily::SoftmaxWarp;
   }
+  bool layerNorm() const {
+    return family == CanonicalKernelFamily::LayerNormBlock ||
+           family == CanonicalKernelFamily::LayerNormWarp;
+  }
   bool warp() const {
     return family == CanonicalKernelFamily::SoftmaxWarp ||
-           family == CanonicalKernelFamily::RmsWarp;
+           family == CanonicalKernelFamily::RmsWarp ||
+           family == CanonicalKernelFamily::LayerNormWarp;
   }
 };
 
@@ -5640,8 +6213,15 @@ const NonTypeTemplateParmDecl *valueTemplateParameter(
 
 CanonicalKernelShape canonicalKernelShape(
     const FunctionDecl *function,
-    bool softmax) {
+    CanonicalRowwiseOperation operation) {
   CanonicalKernelShape result;
+  const unsigned expectedParameters =
+      operation == CanonicalRowwiseOperation::Softmax
+          ? 4
+          : operation == CanonicalRowwiseOperation::RmsNorm ? 6 : 7;
+  if (function == nullptr ||
+      function->getNumParams() != expectedParameters)
+    return result;
   const FunctionTemplateDecl *functionTemplate =
       primaryFunctionTemplate(function);
   const TemplateParameterList *parameters =
@@ -5650,22 +6230,27 @@ CanonicalKernelShape canonicalKernelShape(
           : functionTemplate->getTemplateParameters();
   if (parameters == nullptr)
     return result;
-  result.rows = function->getParamDecl(softmax ? 2 : 2);
-  result.columns =
-      function->getParamDecl(softmax ? 3 : 3);
-  result.inverseOutput =
-      softmax ? nullptr : function->getParamDecl(5);
+  result.rows = function->getParamDecl(2);
+  result.columns = function->getParamDecl(3);
+  if (operation == CanonicalRowwiseOperation::RmsNorm)
+    result.inverseOutput = function->getParamDecl(5);
+  if (operation == CanonicalRowwiseOperation::LayerNorm) {
+    result.meanOutput = function->getParamDecl(5);
+    result.inverseOutput = function->getParamDecl(6);
+  }
   result.pack = valueTemplateParameter(parameters, 3);
   if (result.pack == nullptr)
     return {};
-  if (softmax && parameters->size() == 6) {
+  if (operation == CanonicalRowwiseOperation::Softmax &&
+      parameters->size() == 6) {
     result.family =
         CanonicalKernelFamily::SoftmaxBlock;
     result.blockSize =
         valueTemplateParameter(parameters, 4);
     result.algorithm =
         valueTemplateParameter(parameters, 5);
-  } else if (softmax && parameters->size() == 9) {
+  } else if (operation == CanonicalRowwiseOperation::Softmax &&
+             parameters->size() == 9) {
     result.family =
         CanonicalKernelFamily::SoftmaxWarp;
     result.columnsPerThread =
@@ -5678,12 +6263,14 @@ CanonicalKernelShape canonicalKernelShape(
         valueTemplateParameter(parameters, 7);
     result.algorithm =
         valueTemplateParameter(parameters, 8);
-  } else if (!softmax && parameters->size() == 5) {
+  } else if (operation == CanonicalRowwiseOperation::RmsNorm &&
+             parameters->size() == 5) {
     result.family =
         CanonicalKernelFamily::RmsBlock;
     result.blockSize =
         valueTemplateParameter(parameters, 4);
-  } else if (!softmax && parameters->size() == 9) {
+  } else if (operation == CanonicalRowwiseOperation::RmsNorm &&
+             parameters->size() == 9) {
     result.family =
         CanonicalKernelFamily::RmsWarp;
     result.columnsPerThread =
@@ -5696,6 +6283,19 @@ CanonicalKernelShape canonicalKernelShape(
         valueTemplateParameter(parameters, 7);
     result.padding =
         valueTemplateParameter(parameters, 8);
+  } else if (operation == CanonicalRowwiseOperation::LayerNorm &&
+             parameters->size() == 5) {
+    result.family = CanonicalKernelFamily::LayerNormBlock;
+    result.blockSize = valueTemplateParameter(parameters, 4);
+  } else if (operation == CanonicalRowwiseOperation::LayerNorm &&
+             parameters->size() == 9) {
+    result.family = CanonicalKernelFamily::LayerNormWarp;
+    result.columnsPerThread = valueTemplateParameter(parameters, 4);
+    result.minimumColumnsPerThread =
+        valueTemplateParameter(parameters, 5);
+    result.threadGroupWidth = valueTemplateParameter(parameters, 6);
+    result.rowsPerAccess = valueTemplateParameter(parameters, 7);
+    result.padding = valueTemplateParameter(parameters, 8);
   }
   if (result.family == CanonicalKernelFamily::None ||
       (result.warp() &&
@@ -5707,7 +6307,8 @@ CanonicalKernelShape canonicalKernelShape(
        result.blockSize == nullptr) ||
       (result.softmax() &&
        result.algorithm == nullptr) ||
-      (result.family == CanonicalKernelFamily::RmsWarp &&
+      ((result.family == CanonicalKernelFamily::RmsWarp ||
+        result.family == CanonicalKernelFamily::LayerNormWarp) &&
        result.minimumColumnsPerThread == nullptr))
     return {};
   return result;
@@ -5749,12 +6350,21 @@ bool canonicalBlockPackLoop(
       !canonicalDeclReference(
           parts.step, shape.blockSize, context))
     return false;
+  const auto columns = [&](const Expr *operand) {
+    operand = canonicalAliasExpression(operand, context);
+    while (const auto *cast =
+               llvm::dyn_cast_or_null<clang::ExplicitCastExpr>(operand)) {
+      if (!cast->getType()->isIntegerType() ||
+          !cast->getSubExpr()->getType()->isIntegerType())
+        return false;
+      operand = canonicalAliasExpression(
+          cast->getSubExpr(), context);
+    }
+    return directReferencedDecl(operand) == shape.columns;
+  };
   return canonicalBinaryOperands(
       parts.bound, clang::BO_Div,
-      [&](const Expr *operand) {
-        return canonicalDeclReference(
-            operand, shape.columns, context);
-      },
+      columns,
       [&](const Expr *operand) {
         return canonicalDeclReference(
             operand, shape.pack, context);
@@ -5855,8 +6465,8 @@ bool canonicalWarpOuterLoop(
       parts.incrementOpcode !=
           clang::BO_AddAssign)
     return false;
-  if (shape.family ==
-      CanonicalKernelFamily::SoftmaxWarp) {
+  if (shape.family == CanonicalKernelFamily::SoftmaxWarp ||
+      shape.family == CanonicalKernelFamily::LayerNormWarp) {
     const bool initial =
         canonicalBinaryOperands(
             parts.initial, clang::BO_Mul,
@@ -6059,7 +6669,7 @@ bool canonicalWarpAdapterAccesses(
                 call, shape, context))
           return false;
         const Expr *rowExpression =
-            canonicalAliasExpression(
+            canonicalUnmodifiedIntegerAliasExpression(
                 call->getArg(1), context);
         ReferencedVariableSet rowReferences;
         rowReferences.TraverseStmt(
@@ -6106,8 +6716,8 @@ bool canonicalWarpAdapterAccesses(
           return false;
         outerLoop = candidateOuter;
         const bool rowExact =
-            shape.family ==
-                    CanonicalKernelFamily::SoftmaxWarp
+            (shape.family == CanonicalKernelFamily::SoftmaxWarp ||
+             shape.family == CanonicalKernelFamily::LayerNormWarp)
                 ? canonicalSoftmaxWarpRow(
                       rowExpression, outerRow,
                       rowInGroup, context)
@@ -6189,11 +6799,13 @@ bool canonicalWarpAdapterAccesses(
               canonicalUnitLoop(
                   packLoop, minimum, maximum);
         }
-        return packLoopExact &&
-               statementNestedWithin(
-                   call, packLoop, context) &&
-               statementNestedWithin(
-                   packLoop, rowLoop, context);
+        if (!packLoopExact ||
+            !statementNestedWithin(
+                call, packLoop, context) ||
+            !statementNestedWithin(
+                packLoop, rowLoop, context))
+          return false;
+        return true;
       };
   for (const AdapterBufferEvidence::Access &access :
        adapters.loadCalls) {
@@ -6570,6 +7182,24 @@ bool canonicalLeaderIf(
       !cudaThreadLaneZeroCondition(
           statement->getCond(), context))
     return false;
+  if (shape.layerNorm()) {
+    const auto *body = llvm::dyn_cast_or_null<clang::CompoundStmt>(
+        stripAttributedStmt(statement->getThen()));
+    if (body == nullptr || body->size() != 2)
+      return false;
+    std::set<const Decl *> destinations;
+    for (const Stmt *child : body->body()) {
+      const auto *write = llvm::dyn_cast_or_null<BinaryOperator>(
+          stripAttributedStmt(child));
+      if (write == nullptr ||
+          write->getOpcode() != clang::BO_Assign)
+        return false;
+      destinations.insert(storageRoot(write->getLHS()));
+    }
+    return destinations.size() == 2 &&
+           destinations.count(shape.meanOutput) == 1 &&
+           destinations.count(shape.inverseOutput) == 1;
+  }
   const auto *write =
       llvm::dyn_cast_or_null<BinaryOperator>(
           stripAttributedStmt(
@@ -6737,13 +7367,13 @@ public:
 
 bool canonicalKernelCoverageAndControl(
     const FunctionDecl *function,
-    bool softmax,
+    CanonicalRowwiseOperation operation,
     const AdapterBufferEvidence &adapters,
     ASTContext &context,
     std::set<const clang::CallExpr *>
         &allowedStructuralCalls) {
   const CanonicalKernelShape shape =
-      canonicalKernelShape(function, softmax);
+      canonicalKernelShape(function, operation);
   if (shape.family == CanonicalKernelFamily::None)
     return false;
   const bool accesses =
@@ -7275,7 +7905,7 @@ void collectSoftmaxChoices(
   std::set<const clang::CallExpr *>
       allowedStructuralCalls;
   if (!canonicalKernelCoverageAndControl(
-          function, true,
+          function, CanonicalRowwiseOperation::Softmax,
           adapterBuffers.evidence, context,
           allowedStructuralCalls))
     return;
@@ -8058,14 +8688,17 @@ bool dependentEnableIfStatus(
 
 bool statusReturnCompatible(
     const FunctionDecl *function,
-    SourceManager &sourceManager) {
+    SourceManager &sourceManager,
+    bool allowAnnotatedStatus) {
   if (function == nullptr || !function->hasBody())
     return false;
-  for (const clang::AnnotateAttr *annotation :
-       function->specific_attrs<clang::AnnotateAttr>()) {
-    if (annotation->getAnnotation() ==
-        "ascify.semantic.status")
-      return true;
+  if (allowAnnotatedStatus) {
+    for (const clang::AnnotateAttr *annotation :
+         function->specific_attrs<clang::AnnotateAttr>()) {
+      if (annotation->getAnnotation() ==
+          "ascify.semantic.status")
+        return true;
+    }
   }
   const QualType type =
       function->getReturnType().getNonReferenceType();
@@ -8086,7 +8719,7 @@ bool isSoftmaxDispatcher(
       choices.empty() ||
       function->hasAttr<clang::CUDADeviceAttr>() ||
       function->hasAttr<clang::CUDAGlobalAttr>() ||
-      !statusReturnCompatible(function, sourceManager) ||
+      !statusReturnCompatible(function, sourceManager, true) ||
       function->getNumParams() != 5 ||
       !exactlyTypeTemplateParameters(function, 3) ||
       !function->getParamDecl(0)->getType()->isPointerType() ||
@@ -8513,6 +9146,7 @@ bool cudaThreadLaneZeroCondition(
   else if (evaluatesToZero(
                comparison->getRHS(), context))
     lane = stripExpr(comparison->getLHS());
+  lane = canonicalUnmodifiedIntegerAliasExpression(lane, context);
   const clang::MemberExpr *member =
       llvm::dyn_cast_or_null<clang::MemberExpr>(lane);
   if (const auto *pseudo =
@@ -8591,6 +9225,60 @@ bool singleThreadLeaderWrite(
              onlyStatement(leader->getThen())) == write &&
          cudaThreadLaneZeroCondition(
              leader->getCond(), context);
+}
+
+const IfStmt *singleThreadLeaderForWrite(
+    const BinaryOperator *write,
+    ASTContext &context) {
+  if (write == nullptr)
+    return nullptr;
+  const Stmt *current = write;
+  const IfStmt *leader = nullptr;
+  std::set<const Stmt *> active;
+  while (current != nullptr && active.insert(current).second) {
+    const auto parents = context.getParents(*current);
+    const Stmt *next = nullptr;
+    for (const clang::DynTypedNode &parent : parents) {
+      if (const auto *conditional = parent.get<IfStmt>()) {
+        if (conditional->getThen() == current ||
+            conditional->getElse() == current) {
+          if (leader != nullptr)
+            return nullptr;
+          leader = conditional;
+        }
+      }
+      if (next == nullptr)
+        next = parent.get<Stmt>();
+    }
+    current = next;
+  }
+  return leader != nullptr && leader->getElse() == nullptr &&
+                 cudaThreadLaneZeroCondition(
+                     leader->getCond(), context)
+             ? leader
+             : nullptr;
+}
+
+bool pairedSingleThreadLeaderWrites(
+    const BinaryOperator *first,
+    const BinaryOperator *second,
+    ASTContext &context) {
+  const IfStmt *firstLeader =
+      singleThreadLeaderForWrite(first, context);
+  const IfStmt *secondLeader =
+      singleThreadLeaderForWrite(second, context);
+  if (firstLeader == nullptr || firstLeader != secondLeader)
+    return false;
+  const auto *body = llvm::dyn_cast_or_null<clang::CompoundStmt>(
+      stripAttributedStmt(firstLeader->getThen()));
+  if (body == nullptr || body->size() != 2)
+    return false;
+  std::set<const Stmt *> expected = {first, second};
+  for (const Stmt *child : body->body()) {
+    if (expected.erase(stripAttributedStmt(child)) != 1)
+      return false;
+  }
+  return expected.empty();
 }
 
 bool rmsPipelineExecutable(
@@ -8893,7 +9581,7 @@ bool isRmsKernel(const FunctionDecl *function,
   std::set<const clang::CallExpr *>
       allowedStructuralCalls;
   if (!canonicalKernelCoverageAndControl(
-          function, false,
+          function, CanonicalRowwiseOperation::RmsNorm,
           adapterBuffers.evidence, context,
           allowedStructuralCalls))
     return false;
@@ -8907,15 +9595,479 @@ bool isRmsKernel(const FunctionDecl *function,
       context, sourceManager);
 }
 
+bool allSystemCallCandidatesNamed(
+    const clang::CallExpr *call, const FunctionDecl *caller,
+    llvm::StringRef name, ASTContext &context);
+
+bool allSystemDependentCallCandidatesNamed(
+    const clang::CallExpr *call, const FunctionDecl *caller,
+    llvm::StringRef name, ASTContext &context);
+
+bool allSystemOrdinaryDependentCallCandidatesNamed(
+    const clang::CallExpr *call, const FunctionDecl *caller,
+    llvm::StringRef name, ASTContext &context);
+
+struct LayerNormNormalizationEvidence {
+  const Decl *sourceRoot = nullptr;
+  const Decl *outputRoot = nullptr;
+  const VarDecl *meanValue = nullptr;
+  const BinaryOperator *operation = nullptr;
+};
+
+class LayerNormNormalizationVisitor
+    : public clang::RecursiveASTVisitor<LayerNormNormalizationVisitor> {
+public:
+  LayerNormNormalizationVisitor(
+      const ProducedValue &inverse, ASTContext &context)
+      : inverse(inverse), context(context) {}
+
+  bool VisitBinaryOperator(BinaryOperator *operation) {
+    if (operation->getOpcode() != clang::BO_Assign ||
+        discardedOrDeferredExecution(operation, context))
+      return true;
+    const auto *multiply =
+        llvm::dyn_cast_or_null<BinaryOperator>(
+            stripExpr(operation->getRHS()));
+    if (multiply == nullptr || multiply->getOpcode() != clang::BO_Mul)
+      return true;
+    const Expr *centeredExpression = nullptr;
+    if (referencesProducedValue(multiply->getLHS(), inverse))
+      centeredExpression = multiply->getRHS();
+    else if (referencesProducedValue(multiply->getRHS(), inverse))
+      centeredExpression = multiply->getLHS();
+    const auto *centered =
+        llvm::dyn_cast_or_null<BinaryOperator>(
+            stripExpr(centeredExpression));
+    if (centered == nullptr || centered->getOpcode() != clang::BO_Sub)
+      return true;
+    const Decl *sourceRoot =
+        directStorageReadRootThroughArithmeticCasts(centered->getLHS());
+    const auto *meanValue =
+        directReferencedAs<VarDecl>(centered->getRHS());
+    const Decl *outputRoot = storageRoot(operation->getLHS());
+    if (sourceRoot != nullptr && outputRoot != nullptr &&
+        meanValue != nullptr && meanValue->hasInit()) {
+      normalizations.push_back(
+          {sourceRoot, outputRoot, meanValue, operation});
+    }
+    return true;
+  }
+
+  const ProducedValue &inverse;
+  ASTContext &context;
+  std::vector<LayerNormNormalizationEvidence> normalizations;
+};
+
+class ExecutableCallList
+    : public clang::RecursiveASTVisitor<ExecutableCallList> {
+public:
+  explicit ExecutableCallList(ASTContext &context) : context(context) {}
+
+  bool VisitCallExpr(clang::CallExpr *call) {
+    if (!discardedOrDeferredExecution(call, context))
+      calls.push_back(call);
+    return true;
+  }
+
+  ASTContext &context;
+  std::vector<const clang::CallExpr *> calls;
+};
+
+struct LayerNormStatisticsCalls {
+  std::vector<const clang::CallExpr *> accumulations;
+  const clang::CallExpr *reduce = nullptr;
+};
+
+const Decl *layerNormStorageRoot(const Expr *expression) {
+  if (const Decl *root = storageRoot(expression))
+    return root;
+  expression = stripExpr(expression);
+  if (const auto *cast =
+          llvm::dyn_cast_or_null<clang::ExplicitCastExpr>(expression)) {
+    if (cast->getCastKind() != clang::CK_Dependent &&
+        !cast->getType()->isPointerType())
+      return nullptr;
+    expression = stripExpr(cast->getSubExpr());
+  }
+  const auto *offset =
+      llvm::dyn_cast_or_null<BinaryOperator>(expression);
+  if (offset == nullptr || offset->getOpcode() != clang::BO_Add)
+    return nullptr;
+  const auto rootWithOffset = [&](const Expr *base,
+                                  const Expr *index) -> const Decl * {
+    if (!simpleIntegralOffset(index))
+      return nullptr;
+    const QualType type = base->getType();
+    if (!type->isPointerType() && !type->isArrayType() &&
+        !type->isDependentType() &&
+        !type->isInstantiationDependentType())
+      return nullptr;
+    return storageRoot(base);
+  };
+  if (const Decl *root =
+          rootWithOffset(offset->getLHS(), offset->getRHS()))
+    return root;
+  return rootWithOffset(offset->getRHS(), offset->getLHS());
+}
+
+LayerNormStatisticsCalls findLayerNormStatisticsCalls(
+    const Stmt *body, const Decl *meanRoot, const Decl *m2Root,
+    const Decl *countRoot, ASTContext &context,
+    SourceManager &sourceManager) {
+  LayerNormStatisticsCalls result;
+  if (body == nullptr || meanRoot == nullptr || m2Root == nullptr ||
+      countRoot == nullptr || meanRoot == m2Root ||
+      meanRoot == countRoot || m2Root == countRoot)
+    return result;
+
+  ExecutableCallList allCalls(context);
+  allCalls.TraverseStmt(const_cast<Stmt *>(body));
+  for (const clang::CallExpr *reduction : allCalls.calls) {
+    if (reduction->getNumArgs() != 6)
+      continue;
+    const Decl *reducedMean = layerNormStorageRoot(reduction->getArg(3));
+    const Decl *reducedM2 = layerNormStorageRoot(reduction->getArg(4));
+    const Decl *reducedCount = layerNormStorageRoot(reduction->getArg(5));
+    if (reducedMean != meanRoot || reducedM2 != m2Root ||
+        reducedCount != countRoot)
+      continue;
+    const Decl *threadMean = layerNormStorageRoot(reduction->getArg(0));
+    const Decl *threadM2 = layerNormStorageRoot(reduction->getArg(1));
+    const Decl *threadCount = layerNormStorageRoot(reduction->getArg(2));
+    if (threadMean == nullptr || threadM2 == nullptr || threadCount == nullptr ||
+        threadMean == threadM2 || threadMean == threadCount ||
+        threadM2 == threadCount)
+      continue;
+    std::vector<const clang::CallExpr *> accumulations;
+    for (const clang::CallExpr *accumulation : allCalls.calls) {
+      if (accumulation->getNumArgs() != 4)
+        continue;
+      if (layerNormStorageRoot(accumulation->getArg(1)) != threadMean ||
+          layerNormStorageRoot(accumulation->getArg(2)) != threadM2 ||
+          layerNormStorageRoot(accumulation->getArg(3)) != threadCount)
+        continue;
+      const Decl *sourceRoot =
+          directStorageReadRootThroughArithmeticCasts(
+              accumulation->getArg(0));
+      if (sourceRoot == nullptr)
+        continue;
+      const SourceLocation accumulationLocation =
+          sourceManager.getExpansionLoc(accumulation->getBeginLoc());
+      const SourceLocation reductionLocation =
+          sourceManager.getExpansionLoc(reduction->getBeginLoc());
+      if (!sourceManager.isBeforeInTranslationUnit(
+              accumulationLocation, reductionLocation))
+        continue;
+      accumulations.push_back(accumulation);
+    }
+    if (accumulations.empty())
+      continue;
+    if (result.reduce != nullptr)
+      return LayerNormStatisticsCalls{};
+    result.accumulations = std::move(accumulations);
+    result.reduce = reduction;
+  }
+  return result;
+}
+
+class LayerNormOutputWriteVisitor
+    : public clang::RecursiveASTVisitor<LayerNormOutputWriteVisitor> {
+public:
+  LayerNormOutputWriteVisitor(
+      const ParmVarDecl *meanOutput, const ParmVarDecl *inverseOutput,
+      const ProducedValue &mean, const ProducedValue &inverse,
+      ASTContext &context)
+      : meanOutput(meanOutput), inverseOutput(inverseOutput), mean(mean),
+        inverse(inverse), context(context) {}
+
+  bool VisitBinaryOperator(BinaryOperator *operation) {
+    if (operation->getOpcode() != clang::BO_Assign ||
+        discardedOrDeferredExecution(operation, context))
+      return true;
+    const Decl *destination = storageRoot(operation->getLHS());
+    if (destination == meanOutput &&
+        referencesProducedValue(operation->getRHS(), mean))
+      meanWrites.push_back(operation);
+    if (destination == inverseOutput &&
+        referencesProducedValue(operation->getRHS(), inverse))
+      inverseWrites.push_back(operation);
+    return true;
+  }
+
+  const ParmVarDecl *meanOutput;
+  const ParmVarDecl *inverseOutput;
+  const ProducedValue &mean;
+  const ProducedValue &inverse;
+  ASTContext &context;
+  std::vector<const BinaryOperator *> meanWrites;
+  std::vector<const BinaryOperator *> inverseWrites;
+};
+
+const Expr *additionOperandPairedWith(
+    const Expr *expression, const ParmVarDecl *parameter) {
+  const auto *addition =
+      llvm::dyn_cast_or_null<BinaryOperator>(stripExpr(expression));
+  if (addition == nullptr || addition->getOpcode() != clang::BO_Add)
+    return nullptr;
+  if (directReferenceThroughCasts(addition->getLHS()) == parameter)
+    return addition->getRHS();
+  if (directReferenceThroughCasts(addition->getRHS()) == parameter)
+    return addition->getLHS();
+  return nullptr;
+}
+
+bool handledFloatZero(const Expr *expression,
+                      ASTContext &context) {
+  const auto numericZero = [&](const Expr *candidate) {
+    Expr::EvalResult evaluated;
+    if (candidate == nullptr ||
+        !candidate->EvaluateAsRValue(evaluated, context))
+      return false;
+    return (evaluated.Val.isInt() && evaluated.Val.getInt() == 0) ||
+           (evaluated.Val.isFloat() && evaluated.Val.getFloat().isZero());
+  };
+  if (numericZero(expression))
+    return true;
+  expression = stripExpr(expression);
+  const auto *cast =
+      llvm::dyn_cast_or_null<clang::ExplicitCastExpr>(expression);
+  if (cast == nullptr ||
+      (cast->getCastKind() != clang::CK_Dependent &&
+       !cast->getType()->isDependentType() &&
+       !cast->getType()->isInstantiationDependentType() &&
+       !cast->getType()->isArithmeticType()))
+    return false;
+  return numericZero(cast->getSubExpr());
+}
+
+bool layerNormAdapterTopologyExact(
+    const Stmt *body, const LayerNormNormalizationEvidence &normalization,
+    const AdapterBufferEvidence &adapters, SourceManager &sourceManager) {
+  if (adapters.loadCalls.empty() || adapters.loadCalls.size() > 2 ||
+      adapters.storeCalls.empty() || adapters.storeCalls.size() > 2)
+    return false;
+  bool loadedNormalizationSource = false;
+  for (const AdapterBufferEvidence::Access &load : adapters.loadCalls)
+    loadedNormalizationSource =
+        loadedNormalizationSource ||
+        adapterAccessReachesBefore(
+            body, load, normalization.sourceRoot,
+            normalization.operation, sourceManager);
+  if (!loadedNormalizationSource)
+    return false;
+  std::set<const clang::CallExpr *> canonicalStores;
+  for (const AdapterBufferEvidence::Access &store : adapters.storeCalls)
+    canonicalStores.insert(store.call);
+  for (const AdapterBufferEvidence::Access &store : adapters.storeCalls) {
+    if (store.root != normalization.outputRoot ||
+        !normalizationReachesSpecificStore(
+            body, normalization.outputRoot,
+            normalization.operation, store,
+            sourceManager, nullptr, &canonicalStores))
+      return false;
+  }
+  return true;
+}
+
+bool proveLayerNormAlgebra(
+    const FunctionDecl *function, const Stmt *body,
+    const ParmVarDecl *columns, const ParmVarDecl *epsilon,
+    const ParmVarDecl *meanOutput, const ParmVarDecl *inverseOutput,
+    PrimitiveRegistry &registry, const AdapterBufferEvidence &adapters,
+    const std::set<const clang::CallExpr *> &allowedStructuralCalls,
+    ASTContext &context, SourceManager &sourceManager) {
+  PrimitiveCallCollector primitiveCalls(registry, context);
+  primitiveCalls.TraverseStmt(const_cast<Stmt *>(body));
+  for (const clang::CallExpr *rsqrt : primitiveCalls.rsqrtCalls) {
+    if (rsqrt->getNumArgs() != 1)
+      continue;
+    const Expr *varianceValue =
+        additionOperandPairedWith(rsqrt->getArg(0), epsilon);
+    const auto *varianceReference =
+        directReferencedAs<VarDecl>(varianceValue);
+    const Expr *varianceExpression =
+        varianceReference != nullptr && varianceReference->hasInit()
+            ? varianceReference->getInit()
+            : varianceValue;
+    const auto *maximum =
+        llvm::dyn_cast_or_null<clang::CallExpr>(
+            stripExpr(varianceExpression));
+    if (maximum == nullptr || maximum->getNumArgs() != 2 ||
+        !allSystemOrdinaryDependentCallCandidatesNamed(
+            maximum, function, "max", context))
+      continue;
+    const Expr *divisionExpression = nullptr;
+    if (handledFloatZero(maximum->getArg(0), context))
+      divisionExpression = maximum->getArg(1);
+    else if (handledFloatZero(maximum->getArg(1), context))
+      divisionExpression = maximum->getArg(0);
+    const auto *division =
+        llvm::dyn_cast_or_null<clang::CallExpr>(
+            stripExpr(divisionExpression));
+    if (division == nullptr || division->getNumArgs() != 2 ||
+        std::find(
+            primitiveCalls.divideCalls.begin(),
+            primitiveCalls.divideCalls.end(), division) ==
+            primitiveCalls.divideCalls.end())
+      continue;
+    const Decl *m2Root = directStorageReadRoot(division->getArg(0));
+    const Decl *countRoot = directStorageReadRoot(division->getArg(1));
+    if (m2Root == nullptr || countRoot == nullptr || m2Root == countRoot)
+      continue;
+
+    ProducerFinder inverseProducer(rsqrt);
+    inverseProducer.TraverseStmt(const_cast<Stmt *>(body));
+    if (inverseProducer.produced.matches != 1 ||
+        !producedOnExecutablePath(inverseProducer.produced, context))
+      continue;
+    LayerNormNormalizationVisitor normalizations(
+        inverseProducer.produced, context);
+    normalizations.TraverseStmt(const_cast<Stmt *>(body));
+    if (normalizations.normalizations.size() != 1)
+      continue;
+    const LayerNormNormalizationEvidence &normalization =
+        normalizations.normalizations.front();
+    ProducedValue meanProduced;
+    meanProduced.local = normalization.meanValue;
+    meanProduced.matches = 1;
+    const Decl *meanRoot =
+        directStorageReadRoot(normalization.meanValue->getInit());
+    if (meanRoot == nullptr ||
+        adapters.stored.count(normalization.outputRoot) == 0 ||
+        !layerNormAdapterTopologyExact(
+            body, normalization, adapters, sourceManager))
+      continue;
+
+    const LayerNormStatisticsCalls statistics =
+        findLayerNormStatisticsCalls(
+            body, meanRoot, m2Root, countRoot, context, sourceManager);
+    if (statistics.accumulations.empty() || statistics.reduce == nullptr)
+      continue;
+    bool statisticsLoaded = true;
+    bool statisticsMatchNormalization = false;
+    for (const clang::CallExpr *accumulation :
+         statistics.accumulations) {
+      const Decl *sourceRoot =
+          directStorageReadRootThroughArithmeticCasts(
+              accumulation->getArg(0));
+      if (!adapterLoadReachesBefore(
+              body, adapters, sourceRoot,
+              accumulation, sourceManager)) {
+        statisticsLoaded = false;
+        break;
+      }
+      if (sourceRoot == normalization.sourceRoot ||
+          storageCopiesReachBefore(
+              body, sourceRoot, normalization.sourceRoot,
+              normalization.operation, sourceManager) ||
+          equivalentAdapterLoads(
+              adapters, sourceRoot, normalization.sourceRoot, context))
+        statisticsMatchNormalization = true;
+    }
+    if (!statisticsLoaded || !statisticsMatchNormalization)
+      continue;
+    LayerNormOutputWriteVisitor writes(
+        meanOutput, inverseOutput, meanProduced, inverseProducer.produced,
+        context);
+    writes.TraverseStmt(const_cast<Stmt *>(body));
+    if (writes.meanWrites.size() != 1 ||
+        writes.inverseWrites.size() != 1 ||
+        !pairedSingleThreadLeaderWrites(
+            writes.meanWrites.front(), writes.inverseWrites.front(), context))
+      continue;
+
+    std::vector<const Stmt *> ordered = {
+        statistics.accumulations.front(), statistics.reduce,
+        producedStatement(meanProduced), division, rsqrt,
+        producedStatement(inverseProducer.produced),
+        writes.meanWrites.front(), writes.inverseWrites.front(),
+        normalization.operation};
+    if (!controlContextsCompatible(ordered, context))
+      continue;
+
+    std::set<const clang::CallExpr *> allowedAdapterCalls;
+    for (const AdapterBufferEvidence::Access &load : adapters.loadCalls)
+      allowedAdapterCalls.insert(load.call);
+    for (const AdapterBufferEvidence::Access &store : adapters.storeCalls)
+      allowedAdapterCalls.insert(store.call);
+    std::set<const clang::CallExpr *> allowedSemanticCalls =
+        allowedStructuralCalls;
+    allowedSemanticCalls.insert(
+        statistics.accumulations.begin(),
+        statistics.accumulations.end());
+    allowedSemanticCalls.insert(statistics.reduce);
+    allowedSemanticCalls.insert(division);
+    allowedSemanticCalls.insert(rsqrt);
+    if (!semanticEffectsAllowedWithTwoOutputs(
+            function, registry, allowedAdapterCalls, allowedSemanticCalls,
+            meanOutput, writes.meanWrites.front(), inverseOutput,
+            writes.inverseWrites.front(), nullptr, context))
+      continue;
+    (void)columns;
+    return true;
+  }
+  return false;
+}
+
+bool isLayerNormKernel(
+    const FunctionDecl *function, ASTContext &context,
+    PrimitiveRegistry &registry, SourceManager &sourceManager) {
+  if (function == nullptr || !function->hasBody() ||
+      !function->hasAttr<clang::CUDAGlobalAttr>() ||
+      function->getNumParams() != 7 ||
+      !templateTypeParameter(
+          function->getParamDecl(0)->getType(), 0, 0,
+          false, false, false) ||
+      !templateTypeParameter(
+          function->getParamDecl(1)->getType(), 0, 1,
+          false, false, false) ||
+      !isIntegralWidthAtLeast(
+          function->getParamDecl(2)->getType(), context, 32) ||
+      !isIntegralWidthAtLeast(
+          function->getParamDecl(3)->getType(), context, 32) ||
+      !function->getParamDecl(4)->getType()
+           .getNonReferenceType()->isFloatingType() ||
+      !templateTypeParameter(
+          function->getParamDecl(5)->getType(), 0, 2,
+          true, false, true) ||
+      !templateTypeParameter(
+          function->getParamDecl(6)->getType(), 0, 2,
+          true, false, true) ||
+      function->getParamDecl(5) == function->getParamDecl(6))
+    return false;
+
+  AdapterCallVisitor adapterCalls(
+      function->getParamDecl(0), function->getParamDecl(1), context);
+  adapterCalls.TraverseStmt(const_cast<Stmt *>(function->getBody()));
+  if (!adapterCalls.proven())
+    return false;
+  AdapterBufferVisitor adapterBuffers(
+      function->getParamDecl(0), function->getParamDecl(1), context);
+  adapterBuffers.TraverseStmt(const_cast<Stmt *>(function->getBody()));
+  std::set<const clang::CallExpr *> allowedStructuralCalls;
+  if (!canonicalKernelCoverageAndControl(
+          function, CanonicalRowwiseOperation::LayerNorm,
+          adapterBuffers.evidence, context,
+          allowedStructuralCalls))
+    return false;
+  return proveLayerNormAlgebra(
+      function, function->getBody(), function->getParamDecl(3),
+      function->getParamDecl(4), function->getParamDecl(5),
+      function->getParamDecl(6), registry, adapterBuffers.evidence,
+      allowedStructuralCalls, context, sourceManager);
+}
+
 enum class DirectKernelDomain {
   None,
   Block,
   SoftmaxWarp,
   RmsNormWarp,
+  LayerNormWarp,
 };
 
 struct DirectLaunchWrapperProof {
   bool softmax = false;
+  bool layerNorm = false;
   const FunctionDecl *function = nullptr;
   const ParmVarDecl *stream = nullptr;
   const ParmVarDecl *load = nullptr;
@@ -8923,6 +10075,7 @@ struct DirectLaunchWrapperProof {
   const ParmVarDecl *rows = nullptr;
   const ParmVarDecl *columns = nullptr;
   const ParmVarDecl *epsilon = nullptr;
+  const ParmVarDecl *meanOutput = nullptr;
   const ParmVarDecl *inverseOutput = nullptr;
   const ParmVarDecl *sharedMemory = nullptr;
   const TemplateTypeParmDecl *computeType = nullptr;
@@ -8950,9 +10103,9 @@ struct DirectLaunchWrapperProof {
            packSize != nullptr &&
            domain != DirectKernelDomain::None &&
            (softmax ||
-            (epsilon != nullptr &&
-             inverseOutput != nullptr &&
-             postGeometryBlock != nullptr));
+            (epsilon != nullptr && inverseOutput != nullptr &&
+             postGeometryBlock != nullptr &&
+             (!layerNorm || meanOutput != nullptr)));
   }
 };
 
@@ -9098,6 +10251,7 @@ bool directKernelDomainMapping(
     const FunctionDecl *kernel,
     const std::vector<clang::TemplateArgument> &arguments,
     bool softmax,
+    bool layerNorm,
     DirectLaunchWrapperProof &proof) {
   const FunctionTemplateDecl *kernelTemplate =
       primaryFunctionTemplate(kernel);
@@ -9148,7 +10302,9 @@ bool directKernelDomainMapping(
   proof.domain =
       softmax
           ? DirectKernelDomain::SoftmaxWarp
-          : DirectKernelDomain::RmsNormWarp;
+          : (layerNorm
+                 ? DirectKernelDomain::LayerNormWarp
+                 : DirectKernelDomain::RmsNormWarp);
   return true;
 }
 
@@ -9469,6 +10625,33 @@ bool allSystemDependentCallCandidatesNamed(
         (candidate->getBuiltinID() == 0 &&
          !sourceManager.isInSystemHeader(
              candidate->getLocation())))
+      return false;
+  }
+  return true;
+}
+
+bool allSystemOrdinaryDependentCallCandidatesNamed(
+    const clang::CallExpr *call,
+    const FunctionDecl *caller,
+    llvm::StringRef name,
+    ASTContext &context) {
+  if (allSystemCallCandidatesNamed(
+          call, caller, name, context))
+    return true;
+  const auto *unresolved =
+      llvm::dyn_cast_or_null<clang::UnresolvedLookupExpr>(
+          stripExpr(call == nullptr ? nullptr : call->getCallee()));
+  if (unresolved == nullptr ||
+      unresolved->getName().getAsString() != name ||
+      unresolved->decls_begin() == unresolved->decls_end())
+    return false;
+  const SourceManager &sourceManager = context.getSourceManager();
+  for (const NamedDecl *declaration : unresolved->decls()) {
+    const FunctionDecl *candidate =
+        functionFromNamedDecl(declaration);
+    if (candidate == nullptr || candidate->getName() != name ||
+        (candidate->getBuiltinID() == 0 &&
+         !sourceManager.isInSystemHeader(candidate->getLocation())))
       return false;
   }
   return true;
@@ -9971,9 +11154,33 @@ bool provenLaunchGeometryCall(
   if (grid == nullptr)
     return false;
   std::set<const FunctionDecl *> candidates;
-  if (!callCandidateFunctions(
-          call, caller, candidates) ||
-      candidates.empty())
+  bool collectedCandidates =
+      callCandidateFunctions(call, caller, candidates);
+  if (!collectedCandidates) {
+    candidates.clear();
+    collectedCandidates =
+        unresolvedFunctorCandidates(call, candidates);
+  }
+  if (!collectedCandidates) {
+    candidates.clear();
+    const auto *unresolved =
+        llvm::dyn_cast_or_null<clang::UnresolvedLookupExpr>(
+            stripExpr(call->getCallee()));
+    if (unresolved != nullptr) {
+      collectedCandidates = true;
+      for (const NamedDecl *declaration : unresolved->decls()) {
+        const FunctionDecl *candidate =
+            functionFromNamedDecl(declaration);
+        if (candidate == nullptr) {
+          collectedCandidates = false;
+          candidates.clear();
+          break;
+        }
+        candidates.insert(candidate->getCanonicalDecl());
+      }
+    }
+  }
+  if (!collectedCandidates || candidates.empty())
     return false;
   for (const FunctionDecl *candidate : candidates) {
     const FunctionDecl *definition = nullptr;
@@ -10209,13 +11416,16 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
     SourceManager &sourceManager,
     const std::set<const FunctionDecl *> &softmaxKernels,
     const SoftmaxKernelBindings &softmaxBindings,
-    const std::set<const FunctionDecl *> &rmsKernels) {
+    const std::set<const FunctionDecl *> &rmsKernels,
+    const std::set<const FunctionDecl *> &layerNormKernels,
+    bool allowAnnotatedStatus) {
   DirectLaunchWrapperProof proof;
   if (function == nullptr || !function->hasBody() ||
       llvm::isa<clang::CXXMethodDecl>(function) ||
       function->hasAttr<clang::CUDADeviceAttr>() ||
       function->hasAttr<clang::CUDAGlobalAttr>() ||
-      !statusReturnCompatible(function, sourceManager))
+      !statusReturnCompatible(
+          function, sourceManager, allowAnnotatedStatus))
     return proof;
 
   ExecutableCallCollector collector;
@@ -10252,12 +11462,17 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
   const bool rms =
       rmsKernels.count(
           kernel->getCanonicalDecl()) != 0;
-  if (softmax == rms)
+  const bool layerNorm =
+      layerNormKernels.count(
+          kernel->getCanonicalDecl()) != 0;
+  if (static_cast<unsigned>(softmax) + static_cast<unsigned>(rms) +
+          static_cast<unsigned>(layerNorm) !=
+      1U)
     return proof;
   const clang::CompoundStmt *postGeometryBlock =
       nullptr;
   if (!directWrapperEffectsExact(
-          function, launch, rms,
+          function, launch, !softmax,
           postGeometryBlock, context))
     return proof;
 
@@ -10272,7 +11487,7 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
     return proof;
 
   const unsigned expectedKernelArguments =
-      softmax ? 4 : 6;
+      softmax ? 4 : (layerNorm ? 7 : 6);
   if (launch->getNumArgs() !=
       expectedKernelArguments)
     return proof;
@@ -10344,6 +11559,7 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
   }
 
   const ParmVarDecl *epsilon = nullptr;
+  const ParmVarDecl *meanOutput = nullptr;
   const ParmVarDecl *inverseOutput = nullptr;
   if (!softmax) {
     epsilon = parameterThroughIntegralCasts(
@@ -10352,8 +11568,16 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
         !epsilon->getType()
              .getNonReferenceType()->isFloatingType())
       return proof;
+    if (layerNorm) {
+      meanOutput = parameterThroughIntegralCasts(
+          launch->getArg(5), ignoredCast);
+      if (meanOutput == nullptr || ignoredCast ||
+          !typeIsTemplateParameter(
+              meanOutput->getType(), computeType, true))
+        return proof;
+    }
     inverseOutput = parameterThroughIntegralCasts(
-        launch->getArg(5), ignoredCast);
+        launch->getArg(layerNorm ? 6 : 5), ignoredCast);
     if (inverseOutput == nullptr || ignoredCast ||
         !typeIsTemplateParameter(
             inverseOutput->getType(),
@@ -10365,6 +11589,8 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
       stream, load, store, rows, columns};
   if (epsilon != nullptr)
     expected.insert(epsilon);
+  if (meanOutput != nullptr)
+    expected.insert(meanOutput);
   if (inverseOutput != nullptr)
     expected.insert(inverseOutput);
   if (sharedMemory != nullptr)
@@ -10387,10 +11613,11 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
     return proof;
   if (!directKernelDomainMapping(
           function, kernel, arguments,
-          softmax, proof))
+          softmax, layerNorm, proof))
     return proof;
 
   proof.softmax = softmax;
+  proof.layerNorm = layerNorm;
   proof.function = function;
   proof.stream = stream;
   proof.load = load;
@@ -10398,6 +11625,7 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
   proof.rows = rows;
   proof.columns = columns;
   proof.epsilon = epsilon;
+  proof.meanOutput = meanOutput;
   proof.inverseOutput = inverseOutput;
   proof.sharedMemory = sharedMemory;
   proof.computeType = computeType;
@@ -10547,7 +11775,7 @@ bool isRmsDispatcher(
   if (function == nullptr || !function->hasBody() ||
       function->hasAttr<clang::CUDADeviceAttr>() ||
       function->hasAttr<clang::CUDAGlobalAttr>() ||
-      !statusReturnCompatible(function, sourceManager) ||
+      !statusReturnCompatible(function, sourceManager, true) ||
       function->getNumParams() != 7 ||
       !exactlyTypeTemplateParameters(function, 3) ||
       !function->getParamDecl(0)->getType()->isPointerType() ||
@@ -10623,7 +11851,8 @@ std::string uniqueResultName(const FunctionDecl *function) {
 }
 
 std::string directWrapperPrologue(
-    const DirectLaunchWrapperProof &proof) {
+    const DirectLaunchWrapperProof &proof,
+    bool useSimdEntryPoints) {
   const std::string result =
       uniqueResultName(proof.function);
   const std::string rows =
@@ -10632,12 +11861,70 @@ std::string directWrapperPrologue(
       proof.columns->getNameAsString();
   const std::string pack =
       proof.packSize->getNameAsString();
-  const std::string macroPush =
-      "\n#pragma push_macro(\"" + result +
-      "\")\n#undef " + result + "\n";
-  const std::string macroPop =
-      "#pragma pop_macro(\"" + result +
-      "\")\n";
+  const std::string callee =
+      proof.softmax
+          ? (useSimdEntryPoints ? "TrySoftmaxHybrid" : "TrySoftmax")
+          : (proof.layerNorm
+                 ? (useSimdEntryPoints
+                        ? "TryLayerNormHybrid"
+                        : "TryLayerNorm")
+                 : (useSimdEntryPoints
+                        ? "TryRmsNormHybrid"
+                        : "TryRmsNorm"));
+  std::vector<std::string> protectedNames = {
+      result, "ascify", "target", "dav_c310",
+      "rowwise_simd_v1", "RowwiseHybridFacadeV1",
+      callee, "handled", "status", "if", "constexpr", "const", "auto",
+      "static_cast", "nullptr", "return", "unsigned", "long", "sizeof"};
+  const auto protect = [&](const NamedDecl *declaration) {
+    if (declaration == nullptr || declaration->getIdentifier() == nullptr)
+      return;
+    const std::string name = declaration->getNameAsString();
+    if (std::find(protectedNames.begin(), protectedNames.end(), name) ==
+        protectedNames.end())
+      protectedNames.push_back(name);
+  };
+  protect(proof.stream);
+  protect(proof.load);
+  protect(proof.store);
+  protect(proof.rows);
+  protect(proof.columns);
+  protect(proof.epsilon);
+  protect(proof.meanOutput);
+  protect(proof.inverseOutput);
+  protect(proof.sharedMemory);
+  protect(proof.computeType);
+  protect(proof.packSize);
+  protect(proof.maxColumnsPerThread);
+  protect(proof.minColumnsPerThread);
+  protect(proof.threadGroupWidth);
+  protect(proof.rowsPerAccess);
+  protect(proof.padding);
+  protect(proof.algorithm);
+  protect(proof.choice);
+  if (proof.choice != nullptr) {
+    llvm::SmallVector<llvm::StringRef, 8> components;
+    const std::string qualifiedChoice =
+        proof.choice->getQualifiedNameAsString();
+    llvm::StringRef(qualifiedChoice).split(
+        components, "::", -1, false);
+    for (const llvm::StringRef component : components) {
+      const std::string name = component.str();
+      if (std::find(
+              protectedNames.begin(), protectedNames.end(), name) ==
+          protectedNames.end())
+        protectedNames.push_back(name);
+    }
+  }
+  std::string macroPush = "\n";
+  for (const std::string &name : protectedNames) {
+    macroPush += "#pragma push_macro(\"" + name +
+                 "\")\n#undef " + name + "\n";
+  }
+  std::string macroPop;
+  for (auto name = protectedNames.rbegin();
+       name != protectedNames.rend(); ++name)
+    macroPop += "#pragma pop_macro(\"" + *name + "\")\n";
   std::string condition =
       "(" + rows + " > 0) && (" + columns +
       " > 0) && (" + columns + " % " + pack +
@@ -10659,8 +11946,8 @@ std::string directWrapperPrologue(
     condition += " && (" + rows + " % " +
                  proof.rowsPerAccess->getNameAsString() +
                  " == 0)";
-  } else if (proof.domain ==
-             DirectKernelDomain::RmsNormWarp) {
+  } else if (proof.domain == DirectKernelDomain::RmsNormWarp ||
+             proof.domain == DirectKernelDomain::LayerNormWarp) {
     const std::string maximum =
         "(" +
         proof.maxColumnsPerThread->getNameAsString() +
@@ -10706,8 +11993,16 @@ std::string directWrapperPrologue(
           ? "      const auto "
           : "    const auto ";
   text += result;
-  text += " = ::ascify::target::dav_c310::";
-  text += proof.softmax ? "TrySoftmax(" : "TryRmsNorm(";
+  text += useSimdEntryPoints
+              ? " = ::ascify::target::dav_c310::rowwise_simd_v1::"
+                "RowwiseHybridFacadeV1::"
+              : " = ::ascify::target::dav_c310::";
+  if (proof.softmax)
+    text += useSimdEntryPoints ? "TrySoftmaxHybrid(" : "TrySoftmax(";
+  else if (proof.layerNorm)
+    text += useSimdEntryPoints ? "TryLayerNormHybrid(" : "TryLayerNorm(";
+  else
+    text += useSimdEntryPoints ? "TryRmsNormHybrid(" : "TryRmsNorm(";
   text += proof.stream->getNameAsString();
   text += ", ";
   text += proof.load->getNameAsString();
@@ -10720,13 +12015,19 @@ std::string directWrapperPrologue(
   if (!proof.softmax) {
     text += ", ";
     text += proof.epsilon->getNameAsString();
+    if (proof.layerNorm) {
+      text += ", ";
+      text += proof.meanOutput->getNameAsString();
+    }
     text += ", ";
     text += proof.inverseOutput->getNameAsString();
   }
   text += ", static_cast<";
   text += proof.computeType->getNameAsString();
-  text += "*>(nullptr));\n"
-          "    if (";
+  text += "*>(nullptr));\n";
+  text += proof.softmax && proof.algorithm != nullptr
+              ? "      if ("
+              : "    if (";
   text += result;
   text += ".handled) { return ";
   text += result;
@@ -10825,7 +12126,8 @@ DavC310TargetRecipe::FinalizedEdits
 DavC310TargetRecipe::finalize(
     ASTContext &context,
     SourceManager &sourceManager,
-    const LangOptions &langOptions) {
+    const LangOptions &langOptions,
+    bool useSimdEntryPoints) {
   FinalizedEdits finalized;
   std::set<unsigned> insertionOffsets;
 
@@ -10860,8 +12162,10 @@ DavC310TargetRecipe::finalize(
   std::set<const FunctionDecl *> softmaxKernels;
   SoftmaxKernelBindings softmaxBindings;
   std::set<const FunctionDecl *> rmsKernels;
+  std::set<const FunctionDecl *> layerNormKernels;
   PrimitiveRegistry primitives(
-      context, sourceManager, functions);
+      context, sourceManager, functions,
+      !useSimdEntryPoints);
   for (const FunctionDecl *function : functions) {
     if (function == nullptr || !function->hasBody())
       continue;
@@ -10872,13 +12176,17 @@ DavC310TargetRecipe::finalize(
     if (isRmsKernel(
             function, context, primitives, sourceManager))
       rmsKernels.insert(function->getCanonicalDecl());
+    if (useSimdEntryPoints && isLayerNormKernel(
+            function, context, primitives, sourceManager))
+      layerNormKernels.insert(function->getCanonicalDecl());
   }
   for (const FunctionDecl *function : functions) {
     const DirectLaunchWrapperProof wrapper =
         proveDirectLaunchWrapper(
             function, context, sourceManager,
             softmaxKernels, softmaxBindings,
-            rmsKernels);
+            rmsKernels, layerNormKernels,
+            !useSimdEntryPoints);
     if (!wrapper.proven())
       continue;
 
@@ -10897,12 +12205,16 @@ DavC310TargetRecipe::finalize(
       continue;
 
     finalized.edits.push_back(
-        {insert, directWrapperPrologue(wrapper),
+        {insert, directWrapperPrologue(wrapper, useSimdEntryPoints),
          wrapper.softmax
              ? Edit::Kind::SoftmaxDirectWrapperPrologue
-             : Edit::Kind::RmsNormDirectWrapperPrologue});
+             : (wrapper.layerNorm
+                    ? Edit::Kind::LayerNormDirectWrapperPrologue
+                    : Edit::Kind::RmsNormDirectWrapperPrologue)});
     if (wrapper.softmax)
       ++finalized.softmaxDirectWrappers;
+    else if (wrapper.layerNorm)
+      ++finalized.layerNormDirectWrappers;
     else
       ++finalized.rmsNormDirectWrappers;
     finalized.needsTargetHeader = true;
@@ -10910,7 +12222,8 @@ DavC310TargetRecipe::finalize(
 
   finalized.needsTargetHeader =
       finalized.softmaxDirectWrappers != 0 ||
-      finalized.rmsNormDirectWrappers != 0;
+      finalized.rmsNormDirectWrappers != 0 ||
+      finalized.layerNormDirectWrappers != 0;
   return finalized;
 }
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Fail-closed mutation gate for the dav-c310 rowwise recipes.
 
-The test intentionally uses the full OneFlow Softmax and RMSNorm headers.  A
-canonical header must produce all three direct forward recipes.  Each mutation
+The test intentionally uses the full OneFlow Softmax, RMSNorm, and LayerNorm
+headers. Canonical Softmax and RMSNorm each produce three direct forward
+recipes; canonical LayerNorm produces its proved warp recipe. Each mutation
 preserves enough of the original algebra/topology to catch an overly permissive
-matcher, but changes one correctness-critical property.  Such a mutation must
+matcher, but changes one correctness-critical property. Such a mutation must
 remove exactly the affected recipe(s).
 
 All generated inputs, converter outputs, logs and the result manifest are kept
@@ -22,8 +23,15 @@ import sys
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 
-SOFTMAX_RECIPE = "::ascify::target::dav_c310::TrySoftmax("
-RMS_RECIPE = "::ascify::target::dav_c310::TryRmsNorm("
+HYBRID_FACADE = (
+    "::ascify::target::dav_c310::rowwise_simd_v1::"
+    "RowwiseHybridFacadeV1::"
+)
+SOFTMAX_RECIPE = HYBRID_FACADE + "TrySoftmaxHybrid("
+RMS_RECIPE = HYBRID_FACADE + "TryRmsNormHybrid("
+LAYER_NORM_RECIPE = (
+    HYBRID_FACADE + "TryLayerNormHybrid("
+)
 DEBUG_MARKER = "ASCIFY_RECIPE_DEBUG"
 
 
@@ -204,6 +212,7 @@ SOFTMAX_GEOMETRY = (
 
 RMS_WARP = "__global__ void RmsNormWarpImpl("
 RMS_BLOCK = "__global__ void RmsNormBlockSMemImpl("
+LAYER_NORM_WARP = "__global__ void LayerNormWarpImpl("
 
 
 def softmax_renamed_spelling(text: str) -> str:
@@ -231,6 +240,73 @@ def rms_renamed_spelling(text: str) -> str:
             ("RmsNormBlockSMemImpl", "QuadraticScaleSharedRowKernel"),
             ("RmsNormWarpImpl", "QuadraticScaleLaneGroupKernel"),
         ),
+    )
+
+
+def layer_norm_renamed_spelling(text: str) -> str:
+    renamed = rename_identifiers(
+        text,
+        (
+            ("LaunchLayerNormWarpImpl", "SubmitCenterScaleLaneGroup"),
+            ("LayerNormWarpImpl", "CenterScaleLaneGroupKernel"),
+        ),
+    )
+    return replace_identifiers_in_function(
+        renamed,
+        "__global__ void CenterScaleLaneGroupKernel(",
+        (
+            ("global_thread_group_id", "row_group_origin"),
+            ("num_global_thread_group", "row_group_count"),
+            ("global_row_id", "logical_row"),
+            ("row_mean", "center_value"),
+            ("row_variance", "spread_value"),
+            ("row_inv_var", "scale_value"),
+        ),
+    )
+
+
+def layer_norm_wrong_variance_source(text: str) -> str:
+    return replace_in_function(
+        text,
+        LAYER_NORM_WARP,
+        "Div(warp_m2[row_id], warp_count[row_id])",
+        "Div(warp_count[row_id], warp_count[row_id])",
+    )
+
+
+def layer_norm_not_centered(text: str) -> str:
+    return replace_in_function(
+        text,
+        LAYER_NORM_WARP,
+        "row_buf[i] = (row_buf[i] - row_mean) * row_inv_var;",
+        "row_buf[i] = row_buf[i] * row_inv_var;",
+    )
+
+
+def layer_norm_wrong_leader(text: str) -> str:
+    return replace_in_function(
+        text,
+        LAYER_NORM_WARP,
+        "if (lane_id == 0) {",
+        "if (row_id == 0) {",
+    )
+
+
+def layer_norm_missing_mean_output(text: str) -> str:
+    return replace_in_function(
+        text,
+        LAYER_NORM_WARP,
+        "mean[global_row_id] = row_mean;",
+        "inv_variance[global_row_id] = row_mean;",
+    )
+
+
+def layer_norm_mutable_row_alias(text: str) -> str:
+    return replace_in_function(
+        text,
+        LAYER_NORM_WARP,
+        "int global_row_id = row + row_id;",
+        "int global_row_id = row + row_id;\n      global_row_id += 1;",
     )
 
 
@@ -631,6 +707,24 @@ def validates_rms_post_geometry(converted: str) -> bool:
     return converted.count(RMS_RECIPE) == 3
 
 
+def validates_layer_norm_post_geometry(converted: str) -> bool:
+    if converted.count(LAYER_NORM_RECIPE) != 1:
+        return False
+    recipe = converted.find(LAYER_NORM_RECIPE)
+    geometry = converted.rfind("GetNumBlocks(", 0, recipe)
+    error_return = converted.find("return err", geometry, recipe)
+    geometry_block_close = converted.find(
+        "\n  }", error_return, recipe
+    )
+    launch = converted.find("<<<", recipe)
+    return (
+        geometry >= 0
+        and error_return >= 0
+        and geometry_block_close >= 0
+        and launch >= 0
+    )
+
+
 RMS_REDUCTION = """ComputeType row_square_sum =
         layer_norm::BlockAllReduce<layer_norm::SumOp, ComputeType, block_size>(thread_square_sum);"""
 
@@ -985,6 +1079,62 @@ def rms_cases() -> Sequence[MutationCase]:
     )
 
 
+def layer_norm_cases() -> Sequence[MutationCase]:
+    return (
+        MutationCase(
+            "layer_norm",
+            "canonical_full_coverage",
+            1,
+            "the proven LayerNorm warp wrapper inserts one hybrid attempt after geometry",
+            unchanged,
+            validates_layer_norm_post_geometry,
+        ),
+        MutationCase(
+            "layer_norm",
+            "renamed_kernel_wrapper_and_locals",
+            1,
+            "LayerNorm recognition is independent of kernel, wrapper, and local spelling",
+            layer_norm_renamed_spelling,
+            validates_layer_norm_post_geometry,
+        ),
+        MutationCase(
+            "layer_norm",
+            "wrong_variance_source",
+            0,
+            "variance divides the Welford M2 output by the Welford count",
+            layer_norm_wrong_variance_source,
+        ),
+        MutationCase(
+            "layer_norm",
+            "normalization_not_centered",
+            0,
+            "normalization subtracts the proven row mean before scaling",
+            layer_norm_not_centered,
+        ),
+        MutationCase(
+            "layer_norm",
+            "wrong_output_leader",
+            0,
+            "mean and inverse variance are written by proven CUDA lane zero",
+            layer_norm_wrong_leader,
+        ),
+        MutationCase(
+            "layer_norm",
+            "missing_mean_output",
+            0,
+            "the accelerated path preserves distinct mean and inverse-variance outputs",
+            layer_norm_missing_mean_output,
+        ),
+        MutationCase(
+            "layer_norm",
+            "mutable_row_alias",
+            0,
+            "adapter coordinates may use only aliases proven unmodified",
+            layer_norm_mutable_row_alias,
+        ),
+    )
+
+
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run fail-closed real-source mutations for dav-c310 recipes"
@@ -1055,7 +1205,16 @@ def converter_command(
     args: argparse.Namespace,
     source: pathlib.Path,
     output: pathlib.Path,
+    family: str,
 ) -> List[str]:
+    recipe_arguments: List[str] = []
+    if not any(
+        argument.startswith("--target-recipe=")
+        for argument in args.converter_arg
+    ):
+        recipe_arguments.append(
+            "--target-recipe=dav-3510-rowwise-simd-v1"
+        )
     return [
         str(args.ascify),
         str(source),
@@ -1063,6 +1222,7 @@ def converter_command(
         "--clang-resource-directory=" + str(args.clang_resource_directory),
         "--target-policy=dav-c310-vec",
         "--simt-math=fast",
+        *recipe_arguments,
         *args.converter_arg,
         "-o",
         str(output),
@@ -1140,7 +1300,7 @@ def run_case(
         raise MutationError(prefix + ": mutation did not change the source")
     source_path.write_text(mutated, encoding="utf-8")
     completed = subprocess.run(
-        converter_command(args, source_path, output_path),
+        converter_command(args, source_path, output_path, case.family),
         cwd=str(args.converter_cwd) if args.converter_cwd else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1154,7 +1314,11 @@ def run_case(
         if output_path.is_file()
         else ""
     )
-    token = SOFTMAX_RECIPE if case.family == "softmax" else RMS_RECIPE
+    token = {
+        "softmax": SOFTMAX_RECIPE,
+        "rms_norm": RMS_RECIPE,
+        "layer_norm": LAYER_NORM_RECIPE,
+    }[case.family]
     actual = converted.count(token)
     debug = (completed.stdout + completed.stderr).count(DEBUG_MARKER)
     output_valid = (
@@ -1199,6 +1363,7 @@ def main(argv: Sequence[str]) -> int:
     originals = {
         "softmax": args.softmax.read_text(encoding="utf-8"),
         "rms_norm": args.rms_norm.read_text(encoding="utf-8"),
+        "layer_norm": args.layer_norm.read_text(encoding="utf-8"),
     }
     provenance = tuple(
         Provenance(label, path.resolve(), sha256_file(path))
@@ -1215,7 +1380,9 @@ def main(argv: Sequence[str]) -> int:
             ("recipe_header", args.recipe_header),
         )
     )
-    cases = selected((*softmax_cases(), *rms_cases()), args.case)
+    cases = selected(
+        (*softmax_cases(), *rms_cases(), *layer_norm_cases()), args.case
+    )
     results: List[CaseResult] = []
     manifest = args.work_dir / "rowwise_mutation_results.tsv"
     for case in cases:

@@ -1,10 +1,21 @@
-# Softmax / RMSNorm 910C-to-950PR replay
+# Legacy Softmax / RMSNorm 910C-to-950PR recipe replay
+
+> Scope: `run_910_conversion_v3.sh` exercises the earlier in-header
+> `TrySoftmax` / `TryRmsNorm` recipe and does not pass the explicit
+> `--target-recipe=dav-3510-rowwise-simd-v1` option or build the four v1 mixed
+> runtime DSOs. Keep it as a baseline replay. For the current externally
+> linked SIMD+SIMT path, follow
+> [the explicit conversion guide](../../docs/rowwise-simd-conversion.md), then
+> use this directory's build/smoke harness with
+> `ROWWISE_SIMD_RUNTIME_DIR` set to the complete runtime `lib` directory.
 
 This harness validates forward FP16 Softmax and RMSNorm (plain and affine).
-It excludes LogSoftmax, backward kernels, and A800 comparison.
+`layernorm_hybrid_check.cce` additionally validates the registered LayerNorm
+route with fixed boundary, tail, cross-AIV, in-place, invalid-domain, and
+profile cases. It excludes LogSoftmax, backward kernels, and A800 comparison.
 
 `direct` means an unedited Ascify-generated header whose proved wrapper calls
-the versioned `ascify::target::dav_c310::v1` implementation. `native` is a thin
+the versioned `ascify::target::dav_c310::rowwise_simd_v1` implementation. `native` is a thin
 control entry into the same implementation. The comparison proves that a
 clean conversion reproduces the deposited target recipe; it does not claim
 that Ascify synthesizes the low-level kernel from arbitrary CUDA.
@@ -19,7 +30,7 @@ export WORK_ROOT="${REPO_ROOT}/.work/softmax_rmsnorm_950"
 ```
 
 All generated headers, converter binaries, build outputs, locks, manifests,
-CSV evidence, and logs stay below `WORK_ROOT`. CANN, LLVM, CUDA parsing headers,
+CSV evidence and logs stay below `WORK_ROOT`. CANN, LLVM, CUDA parsing headers,
 drivers, and global shell configuration are external and must not be modified.
 
 The three OneFlow conversion inputs are versioned in
@@ -32,8 +43,8 @@ are recorded in [the fixture manifest](../fixtures/oneflow/README.md).
 sh tests/run_release_checks.sh
 ```
 
-This runs four static rewrite contracts and 49 Python tests. With a built
-translator, it also re-translates the golden fixtures:
+This runs the static rewrite contracts and registered Python suites. With a
+built translator, it also re-translates the golden fixtures:
 
 ```bash
 ASCIFY_BINARY=build/ascify-clang \
@@ -105,8 +116,8 @@ python3 -B tests/rewrite/check_dav_c310_rowwise_mutations.py \
   --converter-cwd "${REPO_ROOT}"
 ```
 
-The accepted matrix is 29 Softmax plus 9 RMSNorm cases. Exit status zero means
-38/38 passed.
+The accepted matrix is 29 Softmax, 9 RMSNorm, and 7 LayerNorm cases. Exit
+status zero means 45/45 passed.
 
 ## Transfer the immutable conversion evidence
 
@@ -189,3 +200,50 @@ The calculation does not count `exp` or `rsqrt` as FLOPs. Probe instructions
 are in [probes/README.md](probes/README.md); measured conversion and tuning
 results are in
 [the tuning report](../../docs/softmax-rmsnorm-950pr-tuning-report.md).
+
+Build and run only the independent LayerNorm hybrid check when converted
+Softmax/RMSNorm headers are not being staged:
+
+```bash
+CANN_ROOT=/path/to/user-owned/cann \
+ROWWISE_SIMD_RUNTIME_DIR=build/rowwise-simd-v1/lib \
+  tests/softmax_rmsnorm_950/scripts/build.sh \
+  layernorm-check production-fast
+
+LD_LIBRARY_PATH=build/rowwise-simd-v1/lib \
+  .work/softmax_rmsnorm_950/bin/layernorm_hybrid_check_production_fast \
+  --device 0
+```
+
+The program checks five valid domains, including exact in-place input/output,
+requires a non-divisible column count to be rejected before launch, and prints
+ACL-event median/minimum/p90 latency for a 256 x 4096 profile case.
+
+To validate the complete generated-code route instead of calling only the
+runtime ABI, stage the Ascify-generated header under its preserved include
+topology and build the same oracle with the generated-wrapper entry enabled:
+
+```bash
+mkdir -p "${WORK_ROOT}/generated/oneflow/core/cuda"
+cp /path/to/ascify-output/layer_norm.cuh \
+  "${WORK_ROOT}/generated/oneflow/core/cuda/layer_norm.cuh"
+
+CANN_ROOT=/path/to/user-owned/cann \
+GENERATED_ROOT="${WORK_ROOT}/generated" \
+ROWWISE_SIMD_RUNTIME_DIR=build/rowwise-simd-v1/lib \
+  tests/softmax_rmsnorm_950/scripts/build.sh \
+  layernorm-generated-check production-fast
+
+CANN_ROOT=/path/to/user-owned/cann \
+ROWWISE_SIMD_RUNTIME_DIR=build/rowwise-simd-v1/lib \
+  tests/softmax_rmsnorm_950/scripts/run_layernorm_hybrid_checks.sh
+```
+
+This second binary instantiates the converted `DirectLoad`/`DirectStore` and
+ordinary top-level `DispatchLayerNorm`; the injected generic facade then
+selects the same versioned runtime from the proved warp branch. It checks five
+representative generated-path domains through 1024 columns. The companion
+direct-ABI binary additionally covers the runtime's 4096- and 8192-column
+boundaries. The runner acquires one healthy-device lock and checks both paths
+sequentially on that device. See
+[ADR-0009](../../docs/decisions/0009-register-rowwise-hybrid-recipes-and-add-layernorm.md).

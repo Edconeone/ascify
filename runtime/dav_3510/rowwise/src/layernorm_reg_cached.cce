@@ -1,0 +1,348 @@
+// dav-3510 intra-kernel SIMD+SIMT implementation for contiguous fp16
+// LayerNorm. SIMD owns stable two-pass row statistics; SIMT owns centered
+// normalization plus indexed/tail-safe staging into the output UB tile.
+
+#include "acl/acl.h"
+#include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
+#include <ascify/target/dav_c310/rowwise_simd_selectors_v1.hpp>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+namespace ascify950_reg_layernorm {
+
+static_assert(
+    sizeof(half)
+        == ascify::target::dav_c310::rowwise_simd_v1::kHalfStorageBytes,
+    "runtime and selector must agree on fp16 storage width");
+
+constexpr uint32_t kMaxColumns = 8192;
+constexpr uint32_t kPipelineDepth = 1;
+constexpr uint32_t kAdapterSimtThreads = 1024;
+constexpr uint32_t kScalarSlotBytes = 32;
+constexpr uint32_t kRowBytes = kMaxColumns * sizeof(half);
+constexpr uint32_t kConservativeUbBytes = 196608;
+constexpr uint32_t kMaximumUbBytes =
+    2 * kRowBytes + 2 * kScalarSlotBytes;
+constexpr int kDefaultAivCount = 56;
+
+static_assert(kRowBytes == 16384, "unexpected maximum LayerNorm row size");
+static_assert(kMaximumUbBytes == 32832,
+              "unexpected LayerNorm UB budget");
+static_assert(kMaximumUbBytes <= kConservativeUbBytes,
+              "cached LayerNorm exceeds conservative UB budget");
+
+__simd_vf__ inline void LayerNormMeanVF(
+    __ubuf__ half* input, __ubuf__ float* meanSlot, uint32_t count,
+    uint32_t chunkCount, float inverseColumns) {
+  static constexpr AscendC::Reg::CastTrait kHalfToFloat = {
+      AscendC::Reg::RegLayout::ZERO,
+      AscendC::Reg::SatMode::UNKNOWN,
+      AscendC::Reg::MaskMergeMode::ZEROING,
+      AscendC::RoundMode::UNKNOWN};
+  constexpr uint32_t kVectorLength =
+      AscendC::VECTOR_REG_WIDTH / sizeof(float);
+
+  AscendC::Reg::RegTensor<half> inputHalf;
+  AscendC::Reg::RegTensor<float> inputFloat;
+  AscendC::Reg::RegTensor<float> rowSum;
+  AscendC::Reg::MaskReg fullMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::ALL>();
+  AscendC::Reg::MaskReg oneMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::VL1>();
+
+  AscendC::Reg::Duplicate<float>(rowSum, 0.0F, fullMask);
+  uint32_t remaining = count;
+  for (uint32_t chunk = 0; chunk < chunkCount; ++chunk) {
+    const uint32_t offset = chunk * kVectorLength;
+    AscendC::Reg::MaskReg tailMask =
+        AscendC::Reg::UpdateMask<float>(remaining);
+    AscendC::Reg::LoadAlign<
+        half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(
+        inputHalf, input + offset);
+    AscendC::Reg::Cast<float, half, kHalfToFloat>(
+        inputFloat, inputHalf, tailMask);
+    AscendC::Reg::Add<float>(
+        rowSum, rowSum, inputFloat, fullMask);
+  }
+
+  AscendC::Reg::Reduce<AscendC::Reg::ReduceType::SUM>(
+      rowSum, rowSum, fullMask);
+  AscendC::Reg::Muls<float>(
+      rowSum, rowSum, inverseColumns, fullMask);
+  AscendC::Reg::StoreAlign<
+      float, AscendC::Reg::StoreDist::DIST_FIRST_ELEMENT_B32>(
+      meanSlot, rowSum, oneMask);
+}
+
+__simd_vf__ inline void LayerNormVarianceVF(
+    __ubuf__ half* input, __ubuf__ float* meanSlot,
+    __ubuf__ float* inverseSlot,
+    uint32_t count, uint32_t chunkCount, float inverseColumns,
+    float epsilon) {
+  static constexpr AscendC::Reg::CastTrait kHalfToFloat = {
+      AscendC::Reg::RegLayout::ZERO,
+      AscendC::Reg::SatMode::UNKNOWN,
+      AscendC::Reg::MaskMergeMode::ZEROING,
+      AscendC::RoundMode::UNKNOWN};
+  constexpr uint32_t kVectorLength =
+      AscendC::VECTOR_REG_WIDTH / sizeof(float);
+
+  AscendC::Reg::RegTensor<half> inputHalf;
+  AscendC::Reg::RegTensor<float> inputFloat;
+  AscendC::Reg::RegTensor<float> mean;
+  AscendC::Reg::RegTensor<float> centered;
+  AscendC::Reg::RegTensor<float> square;
+  AscendC::Reg::RegTensor<float> variance;
+  AscendC::Reg::RegTensor<float> rootVariance;
+  AscendC::Reg::RegTensor<float> oneFloat;
+  AscendC::Reg::RegTensor<float> inverseVariance;
+  AscendC::Reg::MaskReg fullMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::ALL>();
+  AscendC::Reg::MaskReg oneMask =
+      AscendC::Reg::CreateMask<uint32_t,
+                               AscendC::Reg::MaskPattern::VL1>();
+
+  AscendC::Reg::LoadAlign<
+      float, AscendC::Reg::LoadDist::DIST_BRC_B32>(mean, meanSlot);
+  AscendC::Reg::Duplicate<float>(variance, 0.0F, fullMask);
+  uint32_t remaining = count;
+  for (uint32_t chunk = 0; chunk < chunkCount; ++chunk) {
+    const uint32_t offset = chunk * kVectorLength;
+    AscendC::Reg::MaskReg tailMask =
+        AscendC::Reg::UpdateMask<float>(remaining);
+    AscendC::Reg::LoadAlign<
+        half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(
+        inputHalf, input + offset);
+    AscendC::Reg::Cast<float, half, kHalfToFloat>(
+        inputFloat, inputHalf, tailMask);
+    AscendC::Reg::Sub<float>(centered, inputFloat, mean, tailMask);
+    AscendC::Reg::Mul<float>(square, centered, centered, tailMask);
+    AscendC::Reg::Add<float>(variance, variance, square, fullMask);
+  }
+
+  AscendC::Reg::Reduce<AscendC::Reg::ReduceType::SUM>(
+      variance, variance, fullMask);
+  AscendC::Reg::Muls<float>(
+      variance, variance, inverseColumns, fullMask);
+  AscendC::Reg::Adds<float>(variance, variance, epsilon, fullMask);
+  AscendC::Reg::Sqrt<float>(rootVariance, variance, fullMask);
+  AscendC::Reg::Duplicate<float>(oneFloat, 1.0F, fullMask);
+  AscendC::Reg::Div<float>(
+      inverseVariance, oneFloat, rootVariance, fullMask);
+  AscendC::Reg::StoreAlign<
+      float, AscendC::Reg::StoreDist::DIST_FIRST_ELEMENT_B32>(
+      inverseSlot, inverseVariance, oneMask);
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(kAdapterSimtThreads) inline void
+LayerNormNormalizeStoreSimtVF(
+    __ubuf__ half* output, __ubuf__ half* input,
+    __ubuf__ float* meanSlot, __ubuf__ float* inverseSlot,
+    uint32_t count) {
+  const float mean = meanSlot[0];
+  const float inverseVariance = inverseSlot[0];
+  for (uint32_t index = static_cast<uint32_t>(threadIdx.x); index < count;
+       index += static_cast<uint32_t>(blockDim.x)) {
+    const float value = static_cast<float>(input[index]);
+    output[index] = static_cast<half>((value - mean) * inverseVariance);
+  }
+}
+
+__aicore__ inline uint32_t ChunkCount(uint32_t count) {
+  constexpr uint32_t kVectorLength =
+      AscendC::VECTOR_REG_WIDTH / sizeof(float);
+  return (count + kVectorLength - 1) / kVectorLength;
+}
+
+__aicore__ inline void ComputeMean(
+    const AscendC::LocalTensor<half>& input,
+    const AscendC::LocalTensor<float>& mean, uint32_t count,
+    float inverseColumns) {
+  asc_vf_call<LayerNormMeanVF>(
+      (__ubuf__ half*)input.GetPhyAddr(),
+      (__ubuf__ float*)mean.GetPhyAddr(), count, ChunkCount(count),
+      inverseColumns);
+}
+
+__aicore__ inline void ComputeVariance(
+    const AscendC::LocalTensor<half>& input,
+    const AscendC::LocalTensor<float>& mean,
+    const AscendC::LocalTensor<float>& inverseVariance, uint32_t count,
+    float inverseColumns, float epsilon) {
+  asc_vf_call<LayerNormVarianceVF>(
+      (__ubuf__ half*)input.GetPhyAddr(),
+      (__ubuf__ float*)mean.GetPhyAddr(),
+      (__ubuf__ float*)inverseVariance.GetPhyAddr(), count,
+      ChunkCount(count), inverseColumns, epsilon);
+}
+
+__aicore__ inline void ApplyStoreAdapterSimt(
+    const AscendC::LocalTensor<half>& output,
+    const AscendC::LocalTensor<half>& input,
+    const AscendC::LocalTensor<float>& mean,
+    const AscendC::LocalTensor<float>& inverseVariance, uint32_t count) {
+  asc_vf_call<LayerNormNormalizeStoreSimtVF>(
+      dim3(kAdapterSimtThreads),
+      (__ubuf__ half*)output.GetPhyAddr(),
+      (__ubuf__ half*)input.GetPhyAddr(),
+      (__ubuf__ float*)mean.GetPhyAddr(),
+      (__ubuf__ float*)inverseVariance.GetPhyAddr(), count);
+}
+
+class LayerNormRegCachedKernel {
+ public:
+  __aicore__ inline void Init(
+      GM_ADDR input, GM_ADDR output, GM_ADDR mean, GM_ADDR inverseVariance,
+      int64_t rows, uint32_t columns, float inverseColumns, float epsilon) {
+    inputGm_.SetGlobalBuffer((__gm__ half*)input);
+    outputGm_.SetGlobalBuffer((__gm__ half*)output);
+    meanGm_.SetGlobalBuffer((__gm__ float*)mean);
+    inverseVarianceGm_.SetGlobalBuffer((__gm__ float*)inverseVariance);
+    pipe_.InitBuffer(inputQueue_, kPipelineDepth, kRowBytes);
+    pipe_.InitBuffer(outputQueue_, kPipelineDepth, kRowBytes);
+    pipe_.InitBuffer(meanQueue_, kPipelineDepth, kScalarSlotBytes);
+    pipe_.InitBuffer(inverseQueue_, kPipelineDepth, kScalarSlotBytes);
+    rows_ = rows;
+    columns_ = columns;
+    inverseColumns_ = inverseColumns;
+    epsilon_ = epsilon;
+  }
+
+  __aicore__ inline void Process() {
+    const int64_t firstRow = static_cast<int64_t>(AscendC::GetBlockIdx());
+    const int64_t rowStride = static_cast<int64_t>(AscendC::GetBlockNum());
+    for (int64_t row = firstRow; row < rows_; row += rowStride) {
+      ProcessRow(row);
+    }
+  }
+
+ private:
+  __aicore__ inline int64_t RowOffset(int64_t row) const {
+    return row * static_cast<int64_t>(columns_);
+  }
+
+  __aicore__ inline void CopyIntoLocal(
+      const AscendC::LocalTensor<half>& local,
+      const AscendC::GlobalTensor<half>& global, uint32_t count) {
+    AscendC::DataCopyExtParams params{
+        1, static_cast<uint32_t>(count * sizeof(half)), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<half> pad{false, 0, 0, 0};
+    AscendC::DataCopyPad(local, global, params, pad);
+  }
+
+  __aicore__ inline void CopyScalarOut(
+      const AscendC::GlobalTensor<float>& global,
+      const AscendC::LocalTensor<float>& local) {
+    AscendC::DataCopyExtParams params{
+        1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+    AscendC::DataCopyPad(global, local, params);
+  }
+
+  __aicore__ inline void ProcessRow(int64_t row) {
+    const int64_t rowOffset = RowOffset(row);
+    AscendC::LocalTensor<half> inputLocal =
+        inputQueue_.AllocTensor<half>();
+    CopyIntoLocal(inputLocal, inputGm_[rowOffset], columns_);
+    inputQueue_.EnQue(inputLocal);
+    inputLocal = inputQueue_.DeQue<half>();
+
+    AscendC::LocalTensor<half> outputLocal =
+        outputQueue_.AllocTensor<half>();
+    AscendC::LocalTensor<float> meanLocal =
+        meanQueue_.AllocTensor<float>();
+    AscendC::LocalTensor<float> inverseLocal =
+        inverseQueue_.AllocTensor<float>();
+
+    ComputeMean(inputLocal, meanLocal, columns_, inverseColumns_);
+    AscendC::PipeBarrier<PIPE_V>();
+    ComputeVariance(
+        inputLocal, meanLocal, inverseLocal, columns_, inverseColumns_,
+        epsilon_);
+    AscendC::PipeBarrier<PIPE_V>();
+    ApplyStoreAdapterSimt(
+        outputLocal, inputLocal, meanLocal, inverseLocal, columns_);
+
+    inputQueue_.FreeTensor(inputLocal);
+    outputQueue_.EnQue(outputLocal);
+    meanQueue_.EnQue(meanLocal);
+    inverseQueue_.EnQue(inverseLocal);
+
+    meanLocal = meanQueue_.DeQue<float>();
+    CopyScalarOut(meanGm_[static_cast<uint64_t>(row)], meanLocal);
+    meanQueue_.FreeTensor(meanLocal);
+
+    inverseLocal = inverseQueue_.DeQue<float>();
+    CopyScalarOut(
+        inverseVarianceGm_[static_cast<uint64_t>(row)], inverseLocal);
+    inverseQueue_.FreeTensor(inverseLocal);
+
+    outputLocal = outputQueue_.DeQue<half>();
+    AscendC::DataCopyExtParams copyOut{
+        1, static_cast<uint32_t>(columns_ * sizeof(half)), 0, 0, 0};
+    AscendC::DataCopyPad(outputGm_[rowOffset], outputLocal, copyOut);
+    outputQueue_.FreeTensor(outputLocal);
+  }
+
+  AscendC::TPipe pipe_;
+  AscendC::GlobalTensor<half> inputGm_;
+  AscendC::GlobalTensor<half> outputGm_;
+  AscendC::GlobalTensor<float> meanGm_;
+  AscendC::GlobalTensor<float> inverseVarianceGm_;
+  AscendC::TQue<AscendC::TPosition::VECIN, kPipelineDepth> inputQueue_;
+  AscendC::TQue<AscendC::TPosition::VECOUT, kPipelineDepth> outputQueue_;
+  AscendC::TQue<AscendC::TPosition::VECOUT, kPipelineDepth> meanQueue_;
+  AscendC::TQue<AscendC::TPosition::VECOUT, kPipelineDepth> inverseQueue_;
+  int64_t rows_ = 0;
+  uint32_t columns_ = 0;
+  float inverseColumns_ = 0.0F;
+  float epsilon_ = 0.0F;
+};
+
+extern "C" __global__ __aicore__ void layernorm_reg_cached_kernel(
+    GM_ADDR input, GM_ADDR output, GM_ADDR mean, GM_ADDR inverseVariance,
+    int64_t rows, uint32_t columns, float inverseColumns, float epsilon) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  LayerNormRegCachedKernel kernel;
+  kernel.Init(
+      input, output, mean, inverseVariance, rows, columns, inverseColumns,
+      epsilon);
+  kernel.Process();
+}
+
+extern "C" aclError ascify950_layernorm_reg_cached_launch_v1(
+    aclrtStream stream, const half* input, half* output, float* mean,
+    float* inverseVariance, int64_t rows, int64_t columns, double epsilon) {
+  if (!ascify::target::dav_c310::rowwise_simd_v1::
+          IsLayerNormCachedHybridDomain(
+              stream, input, output, mean, inverseVariance, rows, columns,
+              epsilon, 0, 0)) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  if (rows <= 0 || columns <= 0
+      || columns > static_cast<int64_t>(kMaxColumns)
+      || columns % 8 != 0
+      || rows > std::numeric_limits<int64_t>::max() / columns) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  const uint32_t narrowColumns = static_cast<uint32_t>(columns);
+  const float inverseColumns = 1.0F / static_cast<float>(narrowColumns);
+  const float narrowEpsilon = static_cast<float>(epsilon);
+  if (!(narrowEpsilon > 0.0F) || !std::isfinite(narrowEpsilon)) {
+    return ACL_ERROR_RT_PARAM_INVALID;
+  }
+  const int gridBlocks = static_cast<int>(
+      rows < kDefaultAivCount ? rows : kDefaultAivCount);
+  layernorm_reg_cached_kernel<<<gridBlocks, kMaximumUbBytes, stream>>>(
+      (GM_ADDR)input, (GM_ADDR)output, (GM_ADDR)mean,
+      (GM_ADDR)inverseVariance, rows, narrowColumns, inverseColumns,
+      narrowEpsilon);
+  return aclrtPeekAtLastError(static_cast<aclrtLastErrLevel>(0));
+}
+
+}  // namespace ascify950_reg_layernorm

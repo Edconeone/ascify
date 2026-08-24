@@ -8,6 +8,7 @@
 +RouteDoubleFallback(
 +RouteScale(
 -#include <ascify/target/dav_c310/rowwise_norm_recipes.hpp>
+-#include <ascify/target/dav_c310/rowwise_simd_recipes.hpp>
 -ascify_target_direct_load_tag
 -ascify_target_direct_store_tag
 -ascify_target_storage_type
@@ -16,3 +17,5 @@
 -ascify_target_row_stride
 -::ascify::target::dav_c310::TrySoftmax(
 -::ascify::target::dav_c310::TryRmsNorm(
+-::ascify::target::dav_c310::rowwise_simd_v1::RowwiseHybridFacadeV1::TrySoftmaxHybrid(
+-::ascify::target::dav_c310::rowwise_simd_v1::RowwiseHybridFacadeV1::TryRmsNormHybrid(

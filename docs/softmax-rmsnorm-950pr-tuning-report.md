@@ -1,5 +1,11 @@
 # Softmax / RMSNorm 950PR 转换与调优技术记录
 
+> 历史范围：本文记录的是旧 `TrySoftmax` / `TryRmsNorm` 直接 recipe
+> 及其同轮测量证据，不是
+> `--target-recipe=dav-3510-rowwise-simd-v1` 显式转换结果。旧结果不得直接
+> 归因于新生成主 CCE 或新编译 runtime；当前显式模式、独立链接边界和统计口径
+> 见[显式 SIMD 转换指南](rowwise-simd-conversion.md)。
+
 ## 测量与算量口径
 
 | 项目 | 固定值 |
@@ -113,12 +119,15 @@ rewrite；它没有识别完整 row-wise 算子，也不会自动生成 warp/blo
    weight 和精确乘法语义；
 2. **算子数据流证明**：Softmax 证明
    `load → max → subtract → exp → sum → divide → store`；RMSNorm 证明
-   `load → square → sum/mean → epsilon → rsqrt → inverse/store`；
+   `load → square → sum/mean → epsilon → rsqrt → inverse/store`；LayerNorm
+   另行证明 Welford mean/M2/count、centered variance、epsilon/rsqrt、
+   centered normalize 以及 mean/inverse-variance 输出；
 3. **effect/CFG 证明**：拒绝额外全局写、atomic、volatile、asm、trap、
    未解析调用、死分支证据、条件 launch 和不完整 row/column coverage；
 4. **wrapper 证明与放置**：Softmax 只在三个 direct wrapper 入口插入；
    RMSNorm 保留 dependent `GetNumBlocks` 及其失败边，再在唯一 launch 前插入；
-   dispatcher、LogSoftmax 和顶层 RMSNorm wrapper 不命中；
+   LayerNorm 只在已证明的 warp wrapper 插入；dispatcher、LogSoftmax 和
+   顶层 RMSNorm wrapper 不命中；
 5. **target library**：把手工验证过的 16 B load/store、native reduce、
    cache、warp/block 路由、动态 AIV grid、half2 精化和 fallback 封装在
    `ascify::target::dav_c310::v1`；
@@ -127,7 +136,7 @@ rewrite；它没有识别完整 row-wise 算子，也不会自动生成 warp/blo
 
 project-specific 文件名、kernel 和 wrapper 名不是 recipe 触发条件；真实源码
 mutation matrix 用重命名用例以及 coverage 缺口、伪 reducer、副作用、错误
-CFG、宏插入点、名字冲突和 member wrapper 共 38/38 验证当前源码族。
+CFG、宏插入点、名字冲突和 member wrapper 共 45/45 验证当前三个源码族。
 默认 `portable + precise` 行为不变；只有
 `dav-c310-vec + fast` 启用该 recipe。
 

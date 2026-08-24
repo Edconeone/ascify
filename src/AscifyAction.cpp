@@ -22,12 +22,15 @@ THE SOFTWARE.
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <string>
+#include <utility>
 #include "AscifyAction.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/SourceLocation.h"
@@ -57,6 +60,425 @@ const StringRef sCudaLaunchKernel = "cudaLaunchKernel";
 const StringRef sCudaGlobalScalarDoubleParam = "cudaGlobalScalarDoubleParam";
 const StringRef sCanonicalWarpAddReduction = "canonicalWarpAddReduction";
 const StringRef sCanonicalBinaryReducer = "canonicalBinaryReducer";
+
+namespace {
+
+const char *const RowwiseSimdReservedMacros[] = {
+    "ascify",
+    "target",
+    "dav_c310",
+    "rowwise_simd_v1",
+    "SimdTryResult",
+    "HybridTryResult",
+    "NotHandled",
+    "RowwiseSimdFacadeV1",
+    "RowwiseHybridFacadeV1",
+    "HybridRecipeDescriptor",
+    "HybridStageDescriptor",
+    "DispatchRegisteredHybrid",
+    "TrySoftmaxSimd",
+    "TryRmsNormSimd",
+    "TryLayerNormSimd",
+    "TrySoftmaxHybrid",
+    "TryRmsNormHybrid",
+    "TryLayerNormHybrid",
+    "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_RECIPES_HPP_",
+    "ASCIFY_TARGET_DAV_C310_ROWWISE_HYBRID_REGISTRY_V1_HPP_",
+    "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_SELECTORS_V1_HPP_",
+    "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_ABI_H_",
+    "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_ABI_TYPES_READY",
+    "ASCIFY_DAV_C310_ROWWISE_SIMD_ABI_VERSION",
+    "ASCIFY_ASCIFY_CUDA_COMPAT_HPP",
+    "ASCIFY_ALIGN",
+    "ASCIFY_FORCEINLINE",
+    "ascify950_softmax_reg_recompute_launch_v1",
+    "ascify950_rmsnorm_reg_cached_launch_v1",
+    "ascify950_rmsnorm_reg_plain_rowbatch_launch_v1",
+    "ascify950_layernorm_reg_cached_launch_v1",
+    "handled",
+    "status",
+    "alignas",
+    "alignof",
+    "asm",
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char16_t",
+    "char32_t",
+    "class",
+    "const",
+    "constexpr",
+    "const_cast",
+    "continue",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "public",
+    "nullptr",
+    "operator",
+    "private",
+    "protected",
+    "register",
+    "reinterpret_cast",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+    "exp",
+    "expf",
+    "__expf",
+    "rsqrt",
+    "rsqrtf",
+    "__frsqrt_rn",
+    "__fdividef",
+    "ascify_target_direct_load_tag",
+    "ascify_target_direct_store_tag",
+    "ascify_target_adapter_owner_type",
+    "ascify_target_storage_type",
+    "ascify_target_compute_type",
+    "ascify_target_store_is_affine",
+    "ascify_target_data",
+    "ascify_target_row_stride",
+    "ascify_target_weight",
+};
+
+bool isRowwiseSimdReservedMacro(llvm::StringRef name) {
+  return std::find_if(
+             std::begin(RowwiseSimdReservedMacros),
+             std::end(RowwiseSimdReservedMacros),
+             [&](const char *reserved) { return name == reserved; }) !=
+         std::end(RowwiseSimdReservedMacros);
+}
+
+bool isRowwiseSimdPublishedHeaderMacro(llvm::StringRef name) {
+  return name == "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_RECIPES_HPP_" ||
+         name == "ASCIFY_TARGET_DAV_C310_ROWWISE_HYBRID_REGISTRY_V1_HPP_" ||
+         name == "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_SELECTORS_V1_HPP_" ||
+         name == "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_ABI_H_" ||
+         name == "ASCIFY_DAV_C310_ROWWISE_SIMD_ABI_VERSION" ||
+         name == "ASCIFY_ASCIFY_CUDA_COMPAT_HPP" ||
+         name == "ASCIFY_ALIGN" || name == "ASCIFY_FORCEINLINE";
+}
+
+bool isRowwiseSimdProtectedDeclarationName(llvm::StringRef name) {
+  static const char *const names[] = {
+      "ascify",
+      "SimdTryResult",
+      "HybridTryResult",
+      "NotHandled",
+      "RowwiseSimdFacadeV1",
+      "RowwiseHybridFacadeV1",
+      "HybridRecipeDescriptor",
+      "HybridStageDescriptor",
+      "DispatchRegisteredHybrid",
+      "TrySoftmaxSimd",
+      "TryRmsNormSimd",
+      "TryLayerNormSimd",
+      "TrySoftmaxHybrid",
+      "TryRmsNormHybrid",
+      "TryLayerNormHybrid",
+      "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_RECIPES_HPP_",
+      "ASCIFY_TARGET_DAV_C310_ROWWISE_HYBRID_REGISTRY_V1_HPP_",
+      "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_SELECTORS_V1_HPP_",
+      "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_ABI_H_",
+      "ASCIFY_TARGET_DAV_C310_ROWWISE_SIMD_ABI_TYPES_READY",
+      "ASCIFY_DAV_C310_ROWWISE_SIMD_ABI_VERSION",
+      "ASCIFY_ASCIFY_CUDA_COMPAT_HPP",
+      "ASCIFY_ALIGN",
+      "ASCIFY_FORCEINLINE",
+      "ascify_target_direct_load_tag",
+      "ascify_target_direct_store_tag",
+      "ascify_target_adapter_owner_type",
+      "ascify_target_storage_type",
+      "ascify_target_compute_type",
+      "ascify_target_store_is_affine",
+      "ascify_target_data",
+      "ascify_target_row_stride",
+      "ascify_target_weight",
+      "ascify950_softmax_reg_recompute_launch_v1",
+      "ascify950_rmsnorm_reg_cached_launch_v1",
+      "ascify950_rmsnorm_reg_plain_rowbatch_launch_v1",
+      "ascify950_layernorm_reg_cached_launch_v1",
+  };
+  return std::find_if(
+             std::begin(names), std::end(names),
+             [&](const char *protectedName) {
+               return name == protectedName;
+             }) != std::end(names);
+}
+
+struct RowwiseSimdConflictingDeclaration {
+  clang::SourceLocation location;
+  std::string name;
+
+  explicit operator bool() const { return !name.empty(); }
+};
+
+RowwiseSimdConflictingDeclaration
+findRowwiseSimdConflictingDeclaration(clang::ASTContext &context) {
+  class Visitor : public clang::RecursiveASTVisitor<Visitor> {
+  public:
+    explicit Visitor(clang::SourceManager &sourceManager)
+        : sourceManager(sourceManager) {}
+
+    bool VisitFileScopeAsmDecl(clang::FileScopeAsmDecl *declaration) {
+      if (conflict || declaration == nullptr)
+        return !conflict;
+      return rejectUserAsm(declaration->getLocation(), "GNU asm");
+    }
+
+    bool VisitGCCAsmStmt(clang::GCCAsmStmt *statement) {
+      if (conflict || statement == nullptr)
+        return !conflict;
+      return rejectUserAsm(statement->getAsmLoc(), "GNU asm");
+    }
+
+    bool VisitMSAsmStmt(clang::MSAsmStmt *statement) {
+      if (conflict || statement == nullptr)
+        return !conflict;
+      return rejectUserAsm(statement->getAsmLoc(), "Microsoft asm");
+    }
+
+    bool VisitNamespaceDecl(clang::NamespaceDecl *declaration) {
+      if (conflict || declaration == nullptr || declaration->isImplicit())
+        return !conflict;
+      const std::string qualified =
+          declaration->getQualifiedNameAsString();
+      const llvm::StringRef qualifiedRef(qualified);
+      if (qualifiedRef == "ascify::target::dav_c310" ||
+          qualifiedRef.starts_with("ascify::target::dav_c310::")) {
+        conflict = {
+            declaration->getLocation(), qualified};
+        return false;
+      }
+      return true;
+    }
+
+    bool VisitNamedDecl(clang::NamedDecl *declaration) {
+      if (conflict || declaration == nullptr ||
+          declaration->getIdentifier() == nullptr)
+        return !conflict;
+      const llvm::StringRef name = declaration->getName();
+      if (const auto *assemblerLabel =
+              declaration->getAttr<clang::AsmLabelAttr>()) {
+        llvm::StringRef label = assemblerLabel->getLabel();
+        if (!label.empty() && label.front() == '\1')
+          label = label.drop_front();
+        if (isRowwiseSimdProtectedDeclarationName(label)) {
+          conflict = {
+              declaration->getLocation(), label.str()};
+          return false;
+        }
+      }
+      if (isRowwiseSimdProtectedDeclarationName(name)) {
+        conflict = {
+            declaration->getLocation(),
+            declaration->getQualifiedNameAsString()};
+        return false;
+      }
+      if (name != "RowwiseSimdFacadeV1" &&
+          name != "RowwiseHybridFacadeV1" &&
+          name != "TrySoftmaxSimd" && name != "TryRmsNormSimd" &&
+          name != "TryLayerNormSimd" &&
+          name != "TrySoftmaxHybrid" && name != "TryRmsNormHybrid" &&
+          name != "TryLayerNormHybrid")
+        return true;
+      const auto *owner = llvm::dyn_cast_or_null<clang::NamedDecl>(
+          declaration->getDeclContext());
+      if (owner == nullptr)
+        return true;
+      const std::string qualifiedOwner =
+          owner->getQualifiedNameAsString();
+      const llvm::StringRef qualifiedOwnerRef(qualifiedOwner);
+      if (qualifiedOwnerRef == "ascify::target::dav_c310" ||
+          qualifiedOwnerRef.starts_with("ascify::target::dav_c310::")) {
+        conflict = {
+            declaration->getLocation(),
+            declaration->getQualifiedNameAsString()};
+        return false;
+      }
+      return true;
+    }
+
+  private:
+    bool rejectUserAsm(
+        clang::SourceLocation location, llvm::StringRef spelling) {
+      const clang::SourceLocation expansion =
+          sourceManager.getExpansionLoc(location);
+      if (expansion.isInvalid() ||
+          sourceManager.isInSystemHeader(expansion))
+        return true;
+      conflict = {location, spelling.str()};
+      return false;
+    }
+
+  public:
+
+    RowwiseSimdConflictingDeclaration conflict;
+    clang::SourceManager &sourceManager;
+  } visitor(context.getSourceManager());
+
+  visitor.TraverseDecl(context.getTranslationUnitDecl());
+  return visitor.conflict;
+}
+
+struct RawRowwiseSimdConflict {
+  std::string macro;
+  std::string declaration;
+};
+
+RawRowwiseSimdConflict rawFileRowwiseSimdConflict(
+    clang::CompilerInstance &compiler, clang::FileID file,
+    bool inspectAsmTokens = false) {
+  clang::SourceManager &sourceManager =
+      compiler.getSourceManager();
+  clang::Preprocessor &preprocessor =
+      compiler.getPreprocessor();
+  bool invalid = false;
+  const llvm::StringRef buffer =
+      sourceManager.getBufferData(file, &invalid);
+  if (invalid)
+    return {};
+  clang::Lexer lexer(
+      sourceManager.getLocForStartOfFile(file),
+      preprocessor.getLangOpts(), buffer.begin(), buffer.begin(),
+      buffer.end());
+
+  enum class DirectiveState { None, Hash, Define };
+  DirectiveState state = DirectiveState::None;
+  RawRowwiseSimdConflict conflict;
+  clang::Token token;
+  const auto tokenName = [](const clang::Token &candidate) {
+    if (candidate.is(clang::tok::raw_identifier))
+      return candidate.getRawIdentifier();
+    return candidate.getIdentifierInfo() == nullptr
+               ? llvm::StringRef()
+               : candidate.getIdentifierInfo()->getName();
+  };
+  lexer.LexFromRawLexer(token);
+  while (token.isNot(clang::tok::eof)) {
+    if (token.isAtStartOfLine())
+      state = DirectiveState::None;
+    if (state == DirectiveState::None &&
+        token.is(clang::tok::hash) &&
+        token.isAtStartOfLine()) {
+      state = DirectiveState::Hash;
+    } else if (state == DirectiveState::Hash &&
+               tokenName(token) == "define") {
+      state = DirectiveState::Define;
+    } else if (state == DirectiveState::Define &&
+               !tokenName(token).empty()) {
+      const llvm::StringRef name = tokenName(token);
+      if (isRowwiseSimdReservedMacro(name))
+        conflict.macro = name.str();
+      state = DirectiveState::None;
+    } else if (state != DirectiveState::None) {
+      state = DirectiveState::None;
+    }
+    const llvm::StringRef name = tokenName(token);
+    if (inspectAsmTokens && conflict.declaration.empty() &&
+        (name == "asm" || name == "__asm" || name == "__asm__"))
+      conflict.declaration = "GNU asm";
+    if (conflict.declaration.empty() &&
+        !name.empty() && isRowwiseSimdProtectedDeclarationName(name)) {
+      conflict.declaration = name.str();
+    }
+    if (!conflict.macro.empty() && !conflict.declaration.empty())
+      break;
+    lexer.LexFromRawLexer(token);
+  }
+  return conflict;
+}
+
+std::string findConventionalMainOuterGuard(
+    clang::CompilerInstance &compiler) {
+  clang::SourceManager &sourceManager = compiler.getSourceManager();
+  bool invalid = false;
+  const llvm::StringRef buffer = sourceManager.getBufferData(
+      sourceManager.getMainFileID(), &invalid);
+  if (invalid)
+    return {};
+
+  clang::Lexer lexer(
+      sourceManager.getLocForStartOfFile(sourceManager.getMainFileID()),
+      compiler.getPreprocessor().getLangOpts(), buffer.begin(),
+      buffer.begin(), buffer.end());
+  std::vector<std::string> spellings;
+  std::vector<bool> startsOfLine;
+  clang::Token token;
+  lexer.LexFromRawLexer(token);
+  while (token.isNot(clang::tok::eof) && spellings.size() < 6) {
+    if (token.is(clang::tok::comment)) {
+      lexer.LexFromRawLexer(token);
+      continue;
+    }
+    bool spellingInvalid = false;
+    const std::string spelling = clang::Lexer::getSpelling(
+        token, sourceManager, compiler.getPreprocessor().getLangOpts(),
+        &spellingInvalid);
+    if (spellingInvalid)
+      return {};
+    spellings.push_back(spelling);
+    startsOfLine.push_back(token.isAtStartOfLine());
+    lexer.LexFromRawLexer(token);
+  }
+  if (spellings.size() != 6 || spellings[0] != "#" ||
+      spellings[1] != "ifndef" || spellings[2].empty() ||
+      spellings[3] != "#" || spellings[4] != "define" ||
+      spellings[5] != spellings[2] || !startsOfLine[0] ||
+      !startsOfLine[3]) {
+    return {};
+  }
+  return spellings[2];
+}
+
+} // namespace
 
 void AscifyAction::RewriteString(StringRef s, clang::SourceLocation start) {
   auto &SM = getCompilerInstance().getSourceManager();
@@ -1048,6 +1470,8 @@ void AscifyAction::InclusionDirective(clang::SourceLocation hash_loc,
     hasCudaCompatHeader = true;
   if (file_name == ascify::DavC310TargetRecipe::TargetHeader)
     hasDavC310TargetHeader = true;
+  if (file_name == ascify::DavC310TargetRecipe::SimdTargetHeader)
+    hasDavC310SimdTargetHeader = true;
   if (file_name == "cub/cub.cuh" ||
       file_name == "acl_cub/aclcub.hpp") {
     hasCubCompatHeader = true;
@@ -1416,22 +1840,74 @@ std::unique_ptr<clang::ASTConsumer> AscifyAction::CreateASTConsumer(clang::Compi
 void AscifyAction::Ifndef(clang::SourceLocation Loc, const clang::Token &MacroNameTok, const clang::MacroDefinition &MD) {
 }
 
+void AscifyAction::MacroDefined(const clang::Token &MacroNameTok) {
+  if (MacroNameTok.getIdentifierInfo() == nullptr)
+    return;
+  const llvm::StringRef name =
+      MacroNameTok.getIdentifierInfo()->getName();
+  if (TargetRecipe != ascify::DavC310TargetRecipe::SimdRecipeName)
+    return;
+  if (isRowwiseSimdReservedMacro(name))
+    rowwiseSimdMacrosEverDefined.insert(name.str());
+}
+
 void AscifyAction::EndSourceFileAction() {
   std::string includes;
   if (needsCudaCompatHeader && !hasCudaCompatHeader)
     includes += "#include <ascify/ascify_cuda_compat.hpp>\n";
-  if (needsDavC310TargetHeader && !hasDavC310TargetHeader) {
+  const bool useSimdTargetRecipe =
+      TargetRecipe == ascify::DavC310TargetRecipe::SimdRecipeName;
+  const bool hasSelectedTargetHeader =
+      useSimdTargetRecipe ? hasDavC310SimdTargetHeader
+                          : hasDavC310TargetHeader;
+  if (needsDavC310TargetHeader && !hasSelectedTargetHeader) {
     includes += "#include <";
-    includes += ascify::DavC310TargetRecipe::TargetHeader;
+    includes += useSimdTargetRecipe
+                    ? ascify::DavC310TargetRecipe::SimdTargetHeader
+                    : ascify::DavC310TargetRecipe::TargetHeader;
     includes += ">\n";
   }
   if (includes.empty())
     return;
 
+  if (useSimdTargetRecipe) {
+    std::string shielded;
+    std::vector<const char *> headerShieldNames;
+    for (const char *name : RowwiseSimdReservedMacros) {
+      if (isRowwiseSimdPublishedHeaderMacro(name))
+        continue;
+      headerShieldNames.push_back(name);
+      shielded += "#pragma push_macro(\"";
+      shielded += name;
+      shielded += "\")\n#undef ";
+      shielded += name;
+      shielded += "\n";
+    }
+    shielded += includes;
+    for (auto name = headerShieldNames.rbegin();
+         name != headerShieldNames.rend(); ++name) {
+      shielded += "#pragma pop_macro(\"";
+      shielded += *name;
+      shielded += "\")\n";
+    }
+    includes = std::move(shielded);
+    const std::string mainOuterGuardName =
+        findConventionalMainOuterGuard(getCompilerInstance());
+    if (!mainOuterGuardName.empty()) {
+      includes =
+          "#pragma push_macro(\"" + mainOuterGuardName + "\")\n#undef " +
+          mainOuterGuardName + "\n" + includes +
+          "#pragma pop_macro(\"" + mainOuterGuardName + "\")\n";
+    }
+  }
+
   auto &SM = getCompilerInstance().getSourceManager();
   const clang::FileID mainFile = SM.getMainFileID();
   const clang::SourceLocation insertLoc =
-      firstHeader ? firstHeaderLoc : SM.getLocForStartOfFile(mainFile);
+      useSimdTargetRecipe
+          ? SM.getLocForStartOfFile(mainFile)
+          : (firstHeader ? firstHeaderLoc
+                         : SM.getLocForStartOfFile(mainFile));
   ct::Replacement Rep(SM, insertLoc, 0, includes);
   insertReplacement(Rep, clang::FullSourceLoc(insertLoc, SM));
 }
@@ -1482,6 +1958,12 @@ public:
     ascifyAction.Ifndef(Loc, MacroNameTok, MD);
   }
 
+  void MacroDefined(
+      const clang::Token &MacroNameTok,
+      const clang::MacroDirective *) override {
+    ascifyAction.MacroDefined(MacroNameTok);
+  }
+
   void SourceRangeSkipped(clang::SourceRange Range, clang::SourceLocation EndifLoc) override {
     ascifyAction.AddSkippedSourceRange(Range);
   }
@@ -1505,6 +1987,24 @@ bool AscifyAction::BeginInvocation(clang::CompilerInstance &CI) {
     DE.Report(ID) << SimtMathMode;
     return false;
   }
+  if (TargetRecipe != "none" &&
+      TargetRecipe != ascify::DavC310TargetRecipe::SimdRecipeName) {
+    const auto ID = DE.getCustomDiagID(
+        clang::DiagnosticsEngine::Error,
+        "unsupported --target-recipe value '%0'; expected 'none' or "
+        "'dav-3510-rowwise-simd-v1'");
+    DE.Report(ID) << TargetRecipe;
+    return false;
+  }
+  if (TargetRecipe == ascify::DavC310TargetRecipe::SimdRecipeName &&
+      (TargetPolicy != "dav-c310-vec" || SimtMathMode != "fast")) {
+    const auto ID = DE.getCustomDiagID(
+        clang::DiagnosticsEngine::Error,
+        "--target-recipe=dav-3510-rowwise-simd-v1 requires "
+        "--target-policy=dav-c310-vec and --simt-math=fast");
+    DE.Report(ID);
+    return false;
+  }
   llcompat::RetainExcludedConditionalBlocks(CI);
   return true;
 }
@@ -1521,9 +2021,65 @@ void AscifyAction::ExecuteAction() {
   clang::ASTFrontendAction::ExecuteAction();
   auto &SM = getCompilerInstance().getSourceManager();
   if (TargetPolicy == "dav-c310-vec" && SimtMathMode == "fast") {
+    if (TargetRecipe == ascify::DavC310TargetRecipe::SimdRecipeName) {
+      const RawRowwiseSimdConflict rawMainConflict =
+          rawFileRowwiseSimdConflict(
+              getCompilerInstance(), SM.getMainFileID(), false);
+      std::string conflictingMacro = rawMainConflict.macro;
+      if (rowwiseSimdRawConflictingDeclaration.empty())
+        rowwiseSimdRawConflictingDeclaration =
+            rawMainConflict.declaration;
+      for (const char *name : RowwiseSimdReservedMacros) {
+        if (!conflictingMacro.empty())
+          break;
+        const clang::IdentifierInfo *identifier =
+            PP.getIdentifierInfo(name);
+        if (rowwiseSimdMacrosEverDefined.count(name) != 0 ||
+            (identifier != nullptr && PP.isMacroDefined(identifier))) {
+          conflictingMacro = name;
+          break;
+        }
+      }
+      if (!conflictingMacro.empty()) {
+        const auto diagnostic =
+            getCompilerInstance().getDiagnostics().getCustomDiagID(
+                clang::DiagnosticsEngine::Error,
+                "--target-recipe=dav-3510-rowwise-simd-v1 rejects reserved "
+                "macro '%0'");
+        getCompilerInstance().getDiagnostics().Report(diagnostic)
+            << conflictingMacro;
+        return;
+      }
+      if (!rowwiseSimdRawConflictingDeclaration.empty()) {
+        const auto diagnostic =
+            getCompilerInstance().getDiagnostics().getCustomDiagID(
+                clang::DiagnosticsEngine::Error,
+                "--target-recipe=dav-3510-rowwise-simd-v1 rejects raw "
+                "input token '%0' reserved by the row-wise SIMD recipe");
+        getCompilerInstance().getDiagnostics().Report(diagnostic)
+            << rowwiseSimdRawConflictingDeclaration;
+        return;
+      }
+      const RowwiseSimdConflictingDeclaration conflictingDeclaration =
+          findRowwiseSimdConflictingDeclaration(
+              getCompilerInstance().getASTContext());
+      if (conflictingDeclaration) {
+        const auto diagnostic =
+            getCompilerInstance().getDiagnostics().getCustomDiagID(
+                clang::DiagnosticsEngine::Error,
+                "--target-recipe=dav-3510-rowwise-simd-v1 rejects "
+                "input declaration or asm '%0' reserved by the row-wise "
+                "SIMD recipe");
+        getCompilerInstance().getDiagnostics()
+            .Report(conflictingDeclaration.location, diagnostic)
+            << conflictingDeclaration.name;
+        return;
+      }
+    }
     const ascify::DavC310TargetRecipe::FinalizedEdits recipeEdits =
         davC310TargetRecipe.finalize(
-            getCompilerInstance().getASTContext(), SM, PP.getLangOpts());
+            getCompilerInstance().getASTContext(), SM, PP.getLangOpts(),
+            TargetRecipe == ascify::DavC310TargetRecipe::SimdRecipeName);
     unsigned insertedRecipeEdits = 0;
     for (const ascify::DavC310TargetRecipe::Edit &edit :
          recipeEdits.edits) {
@@ -1541,7 +2097,8 @@ void AscifyAction::ExecuteAction() {
           << recipeEdits.directStoreAdapters
           << "), direct_wrappers(softmax="
           << recipeEdits.softmaxDirectWrappers << ",rmsnorm="
-          << recipeEdits.rmsNormDirectWrappers << ")\n";
+          << recipeEdits.rmsNormDirectWrappers << ",layernorm="
+          << recipeEdits.layerNormDirectWrappers << ")\n";
     }
   }
   // Start lexing the specified input file.
@@ -1566,6 +2123,24 @@ void AscifyAction::ExecuteAction() {
 
 void AscifyAction::AddSkippedSourceRange(clang::SourceRange Range) {
   SkippedSourceRanges.push_back(Range);
+  if (TargetRecipe != ascify::DavC310TargetRecipe::SimdRecipeName)
+    return;
+  clang::SourceManager &sourceManager =
+      getCompilerInstance().getSourceManager();
+  const clang::SourceLocation begin =
+      sourceManager.getFileLoc(Range.getBegin());
+  if (begin.isInvalid() || sourceManager.isInSystemHeader(begin))
+    return;
+  const clang::FileID file = sourceManager.getFileID(begin);
+  if (file.isInvalid() ||
+      !rowwiseSimdRawScannedFiles.insert(file.getHashValue()).second)
+    return;
+  const RawRowwiseSimdConflict conflict =
+      rawFileRowwiseSimdConflict(getCompilerInstance(), file, true);
+  if (!conflict.macro.empty())
+    rowwiseSimdMacrosEverDefined.insert(conflict.macro);
+  if (rowwiseSimdRawConflictingDeclaration.empty())
+    rowwiseSimdRawConflictingDeclaration = conflict.declaration;
 }
 
 void AscifyAction::run(const mat::MatchFinder::MatchResult &Result) {
