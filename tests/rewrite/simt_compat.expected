@@ -4,27 +4,79 @@
 +ascify::shfl_xor_sync(0xffffffffu, value, 1, 32)
 +ASCIFY_ALIGN(16)
 +ascify::syncwarp()
++ascify::syncthreads()
++ascify::threadfence_block()
++ascify::threadfence()
 +expf(value)
 +logf(value)
 +sqrtf(value)
 +rsqrtf(value)
 +ascify::fdividef(value, 2.0f)
 +ascify::cudaDeviceGetAttribute(value, ACL_DEV_ATTR_VECTOR_CORE_NUM, device)
++ascify::cudaDeviceGetAttribute(value, ascify::cudaDevAttrWarpSize, device)
++value, ascify::cudaDevAttrMaxThreadsPerVectorCore, device)
++value, ascify::cudaDevAttrMaxThreadsPerBlock, device)
 +ascify::cudaOccupancyMaxActiveBlocksPerMultiprocessor(
 +ascify::cudaFuncAttributes attributes{}
 +ascify::cudaFuncGetAttributes(&attributes, SimtCompatKernel)
 +ascify::cudaFuncSetAttribute(
 +ascify::cudaFuncAttributeMaxDynamicSharedMemorySize
-+ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE
++ascify::cudaDevAttrLocalMemoryPerVectorCore
 +ascify::cudaPeekAtLastError()
-+__global__ void NarrowScalarDoubleParams(float* output, const float eps, float scale,
++aclrtMemcpyKind kind, aclrtStream stream
++ascify::cudaMalloc(device, bytes)
++ascify::cudaMallocHost(pinned, bytes)
++ascify::cudaMemcpy(destination, source, bytes, kind)
++ascify::cudaMemcpyAsync(destination, source, bytes, kind, stream)
++ascify::cudaMemset(destination, 0, bytes)
++ascify::cudaMemsetAsync(destination, 0, bytes, stream)
++ascify::cudaGetErrorString(status)
++ascify::cudaFree(*device)
++ascify::cudaFreeHost(*pinned)
++ascify::cudaGetLastError()
++ascify::cudaGetDeviceCount(&count)
++ascify::cudaGetDevice(&device)
++ascify::cudaSetDevice(device)
++ascify::cudaStreamCreate(&stream)
++ascify::cudaEventCreate(&start)
++ascify::cudaEventRecord(start, stream)
++ascify::cudaEventSynchronize(start)
++ascify::cudaEventElapsedTime(&elapsed_ms, start, end)
++ascify::cudaEventDestroy(start)
++ascify::cudaStreamSynchronize(stream)
++ascify::cudaStreamDestroy(stream)
++ascify::cudaDeviceSynchronize()
++ascify::cudaDeviceReset()
++float* host = (float*)malloc(bytes)
++free(host)
++std::free(pointer)
++ASCIFY_GLOBAL void NarrowScalarDoubleParams(float* output, const float eps, float scale,
 +const double* pointer, double values[])
 +__aicore__ double KeepDeviceDoubleParam(double value)
 +double KeepHostDoublePrecision(double value)
 +std::is_same<double, double>
 -asc_shfl_xor(0xffffffffu,
+-asc_syncthreads()
+-asc_threadfence_block()
+-asc_threadfence()
 -aclrtGetDeviceInfo(value,
+-ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE
+-ACL_DEV_ATTR_WARP_SIZE
+-ACL_DEV_ATTR_MAX_THREAD_PER_VECTOR_CORE
+-ACL_DEV_ATTR_MAX_THREAD_PER_BLOCK
 -aclrtPeekAtLastError()
+-aclrtMalloc(device, bytes)
+-aclrtMemcpy(destination, source, bytes, kind)
+-aclrtGetLastError()
+-aclGetRecentErrMsg(status)
+-aclrtGetDevice(&device)
+-aclrtSetDevice(device)
+-aclrtGetDeviceCount(&count)
+-aclrtCreateStream(&stream)
+-aclrtCreateEvent(&start)
+-aclrtResetDevice()
+-ascify::cudaMallocHost(&host, bytes)
+-ascify::cudaFreeHost(host)
 -__builtin_expf
 -__builtin_logf
 -__builtin_sqrtf

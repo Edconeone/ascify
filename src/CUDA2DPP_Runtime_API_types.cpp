@@ -35,17 +35,21 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_TYPE_NAME_MAP = [] {
   m["cudaErrorInvalidDevice"]    = {"ACL_ERROR_RT_DEVICE_NOT_FOUND",     CONV_DEFINE, API_RUNTIME, SEC::ERROR_HANDLING};
   // Stream type
   m["cudaStream_t"]              = {"aclrtStream",                       CONV_TYPE, API_RUNTIME, SEC::STREAM};
+  // Keep CUDA flag values in the Ascify namespace. CUDA bit 0 is not
+  // ACL_STREAM_FAST_LAUNCH even though both numeric values are one.
+  m["cudaStreamDefault"]         = {"ascify::cudaStreamDefault",         CONV_DEFINE, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamNonBlocking"]     = {"ascify::cudaStreamNonBlocking",     CONV_DEFINE, API_RUNTIME, SEC::STREAM};
   // Event type
   m["cudaEvent_t"]                = {"aclrtEvent",                       CONV_TYPE, API_RUNTIME, SEC::EVENT};
-  // Device attribute enums (verified: aclrtDevAttr enum is empty in CANN 9.0.0 acl_rt.h)
-  // These constants need verification against actual CANN; use with aclrtGetDeviceInfo()
+  // Device attributes. Values beyond VECTOR_CORE_NUM drift between public ACL
+  // and frozen RTS headers, so generated code names only Ascify constants.
   m["cudaDevAttrMultiProcessorCount"]                 = {"ACL_DEV_ATTR_VECTOR_CORE_NUM",               CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrMaxThreadsPerMultiProcessor"]         = {"ACL_DEV_ATTR_MAX_THREAD_PER_VECTOR_CORE", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrMaxSharedMemoryPerBlock"]             = {"ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxThreadsPerMultiProcessor"]         = {"ascify::cudaDevAttrMaxThreadsPerVectorCore", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxSharedMemoryPerBlock"]             = {"ascify::cudaDevAttrLocalMemoryPerVectorCore", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaDeviceAttr"]                                    = {"aclrtDevAttr",                                        CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrMaxThreadsPerBlock"]                  = {"ACL_DEV_ATTR_MAX_THREAD_PER_BLOCK",      CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrWarpSize"]                          = {"ACL_DEV_ATTR_WARP_SIZE",                  CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDevAttrMaxSharedMemoryPerBlockOptin"]      = {"ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE",       CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxThreadsPerBlock"]                  = {"ascify::cudaDevAttrMaxThreadsPerBlock", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrWarpSize"]                            = {"ascify::cudaDevAttrWarpSize", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDevAttrMaxSharedMemoryPerBlockOptin"]      = {"ascify::cudaDevAttrLocalMemoryPerVectorCore", CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   // Minimal kernel-attribute surface used by layer_norm.cuh.
   m["cudaFuncAttributes"]                            = {"ascify::cudaFuncAttributes",               CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaFuncAttribute"]                             = {"ascify::cudaFuncAttribute",                CONV_TYPE, API_RUNTIME, SEC::DEVICE_MGMT};
@@ -55,6 +59,7 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_TYPE_NAME_MAP = [] {
   m["cudaMemcpyDeviceToHost"]    = {"ACL_MEMCPY_DEVICE_TO_HOST",        CONV_DEFINE, API_RUNTIME, SEC::MEMORY};
   m["cudaMemcpyDeviceToDevice"]  = {"ACL_MEMCPY_DEVICE_TO_DEVICE",      CONV_DEFINE, API_RUNTIME, SEC::MEMORY};
   m["cudaMemcpyHostToHost"]      = {"ACL_MEMCPY_HOST_TO_HOST",          CONV_DEFINE, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemcpyKind"]            = {"aclrtMemcpyKind",                  CONV_TYPE, API_RUNTIME, SEC::MEMORY};
   return m;
 }();
 

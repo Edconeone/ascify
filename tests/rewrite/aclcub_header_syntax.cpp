@@ -9,8 +9,6 @@ struct AscifyTestThreadIndex {
 };
 static AscifyTestThreadIndex threadIdx{};
 
-inline void asc_syncthreads() {}
-
 #include <acl_cub/aclcub.hpp>
 
 template<typename T>

@@ -51,10 +51,44 @@ private:
     unsigned endOffset;
   };
 
+  struct NvidiaSampleHelperInclude {
+    clang::SourceLocation hashLocation;
+    clang::SourceLocation filenameEnd;
+  };
+
+  enum class NvidiaSampleHelperMacroKind {
+    CheckCudaErrors,
+    GetLastCudaError,
+  };
+
+  struct NvidiaSampleHelperMacroCandidate {
+    NvidiaSampleHelperMacroKind kind;
+    clang::SourceLocation nameLocation;
+    SemanticRewriteRange invocationRange;
+    bool statusDomainProven = false;
+    bool rewritten = false;
+  };
+
   ct::Replacements *replacements = nullptr;
+  LocalHeaderRewriteContext *localHeaderContext = nullptr;
+  ascify::FrontendCompatibilityConfig frontendCompatibility;
   std::map<std::string, clang::SourceLocation> Ifndefs;
   std::vector<clang::SourceRange> SkippedSourceRanges;
   std::vector<SemanticRewriteRange> SemanticRewriteRanges;
+  std::vector<SemanticRewriteRange> nvidiaSampleHelperMacroRanges;
+  std::vector<NvidiaSampleHelperMacroCandidate>
+      nvidiaSampleHelperMacroCandidates;
+  std::vector<NvidiaSampleHelperInclude> nvidiaSampleHelperIncludes;
+  std::set<std::string> recognizedNvidiaSampleHelperPaths;
+  std::set<unsigned> nvidiaSampleHelperNormalMacroOffsets;
+  bool nvidiaSampleHelperUnsupportedMacroUse = false;
+  bool nvidiaSampleHelperUnsupportedDeclarationUse = false;
+  bool nvidiaSampleHelperRewriteFailed = false;
+  bool nvidiaSampleHelperOutputMacroEverDefined = false;
+  bool nvidiaSampleHelperReadyToCommit = false;
+  bool nvidiaSampleHelperRawAuditCompleted = false;
+  unsigned nvidiaSampleCheckCudaErrorsRewrites = 0;
+  unsigned nvidiaSampleGetLastCudaErrorRewrites = 0;
   std::unique_ptr<mat::MatchFinder> Finder;
   ascify::DavC310TargetRecipe davC310TargetRecipe;
   // CUDA implicitly adds its runtime header. We rewrite explicitly-provided CUDA includes with equivalent
@@ -86,6 +120,8 @@ private:
   clang::SourceLocation pragmaOnceLoc;
   std::deque<clang::Token> rawTokenWindow;
   std::set<unsigned> loweredDeviceDoubleParamOffsets;
+  std::set<unsigned> rewrittenCudaDefaultDim3Offsets;
+  std::set<unsigned> rewrittenGlobalAtomicOffsets;
   std::set<unsigned> rewrittenWarpAddReductionOffsets;
   std::set<unsigned> taggedCanonicalReducerOffsets;
   std::set<std::string> rowwiseSimdMacrosEverDefined;
@@ -99,17 +135,33 @@ private:
   // call LexFromRawLexer for the current token again.
   bool RewriteToken(clang::Lexer &rawLex, clang::Token &tok);
   bool isInSemanticRewriteRange(clang::SourceLocation loc);
-  // `double *C = (double*)malloc(bytes);` -> `double *C;\naclrtMalloc(C, bytes);`
-  bool tryRewriteMallocDeviceAllocDecl(clang::Lexer &lex, clang::Token &tok);
+  bool isInNvidiaSampleHelperMacroRange(clang::SourceLocation loc);
+  bool hasUnsupportedNvidiaSampleHelperDeclarationUse();
+  void rewriteProvenNvidiaSampleHelperMacros();
+  void auditRawNvidiaSampleHelperToken(const clang::Token &token);
+  void auditExternalNvidiaSampleHelperPreprocessorUse(
+      clang::SourceLocation location,
+      const clang::Token &macroNameToken,
+      llvm::StringRef directive);
+  void finalizeNvidiaSampleHelperClosure();
   // Calculate str's SourceLocation in SourceRange sr
   clang::SourceLocation GetSubstrLocation(const std::string &str, const clang::SourceRange &sr);
 
 public:
-  explicit AscifyAction(ct::Replacements *replacements): clang::ASTFrontendAction(),
-    replacements(replacements) {}
+  explicit AscifyAction(
+      ct::Replacements *replacements,
+      LocalHeaderRewriteContext *context,
+      const ascify::FrontendCompatibilityConfig& compatibility):
+    clang::ASTFrontendAction(),
+    replacements(replacements),
+    localHeaderContext(context),
+    frontendCompatibility(compatibility) {}
   // MatchCallback listeners
   bool cudaLaunchKernel(const mat::MatchFinder::MatchResult &Result);
   bool lowerCudaGlobalScalarDoubleParam(const mat::MatchFinder::MatchResult &Result);
+  bool rewriteCudaDefaultDim3(const mat::MatchFinder::MatchResult &Result);
+  bool rewriteProvenGlobalAtomicCall(
+      const mat::MatchFinder::MatchResult &Result);
   bool rewriteCanonicalWarpAddReduction(
       const mat::MatchFinder::MatchResult &Result);
   bool tagCanonicalBinaryReducer(
@@ -129,7 +181,7 @@ public:
                           StringRef file_name,
                           bool is_angled,
                           clang::CharSourceRange filename_range,
-                          const clang::FileEntry *file,
+                          StringRef resolved_file_name,
                           StringRef search_path,
                           StringRef relative_path,
                           const clang::Module *imported);
@@ -138,7 +190,20 @@ public:
   // Called by the preprocessor for each ifndef directive during the non-raw lexing pass.
   // Found ifndef will be used in EndSourceFileAction() for catching include guard controlling macro.
   void Ifndef(clang::SourceLocation Loc, const clang::Token &MacroNameTok, const clang::MacroDefinition &MD);
+  void Ifdef(clang::SourceLocation Loc, const clang::Token &MacroNameTok,
+             const clang::MacroDefinition &MD);
+  void Defined(const clang::Token &MacroNameTok,
+               const clang::MacroDefinition &MD,
+               clang::SourceRange Range);
+  void MacroUndefined(const clang::Token &MacroNameTok,
+                      const clang::MacroDefinition &MD);
   void MacroDefined(const clang::Token &MacroNameTok);
+  // Rewrite only macro expansions whose definition comes from a recognized
+  // NVIDIA cuda-samples helper_cuda.h. User macros with the same spelling are
+  // intentionally outside this callback's admitted set.
+  void MacroExpands(const clang::Token &MacroNameTok,
+                    const clang::MacroDefinition &MD,
+                    clang::SourceRange Range);
   //
   void AddSkippedSourceRange(clang::SourceRange Range);
 

@@ -1,0 +1,4 @@
+schema=ascify.frontend-compat-profile.v1
+profile=ascify-admitted-v1
+file=cooperative_groups.h;bytes=702;sha256=2f494aad929396ac870a469c58b783da183d99de2a965fb22e190bae91414657
+file=cooperative_groups/reduce.h;bytes=101;sha256=75adbe65aeb5c2acfd63c9896376e67d270198e566080b9260a219ab99e2de8a

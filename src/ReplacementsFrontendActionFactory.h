@@ -25,8 +25,11 @@ THE SOFTWARE.
 #include "clang/Tooling/Tooling.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/Core/Replacement.h"
+#include "FrontendCompatibility.h"
 
 namespace ct = clang::tooling;
+
+struct LocalHeaderRewriteContext;
 
 /**
   * A FrontendActionFactory that propagates a set of Replacements into the FrontendAction.
@@ -37,19 +40,27 @@ namespace ct = clang::tooling;
 template <typename T>
 class ReplacementsFrontendActionFactory : public ct::FrontendActionFactory {
   ct::Replacements *replacements = nullptr;
+  LocalHeaderRewriteContext *localHeaderContext = nullptr;
+  ascify::FrontendCompatibilityConfig frontendCompatibility;
 
 public:
-  explicit ReplacementsFrontendActionFactory(ct::Replacements *r):
+  explicit ReplacementsFrontendActionFactory(
+      ct::Replacements *r,
+      LocalHeaderRewriteContext *context,
+      const ascify::FrontendCompatibilityConfig& compatibility):
     ct::FrontendActionFactory(),
-    replacements(r) {}
+    replacements(r),
+    localHeaderContext(context),
+    frontendCompatibility(compatibility) {}
 
 #if LLVM_VERSION_MAJOR < 10
   clang::FrontendAction *create() override {
-    return new T(replacements);
+    return new T(replacements, localHeaderContext, frontendCompatibility);
   }
 #else
   std::unique_ptr <clang::FrontendAction> create() override {
-    return std::unique_ptr<clang::FrontendAction>(new T(replacements));
+    return std::unique_ptr<clang::FrontendAction>(
+        new T(replacements, localHeaderContext, frontendCompatibility));
   }
 #endif
 };

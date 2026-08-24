@@ -168,6 +168,7 @@ Where `--clang-resource-directory` specifies `lib/clang/23`, which is in the **i
 | `-perl` / `-python` | Emit ascify-perl / Python map artifacts (see also `-o-ascify-perl-dir`, `-o-python-map-dir`) |
 | `-md` / `-csv` | Documentation export (`-doc-format` refines layout) |
 | `-local-headers` / `-local-headers-recursive` | Process quoted local includes |
+| `--frontend-compat=none\|ascify-admitted-v1` | Keep strict CUDA frontend semantics or opt in to the narrow, versioned compatibility profile; default `none` |
 | `--target-policy=portable\|dav-c310-vec` | Select conservative output or opt in to validated dav-c310 SIMT rewrites |
 | `--simt-math=precise\|fast` | Keep precise semantics or enable guarded fast-SIMT transformations |
 | `--target-recipe=none\|dav-3510-rowwise-simd-v1` | Explicitly enable the versioned, externally linked row-wise SIMD+SIMT hybrid dispatch; default `none` |
@@ -175,6 +176,47 @@ Where `--clang-resource-directory` specifies `lib/clang/23`, which is in the **i
 | `-versions` | Print supported third-party version range |
 
 Full list: run **`ascify-clang --help`**.
+
+### Frontend compatibility and local-header boundaries
+
+`--frontend-compat=ascify-admitted-v1` is a closed parser profile, not a broad
+CUDA-header shim. Ascify verifies its versioned manifest, required admission
+and poison headers, compiled-in exact byte identities, published SHA-256 values,
+and exact directory layout before parsing. During preprocessing,
+`<cooperative_groups.h>` must resolve to
+that verified profile file. Quoted local shadows and every unadmitted
+`cooperative_groups/*` subheader fail with no translated output. The default
+`--frontend-compat=none` leaves the CUDA include search unchanged.
+
+`--local-headers` and `--local-headers-recursive` apply only to eligible quoted
+user headers. They do not admit angle-bracket SDK helpers such as
+`<helper_cuda.h>`. Converted headers and the root output are staged as one
+managed two-artifact transaction. Existing-parent symlinks are resolved before
+alias checks; unmanaged destinations, input aliases and restore failures fail
+closed. The transaction protects normal publish failures but is not a durable
+crash-recovery journal. See
+[the local-header closure contract](docs/local-header-closure.md).
+
+### NVIDIA CUDA Samples helper closure
+
+Ascify separately recognizes the proven NVIDIA CUDA Samples
+`helper_cuda.h` included by a main translation unit. It can close the two
+error-handling macros `checkCudaErrors(expr)` and
+`getLastCudaError(message)` only when the resolved header, active macro
+definitions, direct source tokens, and CUDA Runtime status domain all match
+the admitted contract. This proof gate is automatic when such an include is
+encountered; it is not enabled by the frontend-profile or local-header flags.
+The replacement evaluates the status expression once,
+preserves expression/file/line diagnostics, and implements
+`getLastCudaError` with consume-and-reset semantics.
+
+This is one all-or-nothing source transaction. A duplicate or indirect
+include, residual preprocessor use in any local header, altered active macro,
+reserved output-macro collision, unsupported status domain, external helper
+declaration use, or incomplete raw-file audit keeps the original include and
+helper calls. The closure does not implement `findCudaDevice`, occupancy,
+Driver/VMM, compression, or compressible-allocation helpers. See
+[ADR-0015](docs/decisions/0015-admit-only-proven-nvidia-sample-helper-closure.md).
 
 `portable` and `precise` are the defaults. The currently validated 950PR
 performance policy is explicitly opt-in:

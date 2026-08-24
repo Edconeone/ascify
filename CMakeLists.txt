@@ -95,6 +95,12 @@ if (NOT ASCIFY_CLANG_TESTS_ONLY)
   add_llvm_executable(ascify-clang
     ${ASCIFY_SOURCES} ${ASCIFY_HEADERS}
   )
+  target_include_directories(ascify-clang PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(ascify-clang PRIVATE
+    ASCIFY_FRONTEND_COMPAT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/frontend_compat"
+    ASCIFY_FRONTEND_COMPAT_BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+    ASCIFY_FRONTEND_COMPAT_INSTALL_RELPATH="${CMAKE_INSTALL_LIBEXECDIR}/ascify/frontend-compat")
   target_link_directories(ascify-clang PRIVATE ${LLVM_LIBRARY_DIRS})
 
   if(ASCIFY_INCLUDE_IN_ASCIFY_SDK)
@@ -208,6 +214,11 @@ if (NOT ASCIFY_CLANG_TESTS_ONLY)
     FILES ${CMAKE_CURRENT_SOURCE_DIR}/acl_cub/aclcub.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/acl_cub
     COMPONENT ascify-compat-headers)
+
+  install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/frontend_compat/
+    DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ascify/frontend-compat
+    COMPONENT ascify-frontend-compat)
 
   # Headers are already included in HIP SDK, so skip those if including ASCIFY in HIP SDK.
   if( ASCIFY_INSTALL_CLANG_HEADERS)

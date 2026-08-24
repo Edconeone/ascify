@@ -49,17 +49,19 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["__shfl_up_sync"]    = {"ascify::shfl_up_sync",   CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__shfl_xor_sync"]   = {"ascify::shfl_xor_sync",  CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__shfl_sync"]       = {"ascify::shfl_sync",      CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // Sync intrinsics -> official Ascend SIMT API (CANN 9.0.0, simt_api/device_sync_functions.h)
-  // Note: asc_syncthreads currently only supported in SIMD+SIMT mixed mode (not pure SIMT)
-  m["__syncthreads"]     = {"asc_syncthreads",     CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__syncthreads_and"] = {"asc_syncthreads_and", CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__syncthreads_or"]  = {"asc_syncthreads_or",  CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__syncthreads_count"] = {"asc_syncthreads_count", CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // beta3 has lockstep warp execution but no warp-only barrier API.
+  // Keep synchronization behind the dual-header-family compatibility layer.
+  // Public 8.5 deliberately rejects block vote collectives that its aggregate
+  // SIMT interface does not expose.
+  m["__syncthreads"]     = {"ascify::syncthreads",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__syncthreads_and"] = {"ascify::syncthreads_and",   CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__syncthreads_or"]  = {"ascify::syncthreads_or",    CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__syncthreads_count"] = {"ascify::syncthreads_count", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__syncwarp"]        = {"ascify::syncwarp",    CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  // Memory fence -> official Ascend SIMT API
-  m["__threadfence_block"] = {"asc_threadfence_block", CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__threadfence"]       = {"asc_threadfence",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__threadfence_block"] = {"ascify::threadfence_block", CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__threadfence"]       = {"ascify::threadfence",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  // Neither admitted target family has a proven host/system-scope equivalent.
+  // The wrapper is intentionally ill-formed only when called.
+  m["__threadfence_system"] = {"ascify::threadfence_system", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Use the beta3 SIMT math entry points rather than host/compiler builtins.
   m["__expf"]            = {"expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__logf"]            = {"logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
@@ -103,7 +105,11 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["cub"]                = {"aclcub",            CONV_DEVICE_FUNC, API_CUB, 0};
 
   // ---------- CUDA qualifier replacements (note: may need Clang-level Attr rewrite) ----------
-  // __device__ / __forceinline__ have no Ascend C equivalent; kernel functions use __global__ only
+  // The admitted compiler families require different spellings: public 8.5
+  // requires aicore, while coherent 9.1 beta3 rejects device+global.  Let the
+  // injected compatibility header select the spelling instead of baking one
+  // compiler's attributes into every translated source.
+  m["__global__"]         = {"ASCIFY_GLOBAL",        CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__device__"]         = {"__aicore__",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__forceinline__"]    = {"ASCIFY_FORCEINLINE", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // __shared__ -> __ubuf__ (Ascend C Unified Buffer qualifier, defined as empty macro in cpu_stub.hpp)

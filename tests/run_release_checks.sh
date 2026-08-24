@@ -26,6 +26,19 @@ run_check "canonical reducer static contract" \
   sh "$rewrite_dir/check_canonical_reducer_rewrite.sh"
 run_check "SIMT compatibility static contract" \
   sh "$rewrite_dir/check_simt_compat.sh"
+run_check "target ABI compatibility static contract" \
+  sh "$rewrite_dir/check_target_abi_compat.sh"
+run_check "NVIDIA sample-helper compatibility contract" \
+  sh "$rewrite_dir/check_sample_helper_compat.sh"
+run_check "narrow cooperative-groups compatibility contract" \
+  sh "$rewrite_dir/check_cooperative_groups_compat.sh"
+run_check "opt-in frontend compatibility admission contract" \
+  sh "$repo_root/tests/frontend_compat/check_frontend_compat.sh"
+run_check "translated local include closure static contract" \
+  sh "$rewrite_dir/check_local_header_closure.sh"
+run_check "translated local include closure host fixtures" \
+  "$python" -B -m unittest -q \
+    tests/rewrite/test_local_header_closure.py
 run_check "formal-evidence and work-metric Python unit tests" \
   "$python" -B -m unittest -q \
     tests/softmax_rmsnorm_950/scripts/test_validate_formal_run.py \
@@ -75,6 +88,9 @@ cleanup() {
 }
 trap cleanup 0 1 2 15
 
+run_check "real ascify local-header publication negatives" \
+  sh "$rewrite_dir/check_local_header_integration.sh"
+
 translate_fixture() {
   input=$1
   output=$2
@@ -90,6 +106,144 @@ translate_fixture() {
       "$@" \
       -o "$output" \
       -- "-I$repo_root/tests/support/cuda" -std=c++17
+}
+
+reject_frontend_compat_fixture() {
+  input=$1
+  output=$2
+  profile=$3
+  expected_error=$4
+  shift 4
+  if "$ASCIFY_BINARY" "$input" \
+      "--frontend-compat=$profile" \
+      "--cuda-path=$ASCIFY_CUDA_PATH" \
+      "--clang-resource-directory=$ASCIFY_CLANG_RESOURCE_DIRECTORY" \
+      -o "$output" \
+      -- -std=c++17 "$@" \
+      >"$output.stdout" 2>"$output.stderr"; then
+    echo "frontend compatibility rejection unexpectedly succeeded: $profile" >&2
+    exit 1
+  fi
+  if [ -e "$output" ]; then
+    echo "rejected frontend compatibility fixture published output" >&2
+    exit 1
+  fi
+  if ! grep -F -- "$expected_error" "$output.stderr" >/dev/null; then
+    echo "frontend compatibility rejection did not report: $expected_error" >&2
+    exit 1
+  fi
+}
+
+reject_damaged_frontend_profile() {
+  input=$1
+  output=$2
+  isolated_prefix="$work_dir/frontend-profile-prefix"
+  isolated_binary="$isolated_prefix/bin/ascify-clang"
+  isolated_profile_root="$isolated_prefix/libexec/ascify/frontend-compat"
+  isolated_profile="$isolated_profile_root/ascify-admitted-v1"
+  original_lib=$(CDPATH= cd -- "$(dirname -- "$ASCIFY_BINARY")/../lib" 2>/dev/null && pwd || true)
+
+  mkdir -p -- "$isolated_prefix/bin" "$isolated_profile_root"
+  cp -- "$ASCIFY_BINARY" "$isolated_binary"
+  chmod +x -- "$isolated_binary"
+  if [ -n "$original_lib" ]; then
+    ln -s -- "$original_lib" "$isolated_prefix/lib"
+  fi
+
+  reset_isolated_profile() {
+    case "$isolated_profile" in
+      "$work_dir"/*)
+        rm -rf -- "$isolated_profile"
+        ;;
+      *)
+        echo "refusing to reset unexpected frontend profile path" >&2
+        exit 1
+        ;;
+    esac
+    cp -R -- "$repo_root/frontend_compat/ascify-admitted-v1" \
+      "$isolated_profile"
+  }
+
+  run_isolated_profile_rejection() {
+    rejected_output=$1
+    rejected_error=$2
+    if "$isolated_binary" "$input" \
+      --frontend-compat=ascify-admitted-v1 \
+      "--cuda-path=$ASCIFY_CUDA_PATH" \
+      "--clang-resource-directory=$ASCIFY_CLANG_RESOURCE_DIRECTORY" \
+      -o "$rejected_output" -- -std=c++17 \
+      >"$rejected_output.stdout" 2>"$rejected_output.stderr"; then
+      echo "damaged frontend compatibility profile unexpectedly succeeded" >&2
+      exit 1
+    fi
+    if [ -e "$rejected_output" ]; then
+      echo "damaged frontend compatibility profile published output" >&2
+      exit 1
+    fi
+    if ! grep -F -- "$rejected_error" "$rejected_output.stderr" >/dev/null; then
+      echo "damaged frontend profile did not report: $rejected_error" >&2
+      exit 1
+    fi
+  }
+
+  reset_isolated_profile
+  original_bytes=$(wc -c <"$isolated_profile/cooperative_groups.h")
+  sed 's/class thread_block {/class thread_blocK {/' \
+    "$isolated_profile/cooperative_groups.h" \
+    >"$isolated_profile/cooperative_groups.h.mutated"
+  mutated_bytes=$(wc -c <"$isolated_profile/cooperative_groups.h.mutated")
+  if [ "$original_bytes" != "$mutated_bytes" ]; then
+    echo "same-size frontend profile mutation changed file length" >&2
+    exit 1
+  fi
+  mv -- "$isolated_profile/cooperative_groups.h.mutated" \
+    "$isolated_profile/cooperative_groups.h"
+  run_isolated_profile_rejection \
+    "$output.same-size-content" \
+    "exact content mismatch for 'cooperative_groups.h'"
+
+  reset_isolated_profile
+  sed 's/profile.v1/profile.v2/' "$isolated_profile/profile.manifest" \
+    >"$isolated_profile/profile.manifest.mutated"
+  mv -- "$isolated_profile/profile.manifest.mutated" \
+    "$isolated_profile/profile.manifest"
+  run_isolated_profile_rejection \
+    "$output.manifest-content" \
+    "manifest/version is not recognized"
+
+  reset_isolated_profile
+  printf '%s\n' '#error "unmanifested profile file"' \
+    >"$isolated_profile/cooperative_groups/scan.h"
+  run_isolated_profile_rejection \
+    "$output.extra-file" \
+    "layout does not match its closed manifest"
+
+  reset_isolated_profile
+  rm -- "$isolated_profile/cooperative_groups/reduce.h"
+  run_isolated_profile_rejection \
+    "$output.missing-poison" \
+    "missing required regular file 'cooperative_groups/reduce.h'"
+
+  missing_output="$output.missing-profile"
+  rm -rf -- "$isolated_profile"
+  if "$isolated_binary" "$input" \
+      --frontend-compat=ascify-admitted-v1 \
+      "--cuda-path=$ASCIFY_CUDA_PATH" \
+      "--clang-resource-directory=$ASCIFY_CLANG_RESOURCE_DIRECTORY" \
+      -o "$missing_output" -- -std=c++17 \
+      >"$missing_output.stdout" 2>"$missing_output.stderr"; then
+    echo "missing installed frontend compatibility profile unexpectedly succeeded" >&2
+    exit 1
+  fi
+  if [ -e "$missing_output" ]; then
+    echo "missing installed frontend profile published output" >&2
+    exit 1
+  fi
+  if ! grep -F -- "installed frontend compatibility profile is missing" \
+      "$missing_output.stderr" >/dev/null; then
+    echo "missing installed frontend profile did not fail closed" >&2
+    exit 1
+  fi
 }
 
 reject_target_recipe() {
@@ -552,6 +706,8 @@ warp_default="$work_dir/warp_reduce.default.cce"
 reducer_fast="$work_dir/canonical_reducer.fast.cce"
 reducer_default="$work_dir/canonical_reducer.default.cce"
 simt_translated="$work_dir/simt_compat.cce"
+target_abi_translated="$work_dir/target_abi_compat.cce"
+cooperative_groups_translated="$work_dir/cooperative_groups_compat.cce"
 recipe_fast="$work_dir/dav_c310_recipe.fast.cce"
 recipe_portable_precise="$work_dir/dav_c310_recipe.portable_precise.cce"
 recipe_portable_fast="$work_dir/dav_c310_recipe.portable_fast.cce"
@@ -999,6 +1155,42 @@ translate_fixture \
 translate_fixture \
   "$rewrite_dir/simt_compat_input.cu" "$simt_translated" portable precise
 translate_fixture \
+  "$rewrite_dir/target_abi_compat_input.cu" \
+  "$target_abi_translated" portable precise
+translate_fixture \
+  "$rewrite_dir/cooperative_groups_compat_input.cu" \
+  "$cooperative_groups_translated" portable precise \
+  --frontend-compat=ascify-admitted-v1
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/reduce_input.cu" \
+  "$work_dir/frontend_compat_reduce.cce" ascify-admitted-v1 \
+  "does not admit cooperative_groups/reduce.h"
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/block_sync_input.cu" \
+  "$work_dir/frontend_compat_unknown.cce" unknown \
+  "unsupported --frontend-compat value 'unknown'"
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/unknown_memcpy_async_input.cu" \
+  "$work_dir/frontend_compat_memcpy_async.cce" ascify-admitted-v1 \
+  "rejects unadmitted cooperative-groups header 'cooperative_groups/memcpy_async.h'"
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/unknown_scan_input.cu" \
+  "$work_dir/frontend_compat_scan.cce" ascify-admitted-v1 \
+  "rejects unadmitted cooperative-groups header 'cooperative_groups/scan.h'"
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/local_shadow_input.cu" \
+  "$work_dir/frontend_compat_local_shadow.cce" ascify-admitted-v1 \
+  "requires cooperative_groups.h from its verified profile" \
+  -iquote "$repo_root/tests/frontend_compat/local_shadow"
+reject_frontend_compat_fixture \
+  "$repo_root/tests/frontend_compat/local_alias_spelling_input.cu" \
+  "$work_dir/frontend_compat_local_alias_spelling.cce" ascify-admitted-v1 \
+  "rejects unadmitted cooperative-groups header './cooperative_groups.h'" \
+  -iquote "$repo_root/tests/frontend_compat/local_shadow"
+reject_damaged_frontend_profile \
+  "$repo_root/tests/frontend_compat/block_sync_input.cu" \
+  "$work_dir/frontend_compat_profile_reject.cce"
+translate_fixture \
   "$rewrite_dir/dav_c310_recipe_input.cu" "$recipe_fast" dav-c310-vec fast
 reject_target_recipe \
   "$rewrite_dir/dav_c310_recipe_input.cu" \
@@ -1347,6 +1539,12 @@ run_check "canonical reducer translated goldens" \
 run_check "SIMT compatibility translated golden" \
   sh "$rewrite_dir/check_simt_compat.sh" \
     --translated "$simt_translated"
+run_check "target ABI compatibility translated golden" \
+  sh "$rewrite_dir/check_target_abi_compat.sh" \
+    --translated "$target_abi_translated"
+run_check "opt-in product frontend cooperative-groups translated golden" \
+  sh "$rewrite_dir/check_cooperative_groups_compat.sh" \
+    --translated "$cooperative_groups_translated"
 run_check "dav-c310 recipe translated goldens" \
   sh "$rewrite_dir/check_dav_c310_recipe.sh" \
     --dav-fast "$recipe_fast" \

@@ -194,6 +194,13 @@ cl::opt<std::string> TargetRecipe("target-recipe",
   cl::init("none"),
   cl::cat(ToolTemplateCategory));
 
+cl::opt<std::string> FrontendCompat("frontend-compat",
+  cl::desc("Frontend compatibility profile: none (default) or "
+           "ascify-admitted-v1"),
+  cl::value_desc("profile"),
+  cl::init("none"),
+  cl::cat(ToolTemplateCategory));
+
 cl::opt<bool> NoUndocumented("no-undocumented-features",
   cl::desc("Do not rely on undocumented features in code transformation"),
   cl::value_desc("no-undocumented-features"),
@@ -277,4 +284,5 @@ const std::vector<std::string> ascifyOptionsWithTwoArgs {
   std::string(TargetPolicy.ArgStr),
   std::string(SimtMathMode.ArgStr),
   std::string(TargetRecipe.ArgStr),
+  std::string(FrontendCompat.ArgStr),
 };

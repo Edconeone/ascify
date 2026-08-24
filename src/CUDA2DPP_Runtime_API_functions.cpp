@@ -28,42 +28,48 @@ using SEC = runtime::CUDA_RUNTIME_API_SECTIONS;
 const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   std::map<llvm::StringRef,  dppCounter> m;
   // Memory management
-  m["cudaMalloc"]                                              = {"aclrtMalloc",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaFree"]                                                = {"aclrtFree",                                              CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMemcpy"]                                              = {"aclrtMemcpy",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMemcpyAsync"]                                         = {"aclrtMemcpyAsync",                                       CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMemset"]                                              = {"aclrtMemset",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMemsetAsync"]                                         = {"aclrtMemsetAsync",                                       CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaMallocHost"]                                         = {"aclrtMallocHost",                                        CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["cudaFreeHost"]                                            = {"aclrtFreeHost",                                          CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
-  m["free"]                                                    = {"aclrtFreeHost",                                          CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  // CUDA and ACL memory APIs differ in allocation policy, destination bounds,
+  // and async argument order.  Preserve CUDA call shapes and adapt them in the
+  // compatibility layer rather than performing unsound name-only lowering.
+  m["cudaMalloc"]                                              = {"ascify::cudaMalloc",                                     CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaFree"]                                                = {"ascify::cudaFree",                                       CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemcpy"]                                              = {"ascify::cudaMemcpy",                                     CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemcpyAsync"]                                         = {"ascify::cudaMemcpyAsync",                                CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemset"]                                              = {"ascify::cudaMemset",                                     CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMemsetAsync"]                                         = {"ascify::cudaMemsetAsync",                                CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaMallocHost"]                                         = {"ascify::cudaMallocHost",                                 CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["cudaFreeHost"]                                            = {"ascify::cudaFreeHost",                                   CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
   // Device management
-  m["cudaGetDevice"]                                           = {"aclrtGetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaSetDevice"]                                           = {"aclrtSetDevice",                                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaGetDeviceCount"]                                      = {"aclrtGetDeviceCount",                                    CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  // CUDA owns lazy runtime/context creation. Route all lifecycle-sensitive
+  // calls through the compatibility manager instead of assuming an ACL
+  // context already exists or directly changing a mismatched call shape.
+  m["cudaGetDevice"]                                           = {"ascify::cudaGetDevice",                                  CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaSetDevice"]                                           = {"ascify::cudaSetDevice",                                  CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaGetDeviceCount"]                                      = {"ascify::cudaGetDeviceCount",                             CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   // CANN uses a different argument order and writes int64_t. Keep CUDA's
   // signature at the call site and adapt it in the compatibility shim.
   m["cudaDeviceGetAttribute"]                                  = {"ascify::cudaDeviceGetAttribute",                         CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDeviceSynchronize"]                                   = {"aclrtSynchronizeDevice",                                 CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
-  m["cudaDeviceReset"]                                         = {"aclrtResetDevice",                                       CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceSynchronize"]                                   = {"ascify::cudaDeviceSynchronize",                          CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
+  m["cudaDeviceReset"]                                         = {"ascify::cudaDeviceReset",                                CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   // beta3 has no per-kernel attribute API. The compatibility layer exposes the
   // subset needed by OneFlow's dynamic-UB selection code.
   m["cudaFuncGetAttributes"]                                   = {"ascify::cudaFuncGetAttributes",                          CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   m["cudaFuncSetAttribute"]                                    = {"ascify::cudaFuncSetAttribute",                           CONV_DEVICE, API_RUNTIME, SEC::DEVICE_MGMT};
   // Stream management
-  m["cudaStreamCreate"]                                        = {"aclrtCreateStream",                                      CONV_STREAM, API_RUNTIME, SEC::STREAM};
-  m["cudaStreamDestroy"]                                       = {"aclrtDestroyStream",                                     CONV_STREAM, API_RUNTIME, SEC::STREAM};
-  m["cudaStreamSynchronize"]                                   = {"aclrtSynchronizeStream",                                 CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamCreate"]                                        = {"ascify::cudaStreamCreate",                               CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamCreateWithFlags"]                               = {"ascify::cudaStreamCreateWithFlags",                      CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamDestroy"]                                       = {"ascify::cudaStreamDestroy",                              CONV_STREAM, API_RUNTIME, SEC::STREAM};
+  m["cudaStreamSynchronize"]                                   = {"ascify::cudaStreamSynchronize",                          CONV_STREAM, API_RUNTIME, SEC::STREAM};
   // Event management
-  m["cudaEventCreate"]                                         = {"aclrtCreateEvent",                                       CONV_EVENT, API_RUNTIME, SEC::EVENT};
-  m["cudaEventDestroy"]                                        = {"aclrtDestroyEvent",                                      CONV_EVENT, API_RUNTIME, SEC::EVENT};
-  m["cudaEventRecord"]                                         = {"aclrtRecordEvent",                                       CONV_EVENT, API_RUNTIME, SEC::EVENT};
-  m["cudaEventSynchronize"]                                    = {"aclrtSynchronizeEvent",                                  CONV_EVENT, API_RUNTIME, SEC::EVENT};
-  m["cudaEventElapsedTime"]                                    = {"aclrtEventElapsedTime",                                  CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventCreate"]                                         = {"ascify::cudaEventCreate",                                CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventDestroy"]                                        = {"ascify::cudaEventDestroy",                               CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventRecord"]                                         = {"ascify::cudaEventRecord",                                CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventSynchronize"]                                    = {"ascify::cudaEventSynchronize",                           CONV_EVENT, API_RUNTIME, SEC::EVENT};
+  m["cudaEventElapsedTime"]                                    = {"ascify::cudaEventElapsedTime",                           CONV_EVENT, API_RUNTIME, SEC::EVENT};
   // Error handling
-  m["cudaGetLastError"]                                        = {"aclrtGetLastError",                                      CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  m["cudaGetLastError"]                                        = {"ascify::cudaGetLastError",                               CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
   m["cudaPeekAtLastError"]                                     = {"ascify::cudaPeekAtLastError",                            CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
-  m["cudaGetErrorString"]                                      = {"aclGetRecentErrMsg",                                     CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
+  m["cudaGetErrorString"]                                      = {"ascify::cudaGetErrorString",                             CONV_ERROR_LOG, API_RUNTIME, SEC::ERROR_HANDLING};
   // There is no direct CANN counterpart. The shim preserves the CUDA template
   // signature and estimates per-vector-core occupancy from thread and UB limits.
   m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"ascify::cudaOccupancyMaxActiveBlocksPerMultiprocessor", CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY, FULL};

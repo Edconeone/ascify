@@ -1,0 +1,7 @@
+# Lines prefixed with '+' must occur in translated output.
+# Lines prefixed with '-' must not occur in translated output.
++#include <ascify/cooperative_groups_compat.hpp>
++cg::thread_block block = cg::this_thread_block()
++cg::sync(block)
+-#include <cooperative_groups.h>
+-#include <cooperative_groups/reduce.h>

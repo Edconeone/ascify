@@ -21,6 +21,7 @@ THE SOFTWARE.
 */
 
 #include <fstream>
+#include <set>
 #include "LLVMCompat.h"
 #include "AscifyAction.h"
 #include "ArgParse.h"
@@ -43,6 +44,7 @@ THE SOFTWARE.
 
 #include "LocalHeader.h"
 #include "ImplicitCudaHeaders.h"
+#include "FrontendCompatibility.h"
 
 #if LLVM_VERSION_MAJOR < 8
 #include "llvm/Support/Path.h"
@@ -184,7 +186,11 @@ bool setLLVM(ct::RefactoringTool &Tool, const char *ascify_exe) {
   return bExist;
 }
 
-bool appendArgumentsAdjusters(ct::RefactoringTool &Tool, const std::string &sSourceAbsPath, const char *ascify_exe) {
+bool appendArgumentsAdjusters(
+    ct::RefactoringTool &Tool,
+    const std::string &sSourceAbsPath,
+    const char *ascify_exe,
+    ascify::FrontendCompatibilityConfig &frontendCompatibility) {
   if (!setLLVM(Tool, ascify_exe)) {
     llvm::errs() << "\n" << sAscify << sError << "LLVM to work with not found. Ascification is impossible. Exiting. To provide ascify-clang with LLVM to work with, please specify the `--clang-resource-directory` option." << "\n";
     return false;
@@ -224,6 +230,14 @@ bool appendArgumentsAdjusters(ct::RefactoringTool &Tool, const std::string &sSou
   llcompat::addTargetIfNeeded(Tool);
   Tool.appendArgumentsAdjuster(ct::getInsertArgumentAdjuster("cuda", ct::ArgumentInsertPosition::BEGIN));
   Tool.appendArgumentsAdjuster(ct::getInsertArgumentAdjuster("-x", ct::ArgumentInsertPosition::BEGIN));
+  std::string frontendCompatibilityError;
+  if (!ascify::ConfigureFrontendCompatibility(
+          Tool, FrontendCompat, ascify_exe, frontendCompatibility,
+          frontendCompatibilityError)) {
+    llvm::errs() << "\n" << sAscify << sError
+                 << frontendCompatibilityError << "\n";
+    return false;
+  }
   if (Verbose) {
     Tool.appendArgumentsAdjuster(ct::getInsertArgumentAdjuster("-v", ct::ArgumentInsertPosition::END));
   }
@@ -237,7 +251,8 @@ bool ascifySingleSource(const std::string &srcPath,
                                ct::CommonOptionsParser *OptionsParserPtr,
                                const char *ascify_exe_path,
                                const std::string &mainContextPath,
-                               bool preserveTemp) {
+                               bool preserveTemp,
+                               LocalHeaderRewriteContext *localHeaderContext) {
   std::error_code EC;
   SmallString<128> tmpFile;
   StringRef srcFileName = sys::path::filename(srcPath);
@@ -263,14 +278,17 @@ bool ascifySingleSource(const std::string &srcPath,
   ct::RefactoringTool Tool((compDB ? *compDB : OptionsParserPtr->getCompilations()),
                            std::string(tmpFile.c_str()));
   ct::Replacements &replacementsToUse = llcompat::getReplacements(Tool, tmpFile.c_str());
-  ReplacementsFrontendActionFactory<AscifyAction> actionFactory(&replacementsToUse);
+  ascify::FrontendCompatibilityConfig frontendCompatibility;
 
-  if (!appendArgumentsAdjusters(Tool, mainContextPath, ascify_exe_path)) {
+  if (!appendArgumentsAdjusters(
+          Tool, mainContextPath, ascify_exe_path, frontendCompatibility)) {
     llvm::errs() << "\n" << sAscify << sError 
                  << "LLVM/resource config failed for: " << srcPath << "\n";
     if (!SaveTemps && !preserveTemp) sys::fs::remove(tmpFile);
     return false;
   }
+  ReplacementsFrontendActionFactory<AscifyAction> actionFactory(
+      &replacementsToUse, localHeaderContext, frontendCompatibility);
 
   // Ascify _all_ the things!
   if (Tool.runAndSave(&actionFactory)) {
@@ -407,6 +425,19 @@ int main(int argc, const char **argv) {
     llvm::errs() << sAscify << sConflict << "both -o-dir and -inplace options are specified\n";
     return 1;
   }
+  if (!dstDir.empty() && fileSources.size() > 1) {
+    std::set<std::string> outputNames;
+    for (const std::string &source : fileSources) {
+      const std::string outputName =
+          sys::path::filename(source).str() + ".dpp";
+      if (!outputNames.insert(outputName).second) {
+        llvm::errs() << sAscify << sConflict
+                     << "multiple inputs map to the same -o-dir artifact: "
+                     << outputName << "\n";
+        return 1;
+      }
+    }
+  }
   if (Examine) {
     NoOutput = PrintStats = true;
   }
@@ -490,26 +521,17 @@ int main(int argc, const char **argv) {
     }
     // Initialise the statistics counters for this file.
     Statistics::setActive(src);
-    // Checks the local headers if --local-headers/--local-header-recursive specified.
-    if (OptLocalHeaders || OptLocalHeadersRecursive) {
-      if (!ascifyLocalHeaders(sSourceAbsPath,
-                              compilationDatabase.get(),
-                              &OptionsParser,
-                              argv[0],
-                              OptLocalHeadersRecursive)) {
-        Statistics::current().hasErrors = true;
-        LLVM_DEBUG(llvm::dbgs() << "Local header hipification failed for: " << sSourceAbsPath << "\n");
-        Result = 1;
-      }
-    }
-   
     std::string outputPath = NoOutput ? "" : dst;
-    if (!ascifySingleSource(src, outputPath,
-                            compilationDatabase.get(),
-                            &OptionsParser,
-                            argv[0],
-                            sSourceAbsPath,
-                            false)) {
+    const bool conversionOk =
+        (OptLocalHeaders || OptLocalHeadersRecursive)
+            ? ascifySourceWithLocalHeaderClosure(
+                  sSourceAbsPath, outputPath, compilationDatabase.get(),
+                  &OptionsParser, argv[0], OptLocalHeadersRecursive, Inplace,
+                  NoOutput)
+            : ascifySingleSource(
+                  src, outputPath, compilationDatabase.get(), &OptionsParser,
+                  argv[0], sSourceAbsPath, false, nullptr);
+    if (!conversionOk) {
       Statistics::current().hasErrors = true;
       Result = 1;
       LLVM_DEBUG(llvm::dbgs() << "Hipification failed for: " << src << "\n");

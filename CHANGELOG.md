@@ -4,6 +4,21 @@
 
 ### Added
 
+- Lazy CUDA-runtime-compatible ACL lifecycle, memory, device, stream, and
+  event adapters, including ordered process-exit cleanup and parameter-root
+  GM atomic compatibility.
+- Opt-in `--frontend-compat=ascify-admitted-v1` handling for the narrow
+  admitted CUDA frontend surface and cooperative thread-block synchronization;
+  a closed SHA-256 manifest, compiled-in exact byte identities and
+  resolved-include provenance reject damaged profiles, local shadows and
+  unsupported cooperative-group subheaders.
+- Transactional recursive translation of quoted local-header closure with
+  weak-canonical artifact/input isolation and checked publish/rollback.
+- Narrow target-ABI adapters for target-owned vector constructors, host-local
+  default `dim3`, default-stream events, and fail-closed stream flags.
+- A proof-gated, all-or-nothing NVIDIA CUDA Samples helper closure for
+  `checkCudaErrors` and `getLastCudaError`, including active-macro,
+  status-domain, raw-EOF, external-preprocessor, and reserved-macro gates.
 - Opt-in `dav-c310-vec + fast` AST-gated row-wise recipes for FP16 Softmax,
   RMSNorm, and LayerNorm, including affine RMSNorm.
 - Versioned dav-c310 target headers, thin CUDA-to-ACL compatibility helpers,
