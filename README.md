@@ -4,6 +4,41 @@
 
 The upstream Clang driver is still used for parsing and CUDA sema; ascify-specific options control the rewrite, statistics, and auxiliary outputs (Perl/Python maps, Markdown/CSV docs).
 
+## Execution modes and current scope
+
+Ascify keeps one broad compatibility path and adds a proof-gated performance
+path. Both start from the same CUDA source translation; the Hybrid path is an
+explicit extension, not a second standalone translator.
+
+| Mode | How to select it | What Ascify emits | Current role |
+|------|------------------|-------------------|--------------|
+| Pure SIMT | Default recipe (`--target-recipe=none`) | CUDA API and kernel constructs mapped to the DPP/SIMT compatibility layer | Broad semantic coverage and whole-operator fallback |
+| SIMD+SIMT Hybrid | Add `--target-recipe=dav-3510-rowwise-simd-v1` with the validated target policy | A proved facade call plus the original translated SIMT launch | Accelerated regular row-wise stages for supported Softmax, RMSNorm, and LayerNorm cases |
+
+The Hybrid recipe is **proof-gated**. It currently accepts contiguous
+row-major FP16/FP32 forward paths whose complete data flow matches a registered
+Softmax, RMSNorm, or LayerNorm recipe. A selector miss continues through the
+retained whole-operator SIMT kernel. Masked, strided, gather/scatter, backward,
+unsupported-type, or otherwise unproved paths remain SIMT; Ascify does not
+claim automatic SIMD partitioning for arbitrary CUDA programs.
+
+The names describe two different layers: `dav-c310-vec` is the existing
+translator policy identifier, while `dav-3510-rowwise-simd-v1` selects the
+versioned 950PR target runtime and its selector/ABI contract.
+
+### Who controls each part of a selected Hybrid kernel?
+
+| Part | Responsibility |
+|------|----------------|
+| AIV scalar control | Assigns blocks to rows or row batches, drives tile loops, and issues queue/barrier operations. This orchestration is neither the SIMD stage nor the SIMT stage. |
+| MTE2 / MTE3 | Move data between GM and UB (`GM -> UB` / `UB -> GM`). |
+| SIMD stages | Execute proved regular vector math and reductions on the local tile, such as cast, max/sum reduction, `exp`, `rsqrt`, divide, and affine multiply. |
+| SIMT stages | Preserve `threadIdx.x` ownership, indexing/tail behavior, and normalized-local-to-output-local adaptation inside a selected kernel; on a recipe miss, the retained pure-SIMT kernel performs the whole operator. |
+
+“SIMD load/store” and “SIMT load/store” in compute microbenchmarks refer to
+their local access instructions. They do not replace or own the MTE2/MTE3
+GM-to-UB and UB-to-GM transfers.
+
 ## Requirements
 
 - **CMake** 3.16.8 or newer
@@ -46,6 +81,47 @@ Install (optional):
 ```bash
 cmake --install build
 ```
+
+## Quick start: choose a conversion mode
+
+For the validated pure-SIMT policy, omit the target recipe:
+
+```bash
+./build/ascify-clang input.cuh \
+  --target-policy=dav-c310-vec \
+  --simt-math=fast \
+  --cuda-path=/path/to/cuda \
+  --clang-resource-directory=/path/to/llvm/lib/clang/23 \
+  -o output_simt.cuh
+```
+
+For the proof-gated SIMD+SIMT path, add the explicit 950PR recipe:
+
+```bash
+./build/ascify-clang input.cuh \
+  --target-policy=dav-c310-vec \
+  --simt-math=fast \
+  --target-recipe=dav-3510-rowwise-simd-v1 \
+  --cuda-path=/path/to/cuda \
+  --clang-resource-directory=/path/to/llvm/lib/clang/23 \
+  -o output_hybrid.cuh
+```
+
+The Hybrid output dispatches to separately built target support. Build those
+four versioned libraries with the dav-3510 CANN toolchain:
+
+```bash
+export ASCEND_HOME_PATH=/path/to/cann
+cmake -S runtime/dav_3510/rowwise \
+  -B build/rowwise-simd-v1 \
+  -DCMAKE_ASC_ARCHITECTURES=dav-3510
+cmake --build build/rowwise-simd-v1
+```
+
+Source conversion alone does not prove target compilation, device correctness,
+route selection, or performance. The complete build/link and 950PR verification
+procedure is in the
+[row-wise SIMD+SIMT conversion guide](docs/rowwise-simd-conversion.md).
 
 ### CMake options
 
