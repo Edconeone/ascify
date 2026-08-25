@@ -1,4 +1,4 @@
-# ADR-0017: Wrap row-wise kernel analysis in static proofs
+# ADR-0018: Wrap row-wise kernel analysis in static proofs
 
 ## Status
 
