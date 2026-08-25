@@ -21,6 +21,7 @@ THE SOFTWARE.
 */
 
 #include "DavC310TargetRecipe.h"
+#include "StaticKernelProof.h"
 
 #include <algorithm>
 #include <functional>
@@ -3057,6 +3058,114 @@ struct SoftmaxChoiceKey {
 using SoftmaxKernelBindings =
     std::map<const FunctionDecl *,
              std::set<SoftmaxChoiceKey>>;
+
+using detail::StaticKernelProof;
+using detail::StaticKernelSemanticFamily;
+using detail::StaticKernelSourceProvenance;
+
+struct StaticKernelProofRecord {
+  StaticKernelProof proof;
+  std::set<SoftmaxChoiceKey> semanticBindings;
+};
+
+StaticKernelProof makeStaticKernelProof(
+    const FunctionDecl *function,
+    StaticKernelSemanticFamily family,
+    SourceManager &sourceManager) {
+  StaticKernelProof proof;
+  if (function == nullptr)
+    return proof;
+  const FunctionDecl *definition = nullptr;
+  if (!function->hasBody(definition) || definition == nullptr)
+    return proof;
+  const SourceLocation rawBegin =
+      definition->getSourceRange().getBegin();
+  const SourceLocation rawEnd =
+      definition->getSourceRange().getEnd();
+  if (rawBegin.isInvalid() || rawEnd.isInvalid())
+    return proof;
+  const SourceLocation begin =
+      sourceManager.getExpansionLoc(rawBegin);
+  const SourceLocation end =
+      sourceManager.getExpansionLoc(rawEnd);
+  if (begin.isInvalid() || end.isInvalid())
+    return proof;
+
+  proof.canonicalDecl = function->getCanonicalDecl();
+  proof.definitionDecl = definition;
+  proof.definitionRange = {
+      begin.getRawEncoding(), end.getRawEncoding()};
+  if (sourceManager.isWrittenInMainFile(begin)) {
+    proof.provenance = StaticKernelSourceProvenance::MainFile;
+  } else if (sourceManager.isInSystemHeader(begin)) {
+    proof.provenance = StaticKernelSourceProvenance::SystemHeader;
+  } else {
+    proof.provenance = StaticKernelSourceProvenance::UserHeader;
+  }
+  proof.family = family;
+  return proof;
+}
+
+class StaticKernelProofRegistry {
+public:
+  bool add(
+      const FunctionDecl *function,
+      StaticKernelSemanticFamily family,
+      SourceManager &sourceManager,
+      const std::set<SoftmaxChoiceKey> *semanticBindings = nullptr) {
+    const StaticKernelProof proof =
+        makeStaticKernelProof(function, family, sourceManager);
+    if (!proof.proven())
+      return false;
+    for (StaticKernelProofRecord &record : records) {
+      if (record.proof.canonicalDecl != proof.canonicalDecl ||
+          record.proof.family != proof.family)
+        continue;
+      if (semanticBindings != nullptr) {
+        record.semanticBindings.insert(
+            semanticBindings->begin(), semanticBindings->end());
+      }
+      return true;
+    }
+    StaticKernelProofRecord record;
+    record.proof = proof;
+    if (semanticBindings != nullptr) {
+      record.semanticBindings.insert(
+          semanticBindings->begin(), semanticBindings->end());
+    }
+    records.push_back(std::move(record));
+    return true;
+  }
+
+  const StaticKernelProofRecord *find(
+      const FunctionDecl *function,
+      StaticKernelSemanticFamily family) const {
+    if (function == nullptr)
+      return nullptr;
+    function = function->getCanonicalDecl();
+    for (const StaticKernelProofRecord &record : records) {
+      if (record.proof.canonicalDecl == function &&
+          record.proof.family == family)
+        return &record;
+    }
+    return nullptr;
+  }
+
+  unsigned familyCount(const FunctionDecl *function) const {
+    if (function == nullptr)
+      return 0;
+    function = function->getCanonicalDecl();
+    unsigned count = 0;
+    for (const StaticKernelProofRecord &record : records) {
+      if (record.proof.canonicalDecl == function)
+        ++count;
+    }
+    return count;
+  }
+
+private:
+  std::vector<StaticKernelProofRecord> records;
+};
 
 class RootWriteCounter
     : public clang::RecursiveASTVisitor<RootWriteCounter> {
@@ -10311,23 +10420,20 @@ bool directKernelDomainMapping(
 bool softmaxLaunchChoice(
     const FunctionDecl *kernel,
     const std::vector<clang::TemplateArgument> &arguments,
-    const SoftmaxKernelBindings &bindings,
+    const std::set<SoftmaxChoiceKey> &semanticBindings,
     const NonTypeTemplateParmDecl *&wrapperAlgorithm,
     const EnumConstantDecl *&choice) {
   wrapperAlgorithm = nullptr;
   choice = nullptr;
-  const auto proven =
-      bindings.find(kernel->getCanonicalDecl());
   const FunctionTemplateDecl *kernelTemplate =
       primaryFunctionTemplate(kernel);
-  if (proven == bindings.end() ||
-      kernelTemplate == nullptr)
+  if (semanticBindings.empty() || kernelTemplate == nullptr)
     return false;
   const TemplateParameterList *parameters =
       kernelTemplate->getTemplateParameters();
   unsigned matches = 0;
   for (const SoftmaxChoiceKey &evidence :
-       proven->second) {
+       semanticBindings) {
     unsigned index = 0;
     while (index < parameters->size() &&
            parameters->getParam(index) !=
@@ -11414,10 +11520,7 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
     const FunctionDecl *function,
     ASTContext &context,
     SourceManager &sourceManager,
-    const std::set<const FunctionDecl *> &softmaxKernels,
-    const SoftmaxKernelBindings &softmaxBindings,
-    const std::set<const FunctionDecl *> &rmsKernels,
-    const std::set<const FunctionDecl *> &layerNormKernels,
+    const StaticKernelProofRegistry &kernelProofs,
     bool allowAnnotatedStatus) {
   DirectLaunchWrapperProof proof;
   if (function == nullptr || !function->hasBody() ||
@@ -11456,18 +11559,21 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
     return proof;
   const FunctionDecl *kernel =
       *candidates.begin();
-  const bool softmax =
-      softmaxKernels.count(
-          kernel->getCanonicalDecl()) != 0;
-  const bool rms =
-      rmsKernels.count(
-          kernel->getCanonicalDecl()) != 0;
-  const bool layerNorm =
-      layerNormKernels.count(
-          kernel->getCanonicalDecl()) != 0;
-  if (static_cast<unsigned>(softmax) + static_cast<unsigned>(rms) +
-          static_cast<unsigned>(layerNorm) !=
-      1U)
+  const StaticKernelProofRecord *softmaxProof =
+      kernelProofs.find(
+          kernel, StaticKernelSemanticFamily::Softmax);
+  const StaticKernelProofRecord *rmsProof =
+      kernelProofs.find(
+          kernel, StaticKernelSemanticFamily::RmsNorm);
+  const StaticKernelProofRecord *layerNormProof =
+      kernelProofs.find(
+          kernel, StaticKernelSemanticFamily::LayerNorm);
+  if (kernelProofs.familyCount(kernel) != 1U)
+    return proof;
+  const bool softmax = softmaxProof != nullptr;
+  const bool rms = rmsProof != nullptr;
+  const bool layerNorm = layerNormProof != nullptr;
+  if (!softmax && !rms && !layerNorm)
     return proof;
   const clang::CompoundStmt *postGeometryBlock =
       nullptr;
@@ -11608,7 +11714,8 @@ DirectLaunchWrapperProof proveDirectLaunchWrapper(
   const EnumConstantDecl *choice = nullptr;
   if (softmax &&
       !softmaxLaunchChoice(
-          kernel, arguments, softmaxBindings,
+          kernel, arguments,
+          softmaxProof->semanticBindings,
           algorithm, choice))
     return proof;
   if (!directKernelDomainMapping(
@@ -12161,8 +12268,7 @@ DavC310TargetRecipe::finalize(
   std::set<const EnumConstantDecl *> softmaxChoices;
   std::set<const FunctionDecl *> softmaxKernels;
   SoftmaxKernelBindings softmaxBindings;
-  std::set<const FunctionDecl *> rmsKernels;
-  std::set<const FunctionDecl *> layerNormKernels;
+  StaticKernelProofRegistry kernelProofs;
   PrimitiveRegistry primitives(
       context, sourceManager, functions,
       !useSimdEntryPoints);
@@ -12175,17 +12281,28 @@ DavC310TargetRecipe::finalize(
         softmaxKernels, softmaxBindings);
     if (isRmsKernel(
             function, context, primitives, sourceManager))
-      rmsKernels.insert(function->getCanonicalDecl());
+      kernelProofs.add(
+          function, StaticKernelSemanticFamily::RmsNorm,
+          sourceManager);
     if (useSimdEntryPoints && isLayerNormKernel(
             function, context, primitives, sourceManager))
-      layerNormKernels.insert(function->getCanonicalDecl());
+      kernelProofs.add(
+          function, StaticKernelSemanticFamily::LayerNorm,
+          sourceManager);
+  }
+  for (const FunctionDecl *kernel : softmaxKernels) {
+    const auto binding = softmaxBindings.find(kernel);
+    if (binding == softmaxBindings.end())
+      continue;
+    kernelProofs.add(
+        kernel, StaticKernelSemanticFamily::Softmax,
+        sourceManager, &binding->second);
   }
   for (const FunctionDecl *function : functions) {
     const DirectLaunchWrapperProof wrapper =
         proveDirectLaunchWrapper(
             function, context, sourceManager,
-            softmaxKernels, softmaxBindings,
-            rmsKernels, layerNormKernels,
+            kernelProofs,
             !useSimdEntryPoints);
     if (!wrapper.proven())
       continue;

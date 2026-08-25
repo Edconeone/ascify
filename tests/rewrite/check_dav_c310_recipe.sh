@@ -122,7 +122,8 @@ check_static_contract() {
     "$repo_root/include/ascify/target/dav_c310/rowwise_simd_recipes.hpp"
   require_fixed '#pragma push_macro' "$recipe_cpp"
   require_fixed '!useSimdEntryPoints);' "$recipe_cpp"
-  require_fixed 'rmsKernels, layerNormKernels,' "$recipe_cpp"
+  require_fixed 'const StaticKernelProofRegistry &kernelProofs' "$recipe_cpp"
+  require_fixed 'kernelProofs.familyCount(kernel) != 1U' "$recipe_cpp"
   require_fixed 'DispatchRegisteredHybrid' \
     "$repo_root/include/ascify/target/dav_c310/rowwise_hybrid_registry_v1.hpp"
   require_fixed 'extern cl::opt<std::string> TargetRecipe' "$argparse_header"
