@@ -44,6 +44,9 @@ THE SOFTWARE.
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#if LLVM_VERSION_MAJOR >= 13
+#include "llvm/Support/SHA256.h"
+#endif
 #if LLVM_VERSION_MAJOR < 17
 #include "clang/Basic/TargetInfo.h"
 #endif
@@ -87,6 +90,85 @@ bool isRecognizedNvidiaSampleHelperCuda(llvm::StringRef path) {
              "#define getLastCudaError(msg) __getLastCudaError(msg, __FILE__, __LINE__)") &&
          contents.contains("template <typename T>\nvoid check(T result") &&
          contents.contains("inline void __getLastCudaError(");
+}
+
+enum FrozenNvidiaSampleHelperFileRole : unsigned {
+  FrozenNvidiaSampleHelperNone = 0,
+  FrozenOfficialNvidiaSampleHelperCuda = 1U << 0,
+  FrozenOfficialNvidiaSampleHelperString = 1U << 1,
+};
+
+bool sha256Equals(llvm::StringRef contents, llvm::StringRef expectedHex) {
+#if LLVM_VERSION_MAJOR >= 13
+  if (expectedHex.size() != 64)
+    return false;
+  llvm::SHA256 digest;
+  digest.update(contents);
+  const auto bytes = digest.final();
+  if (bytes.size() != 32)
+    return false;
+  const char digits[] = "0123456789abcdef";
+  for (size_t index = 0; index < bytes.size(); ++index) {
+    const uint8_t byte =
+        static_cast<uint8_t>(static_cast<unsigned char>(bytes[index]));
+    if (expectedHex[index * 2] != digits[byte >> 4] ||
+        expectedHex[index * 2 + 1] != digits[byte & 0x0f])
+      return false;
+  }
+  return true;
+#else
+  // Support/SHA256.h is unavailable before LLVM 13. Keep the rest of Ascify
+  // buildable, but disable this compatibility proof rather than weakening the
+  // frozen-source identity check.
+  (void)contents;
+  (void)expectedHex;
+  return false;
+#endif
+}
+
+unsigned frozenNvidiaSampleHelperFileRole(
+    clang::SourceManager &sourceManager,
+    clang::SourceLocation location) {
+  const clang::SourceLocation spelling = sourceManager.getSpellingLoc(location);
+  if (spelling.isInvalid())
+    return FrozenNvidiaSampleHelperNone;
+  const clang::FileID file = sourceManager.getFileID(spelling);
+  if (file.isInvalid())
+    return FrozenNvidiaSampleHelperNone;
+  const llvm::StringRef filename = llvm::sys::path::filename(
+      sourceManager.getFilename(spelling));
+  if (filename != "helper_cuda.h" && filename != "helper_string.h")
+    return FrozenNvidiaSampleHelperNone;
+  bool invalidBuffer = false;
+  const llvm::StringRef contents =
+      sourceManager.getBufferData(file, &invalidBuffer);
+  if (invalidBuffer)
+    return FrozenNvidiaSampleHelperNone;
+  if (filename == "helper_cuda.h") {
+    // NVIDIA cuda-samples commit b7c5481c556c3fe98db060207ecaa41a4b9a9abc
+    if (contents.size() == 28177 &&
+        sha256Equals(
+            contents,
+            "997f9ac1f8e5f8e5f45f8b11eebab5b89305dee7430b90654bafe62283cffee1"))
+      return FrozenOfficialNvidiaSampleHelperCuda;
+  } else if (contents.size() == 15079 &&
+             sha256Equals(
+                 contents,
+                 "26e988c97fb3d77d498e384c685177ed7966e41d5d58ebc9b7d3d696859f5e57")) {
+    return FrozenOfficialNvidiaSampleHelperString;
+  }
+  return FrozenNvidiaSampleHelperNone;
+}
+
+bool locationComesFromFrozenNvidiaSampleHelperFile(
+    clang::SourceManager &sourceManager,
+    clang::SourceLocation location,
+    unsigned admittedRoles) {
+  const clang::SourceLocation spelling = sourceManager.getSpellingLoc(location);
+  if (spelling.isInvalid())
+    return false;
+  return (frozenNvidiaSampleHelperFileRole(sourceManager, spelling) &
+          admittedRoles) != 0;
 }
 
 bool locationComesFromRecognizedNvidiaSampleHelper(
@@ -149,8 +231,15 @@ bool activeNvidiaSampleHelperMacroBodyMatches(
   return actual == expected;
 }
 
+static bool allFunctionRedeclarationsComeFromInitiallyTrustedSystemFiles(
+    const clang::FunctionDecl *callee,
+    clang::SourceManager &sourceManager,
+    const std::set<unsigned> &trustedSystemFileIds);
+
 bool isAdmittedCudaRuntimeStatusCall(
-    clang::SourceManager &sourceManager, const clang::Expr *expression) {
+    clang::SourceManager &sourceManager,
+    const clang::Expr *expression,
+    const std::set<unsigned> &trustedSystemFileIds) {
   if (expression == nullptr)
     return false;
   expression = expression->IgnoreParenImpCasts();
@@ -188,11 +277,11 @@ bool isAdmittedCudaRuntimeStatusCall(
       mapped->second.apiType != API_RUNTIME ||
       !mapped->second.dppName.starts_with("ascify::"))
     return false;
-  const clang::SourceLocation declarationLocation =
-      sourceManager.getExpansionLoc(callee->getLocation());
+  const clang::SourceLocation declarationLocation = callee->getLocation();
   return declarationLocation.isValid() &&
          !sourceManager.isWrittenInMainFile(declarationLocation) &&
-         sourceManager.isInSystemHeader(declarationLocation) &&
+         allFunctionRedeclarationsComeFromInitiallyTrustedSystemFiles(
+             callee, sourceManager, trustedSystemFileIds) &&
          !locationComesFromRecognizedNvidiaSampleHelper(
              sourceManager, declarationLocation);
 }
@@ -1371,6 +1460,810 @@ static const clang::FunctionDecl *enclosingNonLambdaFunction(
   return nullptr;
 }
 
+static bool referencesCanonicalValue(const clang::Expr *expression,
+                                     const clang::ValueDecl *expected) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *reference =
+      llvm::dyn_cast_or_null<clang::DeclRefExpr>(expression);
+  return reference != nullptr && expected != nullptr &&
+         reference->getDecl()->getCanonicalDecl() ==
+             expected->getCanonicalDecl();
+}
+
+static bool isExactStringLiteral(const clang::Expr *expression,
+                                 llvm::StringRef expected) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *literal = llvm::dyn_cast_or_null<clang::StringLiteral>(expression);
+  return literal != nullptr && literal->getString() == expected;
+}
+
+static bool hasExactNvidiaFindCudaDeviceSignature(
+    const clang::FunctionDecl *function,
+    clang::ASTContext &context) {
+  if (function == nullptr || function->isVariadic() ||
+      function->getNumParams() != 2 ||
+      !context.hasSameType(function->getReturnType().getCanonicalType(),
+                           context.IntTy) ||
+      !context.hasSameType(
+          function->getParamDecl(0)->getType().getCanonicalType(),
+          context.IntTy))
+    return false;
+
+  clang::QualType outer =
+      function->getParamDecl(1)->getType().getCanonicalType();
+  if (outer.getLocalCVRQualifiers() != 0)
+    return false;
+  const auto *outerPointer = outer->getAs<clang::PointerType>();
+  if (outerPointer == nullptr)
+    return false;
+  clang::QualType inner = outerPointer->getPointeeType();
+  if (inner.getLocalCVRQualifiers() != 0)
+    return false;
+  const auto *innerPointer = inner->getAs<clang::PointerType>();
+  if (innerPointer == nullptr)
+    return false;
+  const clang::QualType character = innerPointer->getPointeeType();
+  return character.isConstQualified() && !character.isVolatileQualified() &&
+         context.hasSameType(character.getUnqualifiedType(), context.CharTy);
+}
+
+static const clang::CallExpr *directCallNamed(
+    const clang::Expr *expression,
+    llvm::StringRef expectedName) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *call = llvm::dyn_cast_or_null<clang::CallExpr>(expression);
+  const clang::FunctionDecl *callee =
+      call == nullptr ? nullptr : call->getDirectCallee();
+  return callee != nullptr && callee->getIdentifier() != nullptr &&
+                 callee->getName() == expectedName
+             ? call
+             : nullptr;
+}
+
+static const clang::CallExpr *directUnqualifiedSourceCallNamed(
+    const clang::Expr *expression,
+    llvm::StringRef expectedName,
+    clang::SourceManager &sourceManager,
+    const clang::LangOptions &languageOptions) {
+  const clang::CallExpr *call = directCallNamed(expression, expectedName);
+  if (call == nullptr)
+    return nullptr;
+  const auto *reference = llvm::dyn_cast_or_null<clang::DeclRefExpr>(
+      stripParenAndImplicitCasts(call->getCallee()));
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (reference == nullptr || reference->hasQualifier() || callee == nullptr ||
+      reference->getDecl()->getCanonicalDecl() !=
+          callee->getCanonicalDecl())
+    return nullptr;
+  const clang::SourceLocation tokenLocation = reference->getLocation();
+  if (tokenLocation.isInvalid() || tokenLocation.isMacroID())
+    return nullptr;
+  bool invalidSourceToken = false;
+  const llvm::StringRef sourceToken = clang::Lexer::getSourceText(
+      clang::CharSourceRange::getTokenRange(tokenLocation, tokenLocation),
+      sourceManager, languageOptions, &invalidSourceToken);
+  return !invalidSourceToken && sourceToken == expectedName ? call : nullptr;
+}
+
+static bool locationComesFromInitiallyTrustedSystemFile(
+    clang::SourceManager &sourceManager,
+    clang::SourceLocation location,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  // Trust the semantic application site, not a token's macro spelling. A
+  // project declaration generated by invoking a trusted system macro still
+  // belongs to the project file and must not inherit the macro's provenance.
+  const clang::SourceLocation expansion =
+      sourceManager.getExpansionLoc(location);
+  if (expansion.isInvalid())
+    return false;
+  const clang::FileID file = sourceManager.getFileID(expansion);
+  return file.isValid() &&
+         trustedSystemFileIds.count(file.getHashValue()) != 0;
+}
+
+static bool functionDeclarationComesFromInitiallyTrustedSystemFile(
+    const clang::FunctionDecl *declaration,
+    clang::SourceManager &sourceManager,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  if (declaration == nullptr)
+    return false;
+  const clang::SourceLocation location = declaration->getLocation();
+  // Clang may materialize an intrinsic declaration without a source
+  // location. User declarations cannot acquire that identity, and any
+  // source-backed redeclaration is checked below.
+  const bool trustedDeclaration =
+      (location.isInvalid() && declaration->getBuiltinID() != 0) ||
+      locationComesFromInitiallyTrustedSystemFile(
+          sourceManager, location, trustedSystemFileIds);
+  if (!trustedDeclaration)
+    return false;
+  for (const clang::Attr *attribute : declaration->attrs()) {
+    if (attribute == nullptr)
+      return false;
+    const clang::SourceLocation attributeLocation =
+        attribute->getLocation();
+    if (attributeLocation.isInvalid()) {
+      if (attribute->isImplicit())
+        continue;
+      return false;
+    }
+    if (!locationComesFromInitiallyTrustedSystemFile(
+            sourceManager, sourceManager.getExpansionLoc(attributeLocation),
+            trustedSystemFileIds))
+      return false;
+  }
+  return true;
+}
+
+static bool allFunctionRedeclarationsComeFromInitiallyTrustedSystemFiles(
+    const clang::FunctionDecl *callee,
+    clang::SourceManager &sourceManager,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  if (callee == nullptr)
+    return false;
+  const clang::FunctionDecl *canonical = callee->getCanonicalDecl();
+  if (canonical == nullptr)
+    return false;
+  for (const clang::FunctionDecl *redecl : canonical->redecls()) {
+    if (!functionDeclarationComesFromInitiallyTrustedSystemFile(
+            redecl, sourceManager, trustedSystemFileIds))
+      return false;
+  }
+  return true;
+}
+
+static bool hasSystemFunctionDeclarationProvenance(
+    const clang::CallExpr *call,
+    llvm::StringRef expectedName,
+    clang::SourceManager &sourceManager,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::FunctionDecl *callee =
+      call == nullptr ? nullptr : call->getDirectCallee();
+  if (callee == nullptr ||
+      callee->getQualifiedNameAsString() != expectedName)
+    return false;
+  const clang::FunctionDecl *canonical = callee->getCanonicalDecl();
+  if (canonical == nullptr)
+    return false;
+  const clang::SourceLocation calleeLocation = callee->getLocation();
+  const clang::SourceLocation canonicalLocation = canonical->getLocation();
+  return allFunctionRedeclarationsComeFromInitiallyTrustedSystemFiles(
+             callee, sourceManager, trustedSystemFileIds) &&
+         !locationComesFromRecognizedNvidiaSampleHelper(
+             sourceManager, calleeLocation) &&
+         !locationComesFromRecognizedNvidiaSampleHelper(
+             sourceManager, canonicalLocation);
+}
+
+static const clang::CallExpr *directCallStatementNamed(
+    const clang::Stmt *statement,
+    llvm::StringRef expectedName) {
+  return directCallNamed(
+      llvm::dyn_cast_or_null<clang::Expr>(statement), expectedName);
+}
+
+static const clang::CompoundStmt *exactCompound(
+    const clang::Stmt *statement,
+    unsigned expectedSize) {
+  const auto *compound =
+      llvm::dyn_cast_or_null<clang::CompoundStmt>(statement);
+  return compound != nullptr && compound->size() == expectedSize
+             ? compound
+             : nullptr;
+}
+
+static bool isDeviceLessThanZero(const clang::Expr *expression,
+                                 const clang::VarDecl *deviceVariable,
+                                 clang::ASTContext &context) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *comparison =
+      llvm::dyn_cast_or_null<clang::BinaryOperator>(expression);
+  return comparison != nullptr && comparison->getOpcode() == clang::BO_LT &&
+         referencesCanonicalValue(comparison->getLHS(), deviceVariable) &&
+         evaluatesToNonNegative(comparison->getRHS(), 0, context);
+}
+
+static bool isExitFailureStatement(const clang::Stmt *statement,
+                                   clang::ASTContext &context,
+                                   clang::SourceManager &sourceManager,
+                                   const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *call =
+      directUnqualifiedSourceCallNamed(
+          llvm::dyn_cast_or_null<clang::Expr>(statement), "exit",
+          sourceManager, context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 1 &&
+         hasSystemFunctionDeclarationProvenance(
+             call, "exit", sourceManager, trustedSystemFileIds) &&
+         evaluatesToNonNegative(call->getArg(0), EXIT_FAILURE, context);
+}
+
+static bool isExactSingleStringCall(const clang::Stmt *statement,
+                                    llvm::StringRef calleeName,
+                                    llvm::StringRef message,
+                                    clang::ASTContext &context,
+                                    clang::SourceManager &sourceManager,
+                                    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *call =
+      directUnqualifiedSourceCallNamed(
+          llvm::dyn_cast_or_null<clang::Expr>(statement), calleeName,
+          sourceManager, context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 1 &&
+         hasSystemFunctionDeclarationProvenance(
+             call, calleeName, sourceManager, trustedSystemFileIds) &&
+         isExactStringLiteral(call->getArg(0), message);
+}
+
+static bool isOfficialFailureBlock(const clang::Stmt *statement,
+                                   llvm::StringRef message,
+                                   clang::ASTContext &context,
+                                   clang::SourceManager &sourceManager,
+                                   const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CompoundStmt *block = exactCompound(statement, 2);
+  if (block == nullptr)
+    return false;
+  auto child = block->body_begin();
+  return isExactSingleStringCall(
+             *child++, "printf", message, context, sourceManager,
+             trustedSystemFileIds) &&
+         isExitFailureStatement(
+             *child, context, sourceManager, trustedSystemFileIds);
+}
+
+static const clang::CallExpr *assignmentRhsCallNamed(
+    const clang::Stmt *statement,
+    const clang::VarDecl *destination,
+    llvm::StringRef calleeName,
+    clang::SourceManager &sourceManager,
+    const clang::LangOptions &languageOptions) {
+  const auto *expression =
+      llvm::dyn_cast_or_null<clang::Expr>(statement);
+  const auto *assignment = llvm::dyn_cast_or_null<clang::BinaryOperator>(
+      stripParenAndImplicitCasts(expression));
+  if (assignment == nullptr || assignment->getOpcode() != clang::BO_Assign ||
+      !referencesCanonicalValue(assignment->getLHS(), destination))
+    return nullptr;
+  return directUnqualifiedSourceCallNamed(
+      assignment->getRHS(), calleeName, sourceManager, languageOptions);
+}
+
+static bool callDefinitionComesFromFrozenHelperProfile(
+    const clang::CallExpr *call,
+    clang::SourceManager &sourceManager,
+    unsigned admittedRoles) {
+  const clang::FunctionDecl *callee =
+      call == nullptr ? nullptr : call->getDirectCallee();
+  const clang::FunctionDecl *definition = nullptr;
+  return callee != nullptr && callee->hasBody(definition) &&
+         definition != nullptr &&
+         locationComesFromFrozenNvidiaSampleHelperFile(
+             sourceManager, definition->getLocation(), admittedRoles);
+}
+
+static bool allFunctionRedeclarationsComeFromFrozenHelperProfile(
+    const clang::FunctionDecl *function,
+    clang::SourceManager &sourceManager,
+    unsigned admittedRoles,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  if (function == nullptr || function->getCanonicalDecl() == nullptr)
+    return false;
+  for (const clang::FunctionDecl *redecl :
+       function->getCanonicalDecl()->redecls()) {
+    if (!locationComesFromFrozenNvidiaSampleHelperFile(
+            sourceManager, redecl->getLocation(), admittedRoles))
+      return false;
+    for (const clang::Attr *attribute : redecl->attrs()) {
+      if (attribute == nullptr)
+        return false;
+      const clang::SourceLocation attributeLocation =
+          attribute->getLocation();
+      if (attributeLocation.isInvalid()) {
+        if (attribute->isImplicit())
+          continue;
+        return false;
+      }
+      const clang::SourceLocation expansion =
+          sourceManager.getExpansionLoc(attributeLocation);
+      if (!locationComesFromFrozenNvidiaSampleHelperFile(
+              sourceManager, expansion, admittedRoles) &&
+          !locationComesFromInitiallyTrustedSystemFile(
+              sourceManager, expansion, trustedSystemFileIds))
+        return false;
+    }
+  }
+  return true;
+}
+
+// Prove the resolved direct-call graph rooted at the frozen findCudaDevice
+// definition. This complements the byte profile: preprocessing or a normal
+// C/C++ redeclaration can otherwise make an unchanged helper body bind to a
+// project function with telemetry or another side effect.
+class FrozenNvidiaSampleHelperCallClosure
+    : public clang::RecursiveASTVisitor<
+          FrozenNvidiaSampleHelperCallClosure> {
+public:
+  FrozenNvidiaSampleHelperCallClosure(
+      clang::SourceManager &sourceManager,
+      const std::set<unsigned> &trustedSystemFileIds,
+      unsigned admittedRoles)
+      : sourceManager(sourceManager),
+        trustedSystemFileIds(trustedSystemFileIds),
+        admittedRoles(admittedRoles) {}
+
+  bool prove(const clang::FunctionDecl *root) {
+    failed = false;
+    visited.clear();
+    return proveFrozenDefinition(root) && !failed;
+  }
+
+  bool VisitCallExpr(clang::CallExpr *call) {
+    if (failed || call == nullptr)
+      return false;
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (callee == nullptr) {
+      failed = true;
+      return false;
+    }
+    if (allFunctionRedeclarationsComeFromInitiallyTrustedSystemFiles(
+            callee, sourceManager, trustedSystemFileIds))
+      return true;
+    if (!proveFrozenDefinition(callee)) {
+      failed = true;
+      return false;
+    }
+    return true;
+  }
+
+private:
+  bool proveFrozenDefinition(const clang::FunctionDecl *function) {
+    const clang::FunctionDecl *definition = nullptr;
+    if (function == nullptr || !function->hasBody(definition) ||
+        definition == nullptr ||
+        !locationComesFromFrozenNvidiaSampleHelperFile(
+            sourceManager, definition->getLocation(), admittedRoles) ||
+        !allFunctionRedeclarationsComeFromFrozenHelperProfile(
+            function, sourceManager, admittedRoles,
+            trustedSystemFileIds))
+      return false;
+    const clang::FunctionDecl *canonical = definition->getCanonicalDecl();
+    if (canonical == nullptr || !visited.insert(canonical).second)
+      return canonical != nullptr;
+    return TraverseStmt(
+        const_cast<clang::Stmt *>(definition->getBody()));
+  }
+
+  clang::SourceManager &sourceManager;
+  const std::set<unsigned> &trustedSystemFileIds;
+  unsigned admittedRoles;
+  std::set<const clang::FunctionDecl *> visited;
+  bool failed = false;
+};
+
+static bool isOfficialFindCondition(
+    const clang::Expr *condition,
+    const clang::ParmVarDecl *argcParameter,
+    const clang::ParmVarDecl *argvParameter,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedStringRole) {
+  const clang::CallExpr *call =
+      directUnqualifiedSourceCallNamed(
+          condition, "checkCmdLineFlag", sourceManager,
+          context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 3 &&
+         referencesCanonicalValue(call->getArg(0), argcParameter) &&
+         referencesCanonicalValue(call->getArg(1), argvParameter) &&
+         isExactStringLiteral(call->getArg(2), "device") &&
+         callDefinitionComesFromFrozenHelperProfile(
+             call, sourceManager, admittedStringRole);
+}
+
+static bool isGetDeviceArgumentAssignment(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    const clang::ParmVarDecl *argcParameter,
+    const clang::ParmVarDecl *argvParameter,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedStringRole) {
+  const clang::CallExpr *call = assignmentRhsCallNamed(
+      statement, deviceVariable, "getCmdLineArgumentInt", sourceManager,
+      context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 3 &&
+         referencesCanonicalValue(call->getArg(0), argcParameter) &&
+         referencesCanonicalValue(call->getArg(1), argvParameter) &&
+         isExactStringLiteral(call->getArg(2), "device=") &&
+         callDefinitionComesFromFrozenHelperProfile(
+             call, sourceManager, admittedStringRole);
+}
+
+static bool isDeviceInitAssignment(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole) {
+  const clang::CallExpr *call = assignmentRhsCallNamed(
+      statement, deviceVariable, "gpuDeviceInit", sourceManager,
+      context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 1 &&
+         referencesCanonicalValue(call->getArg(0), deviceVariable) &&
+         callDefinitionComesFromFrozenHelperProfile(
+             call, sourceManager, admittedCudaRole);
+}
+
+static bool isMaxGflopsAssignment(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole) {
+  const clang::CallExpr *call = assignmentRhsCallNamed(
+      statement, deviceVariable, "gpuGetMaxGflopsDeviceId", sourceManager,
+      context.getLangOpts());
+  return call != nullptr && call->getNumArgs() == 0 &&
+         callDefinitionComesFromFrozenHelperProfile(
+             call, sourceManager, admittedCudaRole);
+}
+
+static const clang::CallExpr *checkedRuntimeCallNamed(
+    const clang::Stmt *statement,
+    llvm::StringRef runtimeName,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *check =
+      directCallStatementNamed(statement, "check");
+  if (check == nullptr || check->getNumArgs() != 4 ||
+      !callDefinitionComesFromFrozenHelperProfile(
+          check, sourceManager, admittedCudaRole) ||
+      !isAdmittedCudaRuntimeStatusCall(
+          sourceManager, check->getArg(0), trustedSystemFileIds) ||
+      llvm::dyn_cast_or_null<clang::StringLiteral>(
+          stripParenAndImplicitCasts(check->getArg(1))) == nullptr ||
+      llvm::dyn_cast_or_null<clang::StringLiteral>(
+          stripParenAndImplicitCasts(check->getArg(2))) == nullptr ||
+      !check->getArg(3)->isIntegerConstantExpr(context))
+    return nullptr;
+  return directCallNamed(check->getArg(0), runtimeName);
+}
+
+static bool isCheckedSetDeviceStatement(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *call = checkedRuntimeCallNamed(
+      statement, "cudaSetDevice", sourceManager, context,
+      admittedCudaRole, trustedSystemFileIds);
+  return call != nullptr && call->getNumArgs() == 1 &&
+         referencesCanonicalValue(call->getArg(0), deviceVariable);
+}
+
+static bool referencesNamedDeclaration(const clang::Expr *expression,
+                                       llvm::StringRef name) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *reference =
+      llvm::dyn_cast_or_null<clang::DeclRefExpr>(expression);
+  return reference != nullptr && reference->getDecl() != nullptr &&
+         reference->getDecl()->getName() == name;
+}
+
+static bool isAddressOfValue(const clang::Expr *expression,
+                             const clang::ValueDecl *value) {
+  expression = stripParenAndImplicitCasts(expression);
+  const auto *address =
+      llvm::dyn_cast_or_null<clang::UnaryOperator>(expression);
+  return address != nullptr && address->getOpcode() == clang::UO_AddrOf &&
+         referencesCanonicalValue(address->getSubExpr(), value);
+}
+
+static bool isCheckedDeviceAttributeStatement(
+    const clang::Stmt *statement,
+    const clang::VarDecl *output,
+    llvm::StringRef attributeName,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *call = checkedRuntimeCallNamed(
+      statement, "cudaDeviceGetAttribute", sourceManager, context,
+      admittedCudaRole, trustedSystemFileIds);
+  return call != nullptr && call->getNumArgs() == 3 &&
+         isAddressOfValue(call->getArg(0), output) &&
+         referencesNamedDeclaration(call->getArg(1), attributeName) &&
+         referencesCanonicalValue(call->getArg(2), deviceVariable);
+}
+
+static bool isIntZeroVariable(const clang::VarDecl *variable,
+                              llvm::StringRef name,
+                              clang::ASTContext &context) {
+  return variable != nullptr && variable->getName() == name &&
+         context.hasSameType(variable->getType().getCanonicalType(),
+                             context.IntTy) &&
+         evaluatesToNonNegative(variable->getInit(), 0, context);
+}
+
+static bool getMajorMinorDeclarations(const clang::Stmt *statement,
+                                      const clang::VarDecl *&major,
+                                      const clang::VarDecl *&minor,
+                                      clang::ASTContext &context) {
+  const auto *declarations =
+      llvm::dyn_cast_or_null<clang::DeclStmt>(statement);
+  if (declarations == nullptr)
+    return false;
+  std::vector<const clang::VarDecl *> variables;
+  for (const clang::Decl *declaration : declarations->decls()) {
+    const auto *variable = llvm::dyn_cast<clang::VarDecl>(declaration);
+    if (variable == nullptr)
+      return false;
+    variables.push_back(variable);
+  }
+  if (variables.size() != 2 ||
+      !isIntZeroVariable(variables[0], "major", context) ||
+      !isIntZeroVariable(variables[1], "minor", context))
+    return false;
+  major = variables[0];
+  minor = variables[1];
+  return true;
+}
+
+static bool isOfficialDeviceSummaryPrint(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    const clang::VarDecl *major,
+    const clang::VarDecl *minor,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CallExpr *print =
+      directUnqualifiedSourceCallNamed(
+          llvm::dyn_cast_or_null<clang::Expr>(statement), "printf",
+          sourceManager, context.getLangOpts());
+  if (print == nullptr || print->getNumArgs() != 5 ||
+      !hasSystemFunctionDeclarationProvenance(
+          print, "printf", sourceManager, trustedSystemFileIds) ||
+      !isExactStringLiteral(
+          print->getArg(0),
+          "GPU Device %d: \"%s\" with compute capability %d.%d\n\n") ||
+      !referencesCanonicalValue(print->getArg(1), deviceVariable) ||
+      !referencesCanonicalValue(print->getArg(3), major) ||
+      !referencesCanonicalValue(print->getArg(4), minor))
+    return false;
+  const clang::CallExpr *architecture =
+      directUnqualifiedSourceCallNamed(
+          print->getArg(2), "_ConvertSMVer2ArchName", sourceManager,
+          context.getLangOpts());
+  return architecture != nullptr && architecture->getNumArgs() == 2 &&
+         referencesCanonicalValue(architecture->getArg(0), major) &&
+         referencesCanonicalValue(architecture->getArg(1), minor) &&
+         callDefinitionComesFromFrozenHelperProfile(
+             architecture, sourceManager, admittedCudaRole);
+}
+
+static bool isOfficialExplicitDeviceBranch(
+    const clang::Stmt *statement,
+    const clang::ParmVarDecl *argcParameter,
+    const clang::ParmVarDecl *argvParameter,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    unsigned admittedStringRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CompoundStmt *branch = exactCompound(statement, 2);
+  if (branch == nullptr)
+    return false;
+  auto child = branch->body_begin();
+  if (!isGetDeviceArgumentAssignment(
+          *child++, deviceVariable, argcParameter, argvParameter,
+          sourceManager, context, admittedStringRole))
+    return false;
+  const auto *validation = llvm::dyn_cast_or_null<clang::IfStmt>(*child);
+  if (validation == nullptr || validation->getElse() == nullptr ||
+      !isDeviceLessThanZero(
+          validation->getCond(), deviceVariable, context) ||
+      !isOfficialFailureBlock(
+          validation->getThen(), "Invalid command line parameter\n ",
+          context, sourceManager, trustedSystemFileIds))
+    return false;
+  const clang::CompoundStmt *valid =
+      exactCompound(validation->getElse(), 2);
+  if (valid == nullptr)
+    return false;
+  auto validChild = valid->body_begin();
+  if (!isDeviceInitAssignment(
+          *validChild++, deviceVariable, sourceManager, context,
+          admittedCudaRole))
+    return false;
+  const auto *initialized =
+      llvm::dyn_cast_or_null<clang::IfStmt>(*validChild);
+  return initialized != nullptr && initialized->getElse() == nullptr &&
+         isDeviceLessThanZero(
+             initialized->getCond(), deviceVariable, context) &&
+         isOfficialFailureBlock(
+             initialized->getThen(), "exiting...\n", context,
+             sourceManager, trustedSystemFileIds);
+}
+
+static bool isOfficialAutomaticDeviceBranch(
+    const clang::Stmt *statement,
+    const clang::VarDecl *deviceVariable,
+    clang::SourceManager &sourceManager,
+    clang::ASTContext &context,
+    unsigned admittedCudaRole,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  const clang::CompoundStmt *branch = exactCompound(statement, 6);
+  if (branch == nullptr)
+    return false;
+  auto child = branch->body_begin();
+  if (!isMaxGflopsAssignment(
+          *child++, deviceVariable, sourceManager, context,
+          admittedCudaRole) ||
+      !isCheckedSetDeviceStatement(
+          *child++, deviceVariable, sourceManager, context,
+          admittedCudaRole, trustedSystemFileIds))
+    return false;
+  const clang::VarDecl *major = nullptr;
+  const clang::VarDecl *minor = nullptr;
+  if (!getMajorMinorDeclarations(*child++, major, minor, context) ||
+      !isCheckedDeviceAttributeStatement(
+          *child++, major, "cudaDevAttrComputeCapabilityMajor",
+          deviceVariable, sourceManager, context, admittedCudaRole,
+          trustedSystemFileIds) ||
+      !isCheckedDeviceAttributeStatement(
+          *child++, minor, "cudaDevAttrComputeCapabilityMinor",
+          deviceVariable, sourceManager, context, admittedCudaRole,
+          trustedSystemFileIds))
+    return false;
+  return isOfficialDeviceSummaryPrint(
+      *child, deviceVariable, major, minor, sourceManager, context,
+      admittedCudaRole, trustedSystemFileIds);
+}
+
+static bool hasProvenNvidiaFindCudaDeviceDefinition(
+    const clang::FunctionDecl *callee,
+    clang::ASTContext &context,
+    clang::SourceManager &sourceManager,
+    const std::set<unsigned> &trustedSystemFileIds) {
+  if (!hasExactNvidiaFindCudaDeviceSignature(callee, context))
+    return false;
+  const clang::FunctionDecl *definition = nullptr;
+  if (!callee->hasBody(definition) || definition == nullptr ||
+      !definition->isInlineSpecified() ||
+      definition->getTemplatedKind() !=
+          clang::FunctionDecl::TK_NonTemplate ||
+      definition->getCanonicalDecl() != callee->getCanonicalDecl() ||
+      !locationComesFromRecognizedNvidiaSampleHelper(
+          sourceManager, definition->getLocation()))
+    return false;
+
+  const clang::SourceLocation definitionSpelling =
+      sourceManager.getSpellingLoc(definition->getLocation());
+  if (definitionSpelling.isInvalid())
+    return false;
+  const unsigned admittedCudaRole = frozenNvidiaSampleHelperFileRole(
+      sourceManager, definitionSpelling);
+  unsigned admittedStringRole = FrozenNvidiaSampleHelperNone;
+  if (admittedCudaRole == FrozenOfficialNvidiaSampleHelperCuda)
+    admittedStringRole = FrozenOfficialNvidiaSampleHelperString;
+  else
+    return false;
+
+  const auto *body =
+      llvm::dyn_cast_or_null<clang::CompoundStmt>(definition->getBody());
+  if (body == nullptr || body->size() != 3)
+    return false;
+  auto statement = body->body_begin();
+  const auto *declarationStatement =
+      llvm::dyn_cast_or_null<clang::DeclStmt>(*statement++);
+  const auto *selection = llvm::dyn_cast_or_null<clang::IfStmt>(*statement++);
+  const auto *returnStatement =
+      llvm::dyn_cast_or_null<clang::ReturnStmt>(*statement);
+  if (declarationStatement == nullptr ||
+      !declarationStatement->isSingleDecl() || selection == nullptr ||
+      selection->getElse() == nullptr || returnStatement == nullptr)
+    return false;
+  const auto *deviceVariable = llvm::dyn_cast<clang::VarDecl>(
+      declarationStatement->getSingleDecl());
+  if (deviceVariable == nullptr || deviceVariable->getName() != "devID" ||
+      !context.hasSameType(deviceVariable->getType().getCanonicalType(),
+                           context.IntTy) ||
+      !evaluatesToNonNegative(deviceVariable->getInit(), 0, context) ||
+      !referencesCanonicalValue(returnStatement->getRetValue(),
+                                deviceVariable))
+    return false;
+
+  const bool exactOfficialBody = isOfficialFindCondition(
+             selection->getCond(), definition->getParamDecl(0),
+             definition->getParamDecl(1), sourceManager, context,
+             admittedStringRole) &&
+         isOfficialExplicitDeviceBranch(
+             selection->getThen(), definition->getParamDecl(0),
+             definition->getParamDecl(1), deviceVariable,
+             sourceManager, context, admittedCudaRole,
+             admittedStringRole, trustedSystemFileIds) &&
+         isOfficialAutomaticDeviceBranch(
+             selection->getElse(), deviceVariable,
+             sourceManager, context, admittedCudaRole,
+             trustedSystemFileIds);
+  if (!exactOfficialBody)
+    return false;
+  FrozenNvidiaSampleHelperCallClosure closure(
+      sourceManager, trustedSystemFileIds,
+      FrozenOfficialNvidiaSampleHelperCuda |
+          FrozenOfficialNvidiaSampleHelperString);
+  return closure.prove(definition);
+}
+
+static bool proveNvidiaFindCudaDeviceCall(
+    const clang::CallExpr *expression,
+    clang::ASTContext &context,
+    clang::SourceManager &sourceManager,
+    const clang::LangOptions &languageOptions,
+    const std::set<unsigned> &trustedSystemFileIds,
+    clang::SourceLocation &nameLocation,
+    clang::FileID &rewriteFile,
+    unsigned &rewriteBegin,
+    unsigned &rewriteEnd) {
+  if (expression == nullptr || expression->getNumArgs() != 2)
+    return false;
+  const clang::FunctionDecl *callee = expression->getDirectCallee();
+  if (callee == nullptr || callee->getIdentifier() == nullptr ||
+      callee->getName() != "findCudaDevice" ||
+      !hasProvenNvidiaFindCudaDeviceDefinition(
+          callee, context, sourceManager, trustedSystemFileIds))
+    return false;
+
+  const clang::FunctionDecl *enclosing =
+      enclosingNonLambdaFunction(expression, context);
+  if (enclosing == nullptr ||
+      enclosing->hasAttr<clang::CUDADeviceAttr>() ||
+      enclosing->hasAttr<clang::CUDAGlobalAttr>())
+    return false;
+
+  const clang::Expr *calleeExpression =
+      stripParenAndImplicitCasts(expression->getCallee());
+  const auto *reference =
+      llvm::dyn_cast_or_null<clang::DeclRefExpr>(calleeExpression);
+  if (reference == nullptr || reference->hasQualifier() ||
+      reference->getDecl()->getCanonicalDecl() !=
+          callee->getCanonicalDecl())
+    return false;
+  nameLocation = reference->getLocation();
+  const clang::SourceLocation fileLocation =
+      sourceManager.getFileLoc(nameLocation);
+  if (nameLocation.isInvalid() || nameLocation.isMacroID() ||
+      fileLocation.isInvalid() ||
+      !sourceManager.isWrittenInMainFile(fileLocation))
+    return false;
+  bool invalidSourceToken = false;
+  const llvm::StringRef sourceToken = clang::Lexer::getSourceText(
+      clang::CharSourceRange::getTokenRange(nameLocation, nameLocation),
+      sourceManager, languageOptions, &invalidSourceToken);
+  if (invalidSourceToken || sourceToken != "findCudaDevice")
+    return false;
+  const clang::SourceLocation end = clang::Lexer::getLocForEndOfToken(
+      fileLocation, 0, sourceManager, languageOptions);
+  if (end.isInvalid())
+    return false;
+  const std::pair<clang::FileID, unsigned> beginDecomposed =
+      sourceManager.getDecomposedLoc(fileLocation);
+  const std::pair<clang::FileID, unsigned> endDecomposed =
+      sourceManager.getDecomposedLoc(end);
+  if (beginDecomposed.first != endDecomposed.first ||
+      endDecomposed.second <= beginDecomposed.second)
+    return false;
+  rewriteFile = beginDecomposed.first;
+  rewriteBegin = beginDecomposed.second;
+  rewriteEnd = endDecomposed.second;
+  return true;
+}
+
 // This is deliberately a provenance proof, not a pointer-type guess.  Only a
 // direct parameter of the current CUDA global function establishes global
 // memory.  Local aliases, globals, fields, shared variables, helper parameters,
@@ -1538,15 +2431,41 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
   class Visitor : public clang::RecursiveASTVisitor<Visitor> {
   public:
     Visitor(clang::SourceManager &sourceManager,
+            clang::ASTContext &astContext,
+            const clang::LangOptions &languageOptions,
+            const std::set<unsigned> &trustedSystemFileIds,
             const std::vector<SemanticRewriteRange> &supportedRanges,
-            std::vector<NvidiaSampleHelperMacroCandidate> &candidates)
-        : sourceManager(sourceManager), supportedRanges(supportedRanges),
-          candidates(candidates) {}
+            std::vector<NvidiaSampleHelperMacroCandidate> &candidates,
+            std::vector<NvidiaSampleFindDeviceCandidate> &findCandidates)
+        : sourceManager(sourceManager), astContext(astContext),
+          languageOptions(languageOptions),
+          trustedSystemFileIds(trustedSystemFileIds),
+          supportedRanges(supportedRanges),
+          candidates(candidates), findCandidates(findCandidates) {}
 
     bool VisitCallExpr(clang::CallExpr *expression) {
       if (expression == nullptr)
         return true;
       const clang::FunctionDecl *callee = expression->getDirectCallee();
+      if (callee != nullptr && callee->getIdentifier() != nullptr &&
+          callee->getName() == "findCudaDevice" &&
+          locationComesFromRecognizedNvidiaSampleHelper(
+              sourceManager, callee->getLocation())) {
+        clang::SourceLocation nameLocation;
+        clang::FileID rewriteFile;
+        unsigned rewriteBegin = 0;
+        unsigned rewriteEnd = 0;
+        if (proveNvidiaFindCudaDeviceCall(
+                expression, astContext, sourceManager, languageOptions,
+                trustedSystemFileIds,
+                nameLocation, rewriteFile, rewriteBegin, rewriteEnd)) {
+          findCandidates.push_back(
+              {nameLocation,
+               {rewriteFile, rewriteBegin, rewriteEnd},
+               false});
+        }
+        return true;
+      }
       if (callee == nullptr || callee->getIdentifier() == nullptr ||
           callee->getName() != "check" ||
           !locationComesFromRecognizedNvidiaSampleHelper(
@@ -1558,7 +2477,7 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
       if (candidate == nullptr || expression->getNumArgs() == 0)
         return true;
       candidate->statusDomainProven = isAdmittedCudaRuntimeStatusCall(
-          sourceManager, expression->getArg(0));
+          sourceManager, expression->getArg(0), trustedSystemFileIds);
       return true;
     }
 
@@ -1629,7 +2548,7 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
       return nullptr;
     }
 
-    bool isSupportedMacroExpansion(clang::SourceLocation location) const {
+    bool isSupportedHelperRewrite(clang::SourceLocation location) const {
       const clang::SourceLocation expansion =
           sourceManager.getExpansionLoc(location);
       const clang::SourceLocation fileLoc =
@@ -1639,6 +2558,14 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
       const std::pair<clang::FileID, unsigned> decomposed =
           sourceManager.getDecomposedLoc(fileLoc);
       for (const SemanticRewriteRange &range : supportedRanges) {
+        if (range.file == decomposed.first &&
+            decomposed.second >= range.beginOffset &&
+            decomposed.second < range.endOffset)
+          return true;
+      }
+      for (const NvidiaSampleFindDeviceCandidate &candidate :
+           findCandidates) {
+        const SemanticRewriteRange &range = candidate.rewriteRange;
         if (range.file == decomposed.first &&
             decomposed.second >= range.beginOffset &&
             decomposed.second < range.endOffset)
@@ -1656,7 +2583,7 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
       if (expansion.isInvalid() ||
           !locationComesFromRecognizedNvidiaSampleHelper(
               sourceManager, referenced->getLocation()) ||
-          isSupportedMacroExpansion(useLocation) ||
+          isSupportedHelperRewrite(useLocation) ||
           (!sourceManager.isWrittenInMainFile(expansion) &&
            locationComesFromRecognizedNvidiaSampleHelper(
                sourceManager, useLocation)))
@@ -1667,16 +2594,31 @@ bool AscifyAction::hasUnsupportedNvidiaSampleHelperDeclarationUse() {
     }
 
     clang::SourceManager &sourceManager;
+    clang::ASTContext &astContext;
+    const clang::LangOptions &languageOptions;
+    const std::set<unsigned> &trustedSystemFileIds;
     const std::vector<SemanticRewriteRange> &supportedRanges;
     std::vector<NvidiaSampleHelperMacroCandidate> &candidates;
+    std::vector<NvidiaSampleFindDeviceCandidate> &findCandidates;
     bool conflict = false;
     std::string name;
   } visitor(getCompilerInstance().getSourceManager(),
+            getCompilerInstance().getASTContext(),
+            getCompilerInstance().getLangOpts(),
+            trustedSystemFileIds,
             nvidiaSampleHelperMacroRanges,
-            nvidiaSampleHelperMacroCandidates);
+            nvidiaSampleHelperMacroCandidates,
+            nvidiaSampleFindDeviceCandidates);
 
   visitor.TraverseDecl(
       getCompilerInstance().getASTContext().getTranslationUnitDecl());
+  for (const NvidiaSampleFindDeviceCandidate &candidate :
+       nvidiaSampleFindDeviceCandidates) {
+    nvidiaSampleFindDeviceNormalOffsets.insert(
+        getCompilerInstance().getSourceManager().getFileOffset(
+            getCompilerInstance().getSourceManager().getFileLoc(
+                candidate.nameLocation)));
+  }
   if (visitor.hasConflict()) {
     llvm::errs() << "Ascify NVIDIA sample-helper closure: residual helper "
                  << "declaration '" << visitor.conflictingName()
@@ -1739,6 +2681,47 @@ bool AscifyAction::RewriteToken(clang::Lexer &, clang::Token &tok) {
 
 bool AscifyAction::Exclude(const dppCounter &hipToken) {
   return false;
+}
+
+void AscifyAction::FileChanged(
+    clang::SourceLocation location,
+    clang::PPCallbacks::FileChangeReason reason,
+    clang::SrcMgr::CharacteristicKind fileType) {
+  if (reason != clang::PPCallbacks::EnterFile)
+    return;
+  clang::SourceManager &sourceManager =
+      getCompilerInstance().getSourceManager();
+  const clang::SourceLocation spelling =
+      sourceManager.getSpellingLoc(location);
+  if (spelling.isInvalid())
+    return;
+  const clang::FileID file = sourceManager.getFileID(spelling);
+  if (file.isInvalid())
+    return;
+  const clang::FileEntry *entry = sourceManager.getFileEntryForID(file);
+  // Imaginary/remapped buffers have no stable include-search identity. A
+  // content override must not inherit the physical file's trusted identity.
+  if (entry == nullptr || sourceManager.isFileOverridden(entry))
+    return;
+  const llvm::sys::fs::UniqueID &uniqueId = entry->getUniqueID();
+  if (uniqueId.getDevice() == 0 && uniqueId.getFile() == 0)
+    return;
+  const std::pair<std::uint64_t, std::uint64_t> identity(
+      uniqueId.getDevice(), uniqueId.getFile());
+  const bool wasTrusted =
+      initiallyTrustedSystemFileIdentities.count(identity) != 0;
+  const bool wasUntrusted =
+      initiallyUntrustedSystemFileIdentities.count(identity) != 0;
+  if (!wasTrusted && !wasUntrusted) {
+    if (fileType == clang::SrcMgr::C_System ||
+        fileType == clang::SrcMgr::C_ExternCSystem)
+      initiallyTrustedSystemFileIdentities.insert(identity);
+    else
+      initiallyUntrustedSystemFileIdentities.insert(identity);
+  }
+  if (wasTrusted ||
+      initiallyTrustedSystemFileIdentities.count(identity) != 0)
+    trustedSystemFileIds.insert(file.getHashValue());
 }
 
 void AscifyAction::InclusionDirective(clang::SourceLocation hash_loc,
@@ -2417,27 +3400,35 @@ std::unique_ptr<clang::ASTConsumer> AscifyAction::CreateASTConsumer(clang::Compi
 void AscifyAction::Ifndef(clang::SourceLocation Loc, const clang::Token &MacroNameTok, const clang::MacroDefinition &MD) {
   auditExternalNvidiaSampleHelperPreprocessorUse(
       Loc, MacroNameTok, "#ifndef");
+  auditFrozenNvidiaSampleHelperMacroDependency(
+      Loc, MacroNameTok, MD, "#ifndef");
 }
 
 void AscifyAction::Ifdef(clang::SourceLocation Loc,
                          const clang::Token &MacroNameTok,
-                         const clang::MacroDefinition &) {
+                         const clang::MacroDefinition &MD) {
   auditExternalNvidiaSampleHelperPreprocessorUse(
       Loc, MacroNameTok, "#ifdef");
+  auditFrozenNvidiaSampleHelperMacroDependency(
+      Loc, MacroNameTok, MD, "#ifdef");
 }
 
 void AscifyAction::Defined(const clang::Token &MacroNameTok,
-                           const clang::MacroDefinition &,
+                           const clang::MacroDefinition &MD,
                            clang::SourceRange Range) {
   auditExternalNvidiaSampleHelperPreprocessorUse(
       Range.getBegin(), MacroNameTok, "defined");
+  auditFrozenNvidiaSampleHelperMacroDependency(
+      Range.getBegin(), MacroNameTok, MD, "defined");
 }
 
 void AscifyAction::MacroUndefined(
     const clang::Token &MacroNameTok,
-    const clang::MacroDefinition &) {
+    const clang::MacroDefinition &MD) {
   auditExternalNvidiaSampleHelperPreprocessorUse(
       MacroNameTok.getLocation(), MacroNameTok, "#undef");
+  auditFrozenNvidiaSampleHelperMacroDependency(
+      MacroNameTok.getLocation(), MacroNameTok, MD, "#undef");
 }
 
 void AscifyAction::MacroDefined(const clang::Token &MacroNameTok) {
@@ -2446,7 +3437,8 @@ void AscifyAction::MacroDefined(const clang::Token &MacroNameTok) {
   const llvm::StringRef name =
       MacroNameTok.getIdentifierInfo()->getName();
   if (name == "ASCIFY_NVIDIA_SAMPLE_CHECK_CUDA_ERRORS" ||
-      name == "ASCIFY_NVIDIA_SAMPLE_GET_LAST_CUDA_ERROR") {
+      name == "ASCIFY_NVIDIA_SAMPLE_GET_LAST_CUDA_ERROR" ||
+      name == "sampleFindCudaDevice") {
     clang::SourceManager &sourceManager =
         getCompilerInstance().getSourceManager();
     if (!locationComesFromAscifyCudaCompat(
@@ -2473,6 +3465,8 @@ void AscifyAction::MacroExpands(const clang::Token &MacroNameTok,
   clang::SourceManager &sourceManager =
       getCompilerInstance().getSourceManager();
   const clang::MacroInfo *macroInfo = MD.getMacroInfo();
+  auditFrozenNvidiaSampleHelperMacroDependency(
+      MacroNameTok.getLocation(), MacroNameTok, MD, "expansion");
   if (macroInfo == nullptr ||
       !locationComesFromRecognizedNvidiaSampleHelper(
           sourceManager, macroInfo->getDefinitionLoc()))
@@ -2620,7 +3614,8 @@ void AscifyAction::auditRawNvidiaSampleHelperToken(
   if (nvidiaSampleHelperIncludes.empty() || !token.isAnyIdentifier())
     return;
   const llvm::StringRef name = token.getRawIdentifier();
-  if (name != "checkCudaErrors" && name != "getLastCudaError")
+  if (name != "checkCudaErrors" && name != "getLastCudaError" &&
+      name != "findCudaDevice")
     return;
   clang::SourceManager &sourceManager =
       getCompilerInstance().getSourceManager();
@@ -2629,7 +3624,8 @@ void AscifyAction::auditRawNvidiaSampleHelperToken(
   if (fileLoc.isInvalid() || !sourceManager.isWrittenInMainFile(fileLoc))
     return;
   const unsigned offset = sourceManager.getFileOffset(fileLoc);
-  if (nvidiaSampleHelperNormalMacroOffsets.count(offset) != 0)
+  if (nvidiaSampleHelperNormalMacroOffsets.count(offset) != 0 ||
+      nvidiaSampleFindDeviceNormalOffsets.count(offset) != 0)
     return;
   if (!nvidiaSampleHelperUnsupportedMacroUse) {
     llvm::errs()
@@ -2664,6 +3660,71 @@ void AscifyAction::auditExternalNvidiaSampleHelperPreprocessorUse(
       << " use of '" << name << "' keeps all helper edits\n";
 }
 
+void AscifyAction::auditFrozenNvidiaSampleHelperMacroDependency(
+    clang::SourceLocation useLocation,
+    const clang::Token &macroNameToken,
+    const clang::MacroDefinition &definition,
+    llvm::StringRef useKind) {
+  if (macroNameToken.getIdentifierInfo() == nullptr)
+    return;
+  clang::SourceManager &sourceManager =
+      getCompilerInstance().getSourceManager();
+  const clang::SourceLocation expansion =
+      sourceManager.getExpansionLoc(useLocation);
+  const unsigned frozenProfile =
+      FrozenOfficialNvidiaSampleHelperCuda |
+      FrozenOfficialNvidiaSampleHelperString;
+  if (expansion.isInvalid() ||
+      !locationComesFromFrozenNvidiaSampleHelperFile(
+          sourceManager, expansion, frozenProfile))
+    return;
+
+  const clang::MacroInfo *macroInfo = definition.getMacroInfo();
+  // An undefined #if/#ifdef operand supplies no replacement tokens and does
+  // not import project semantics into the frozen helper profile.
+  if (macroInfo == nullptr)
+    return;
+  const clang::SourceLocation definitionLocation =
+      sourceManager.getSpellingLoc(macroInfo->getDefinitionLoc());
+  const clang::FileID definitionFile = definitionLocation.isValid()
+      ? sourceManager.getFileID(definitionLocation)
+      : clang::FileID();
+#if LLVM_VERSION_MAJOR >= 8
+  const clang::FileID predefinesFile =
+      getCompilerInstance().getPreprocessor().getPredefinesFileID();
+  const bool compilerPredefinition =
+      definitionFile.isValid() && predefinesFile.isValid() &&
+      definitionFile == predefinesFile &&
+      !sourceManager.isWrittenInCommandLineFile(definitionLocation);
+#else
+  // isWrittenInCommandLineFile was added in LLVM 8. The frozen SHA profile is
+  // already unavailable before LLVM 13, so conservatively admit no
+  // non-builtin predefinition on older builds instead of weakening the
+  // command-line distinction.
+  (void)definitionFile;
+  const bool compilerPredefinition = false;
+#endif
+  const bool trustedDefinition =
+      macroInfo->isBuiltinMacro() || compilerPredefinition ||
+      (definitionLocation.isValid() &&
+       (locationComesFromFrozenNvidiaSampleHelperFile(
+            sourceManager, definitionLocation, frozenProfile) ||
+        locationComesFromInitiallyTrustedSystemFile(
+            sourceManager, definitionLocation, trustedSystemFileIds)));
+  if (trustedDefinition)
+    return;
+
+  nvidiaSampleHelperUnsupportedMacroUse = true;
+  if (nvidiaSampleFrozenProfileMacroConflict)
+    return;
+  nvidiaSampleFrozenProfileMacroConflict = true;
+  llvm::errs()
+      << "Ascify NVIDIA sample-helper closure: untrusted " << useKind
+      << " macro dependency '"
+      << macroNameToken.getIdentifierInfo()->getName()
+      << "' changed a frozen helper profile; all helper edits kept\n";
+}
+
 void AscifyAction::finalizeNvidiaSampleHelperClosure() {
   if (nvidiaSampleHelperIncludes.empty())
     return;
@@ -2681,6 +3742,8 @@ void AscifyAction::finalizeNvidiaSampleHelperClosure() {
         << ", check_rewrites=" << nvidiaSampleCheckCudaErrorsRewrites
         << ", get_last_rewrites="
         << nvidiaSampleGetLastCudaErrorRewrites
+        << ", find_device_rewrites="
+        << nvidiaSampleFindCudaDeviceRewrites
         << ", unsupported_macro="
         << (nvidiaSampleHelperUnsupportedMacroUse ? 1 : 0)
         << ", unsupported_declaration="
@@ -2739,6 +3802,32 @@ void AscifyAction::finalizeNvidiaSampleHelperClosure() {
     committedMacroLocations.push_back(candidate.nameLocation);
     stagedSemanticRanges.push_back(candidate.invocationRange);
   }
+  for (const NvidiaSampleFindDeviceCandidate &candidate :
+       nvidiaSampleFindDeviceCandidates) {
+    for (const SemanticRewriteRange &existing : SemanticRewriteRanges) {
+      if (overlaps(candidate.rewriteRange, existing)) {
+        stagingError =
+            "findCudaDevice overlap with an existing semantic rewrite";
+        break;
+      }
+    }
+    for (const SemanticRewriteRange &pending : stagedSemanticRanges) {
+      if (overlaps(candidate.rewriteRange, pending)) {
+        stagingError = "findCudaDevice overlap within helper transaction";
+        break;
+      }
+    }
+    if (!stagingError.empty())
+      break;
+    ct::Replacement replacement(
+        sourceManager, candidate.nameLocation, 14U,
+        "::ascify::sampleFindCudaDevice");
+    if (!llcompat::insertReplacement(staged, replacement, &stagingError))
+      break;
+    committedMacroReplacements.push_back(replacement);
+    committedMacroLocations.push_back(candidate.nameLocation);
+    stagedSemanticRanges.push_back(candidate.rewriteRange);
+  }
 
   bool compatInsertedByClosure = hasCudaCompatHeader;
   const NvidiaSampleHelperInclude &include =
@@ -2750,7 +3839,9 @@ void AscifyAction::finalizeNvidiaSampleHelperClosure() {
     stagingError = "invalid direct include range";
   }
   std::string includeReplacementText;
-  const bool helperNeedsCompat = !nvidiaSampleHelperMacroCandidates.empty();
+  const bool helperNeedsCompat =
+      !nvidiaSampleHelperMacroCandidates.empty() ||
+      !nvidiaSampleFindDeviceCandidates.empty();
   if (stagingError.empty() &&
       (needsCudaCompatHeader || helperNeedsCompat) &&
       !compatInsertedByClosure) {
@@ -2790,6 +3881,11 @@ void AscifyAction::finalizeNvidiaSampleHelperClosure() {
     else
       ++nvidiaSampleGetLastCudaErrorRewrites;
   }
+  for (NvidiaSampleFindDeviceCandidate &candidate :
+       nvidiaSampleFindDeviceCandidates) {
+    candidate.rewritten = true;
+    ++nvidiaSampleFindCudaDeviceRewrites;
+  }
   needsCudaCompatHeader = needsCudaCompatHeader || helperNeedsCompat;
   if (compatInsertedByClosure)
     hasCudaCompatHeader = true;
@@ -2812,7 +3908,9 @@ void AscifyAction::finalizeNvidiaSampleHelperClosure() {
       << ", includes=1"
       << ", check_rewrites=" << nvidiaSampleCheckCudaErrorsRewrites
       << ", get_last_rewrites="
-      << nvidiaSampleGetLastCudaErrorRewrites << "\n";
+      << nvidiaSampleGetLastCudaErrorRewrites
+      << ", find_device_rewrites="
+      << nvidiaSampleFindCudaDeviceRewrites << "\n";
 }
 
 void AscifyAction::EndSourceFileAction() {
@@ -2887,6 +3985,15 @@ class PPCallbackProxy : public clang::PPCallbacks {
 
 public:
   explicit PPCallbackProxy(AscifyAction &action): ascifyAction(action) {}
+
+  void FileChanged(
+      clang::SourceLocation location,
+      clang::PPCallbacks::FileChangeReason reason,
+      clang::SrcMgr::CharacteristicKind fileType,
+      clang::FileID) override {
+    ascifyAction.FileChanged(location, reason, fileType);
+  }
+
   void InclusionDirective(clang::SourceLocation hash_loc, const clang::Token &include_token,
                           StringRef file_name, bool is_angled, clang::CharSourceRange filename_range,
 #if LLVM_VERSION_MAJOR < 15

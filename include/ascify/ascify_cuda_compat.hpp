@@ -817,6 +817,98 @@ inline void sampleGetLastCudaError(const char* message, const char* file,
   exit(EXIT_FAILURE);
 }
 
+// Internal target for a provenance- and AST-proven NVIDIA cuda-samples
+// findCudaDevice call. Ascify intentionally does not reproduce CUDA's
+// architecture-specific GFLOPS ranking: the admitted runtime contract is one
+// visible logical device, selected as logical device zero.
+namespace detail {
+
+[[noreturn]] inline void sampleFindCudaDeviceFailure(const char* reason,
+                                                     aclError status) {
+  if (status == ACL_SUCCESS) {
+    fprintf(stderr, "Ascify CUDA sample device selection failed: %s\n",
+            reason == nullptr ? "invalid device selection" : reason);
+  } else {
+    fprintf(stderr,
+            "Ascify CUDA sample device selection failed: %s: code=%d (%s)\n",
+            reason == nullptr ? "runtime failure" : reason,
+            static_cast<int>(status), cudaGetErrorString(status));
+  }
+  exit(EXIT_FAILURE);
+}
+
+inline bool sampleFindCudaDeviceArgumentIsSelector(const char* argument) {
+  if (argument == nullptr) { return false; }
+  while (*argument == '-') { ++argument; }
+  static constexpr char selector[] = "device";
+  for (size_t index = 0; index + 1 < sizeof(selector); ++index) {
+    const char actual = argument[index];
+    if (actual == '\0') { return false; }
+    const char expected = selector[index];
+    const char folded = actual >= 'A' && actual <= 'Z'
+                            ? static_cast<char>(actual - 'A' + 'a')
+                            : actual;
+    if (folded != expected) { return false; }
+  }
+  const char suffix = argument[sizeof(selector) - 1];
+  return suffix == '\0' || suffix == '=';
+}
+
+inline bool sampleFindCudaDeviceArgumentIsExactZero(const char* argument) {
+  if (argument == nullptr) { return false; }
+  static constexpr char admitted[] = "--device=0";
+  size_t index = 0;
+  for (; admitted[index] != '\0'; ++index) {
+    if (argument[index] != admitted[index]) { return false; }
+  }
+  return argument[index] == '\0';
+}
+
+}  // namespace detail
+
+inline int sampleFindCudaDevice(int argc, const char** argv) {
+  if (argc < 0 || (argc > 0 && argv == nullptr)) {
+    detail::sampleFindCudaDeviceFailure("invalid argc/argv", ACL_SUCCESS);
+  }
+
+  bool explicit_zero = false;
+  for (int index = 1; index < argc; ++index) {
+    const char* const argument = argv[index];
+    if (argument == nullptr) {
+      detail::sampleFindCudaDeviceFailure(
+          "null command-line argument", ACL_SUCCESS);
+    }
+    if (!detail::sampleFindCudaDeviceArgumentIsSelector(argument)) {
+      continue;
+    }
+    const bool is_exact_zero =
+        detail::sampleFindCudaDeviceArgumentIsExactZero(argument);
+    if (!is_exact_zero || explicit_zero) {
+      detail::sampleFindCudaDeviceFailure(
+          "only one explicit --device=0 selector is supported", ACL_SUCCESS);
+    }
+    explicit_zero = true;
+  }
+
+  int count = 0;
+  const aclError count_status = cudaGetDeviceCount(&count);
+  if (count_status != ACL_SUCCESS) {
+    detail::sampleFindCudaDeviceFailure(
+        "device-count query failed", count_status);
+  }
+  if (count != 1) {
+    detail::sampleFindCudaDeviceFailure(
+        "exactly one visible logical device is required", ACL_SUCCESS);
+  }
+
+  const aclError bind_status = cudaSetDevice(0);
+  if (bind_status != ACL_SUCCESS) {
+    detail::sampleFindCudaDeviceFailure(
+        "binding logical device 0 failed", bind_status);
+  }
+  return 0;
+}
+
 #ifndef ASCIFY_NVIDIA_SAMPLE_CHECK_CUDA_ERRORS
 #define ASCIFY_NVIDIA_SAMPLE_CHECK_CUDA_ERRORS(expression)                  \
   ::ascify::sampleCheckCudaErrors(                                          \

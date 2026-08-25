@@ -88,6 +88,12 @@ cleanup() {
 }
 trap cleanup 0 1 2 15
 
+run_check "real Ascify NVIDIA sample-helper frontend closure" \
+  sh "$rewrite_dir/check_sample_helper_compat.sh" \
+    --binary "$ASCIFY_BINARY" \
+    --cuda-path "$ASCIFY_CUDA_PATH" \
+    --resource-dir "$ASCIFY_CLANG_RESOURCE_DIRECTORY"
+
 run_check "real ascify local-header publication negatives" \
   sh "$rewrite_dir/check_local_header_integration.sh"
 

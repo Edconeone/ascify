@@ -22,8 +22,10 @@ THE SOFTWARE.
 
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <set>
+#include <utility>
 #include <vector>
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -69,6 +71,12 @@ private:
     bool rewritten = false;
   };
 
+  struct NvidiaSampleFindDeviceCandidate {
+    clang::SourceLocation nameLocation;
+    SemanticRewriteRange rewriteRange;
+    bool rewritten = false;
+  };
+
   ct::Replacements *replacements = nullptr;
   LocalHeaderRewriteContext *localHeaderContext = nullptr;
   ascify::FrontendCompatibilityConfig frontendCompatibility;
@@ -78,17 +86,30 @@ private:
   std::vector<SemanticRewriteRange> nvidiaSampleHelperMacroRanges;
   std::vector<NvidiaSampleHelperMacroCandidate>
       nvidiaSampleHelperMacroCandidates;
+  std::vector<NvidiaSampleFindDeviceCandidate>
+      nvidiaSampleFindDeviceCandidates;
   std::vector<NvidiaSampleHelperInclude> nvidiaSampleHelperIncludes;
   std::set<std::string> recognizedNvidiaSampleHelperPaths;
   std::set<unsigned> nvidiaSampleHelperNormalMacroOffsets;
+  std::set<unsigned> nvidiaSampleFindDeviceNormalOffsets;
+  // FileIDs whose first EnterFile callback already carried a system
+  // characteristic.  A later #pragma system_header notification must not be
+  // able to promote an ordinary project/preinclude file into this set.
+  std::set<unsigned> trustedSystemFileIds;
+  std::set<std::pair<std::uint64_t, std::uint64_t>>
+      initiallyTrustedSystemFileIdentities;
+  std::set<std::pair<std::uint64_t, std::uint64_t>>
+      initiallyUntrustedSystemFileIdentities;
   bool nvidiaSampleHelperUnsupportedMacroUse = false;
   bool nvidiaSampleHelperUnsupportedDeclarationUse = false;
   bool nvidiaSampleHelperRewriteFailed = false;
   bool nvidiaSampleHelperOutputMacroEverDefined = false;
+  bool nvidiaSampleFrozenProfileMacroConflict = false;
   bool nvidiaSampleHelperReadyToCommit = false;
   bool nvidiaSampleHelperRawAuditCompleted = false;
   unsigned nvidiaSampleCheckCudaErrorsRewrites = 0;
   unsigned nvidiaSampleGetLastCudaErrorRewrites = 0;
+  unsigned nvidiaSampleFindCudaDeviceRewrites = 0;
   std::unique_ptr<mat::MatchFinder> Finder;
   ascify::DavC310TargetRecipe davC310TargetRecipe;
   // CUDA implicitly adds its runtime header. We rewrite explicitly-provided CUDA includes with equivalent
@@ -143,6 +164,11 @@ private:
       clang::SourceLocation location,
       const clang::Token &macroNameToken,
       llvm::StringRef directive);
+  void auditFrozenNvidiaSampleHelperMacroDependency(
+      clang::SourceLocation useLocation,
+      const clang::Token &macroNameToken,
+      const clang::MacroDefinition &definition,
+      llvm::StringRef useKind);
   void finalizeNvidiaSampleHelperClosure();
   // Calculate str's SourceLocation in SourceRange sr
   clang::SourceLocation GetSubstrLocation(const std::string &str, const clang::SourceRange &sr);
@@ -174,6 +200,13 @@ public:
   bool cubUsingNamespaceDecl(const mat::MatchFinder::MatchResult &Result);
   bool half2Member(const mat::MatchFinder::MatchResult &Result);
   bool dataTypeSelection(const mat::MatchFinder::MatchResult &Result);
+
+  // Record the include-search characteristic at file entry. This is kept
+  // separate from SourceManager::isInSystemHeader(), whose current value can
+  // be changed later by #pragma clang/GCC system_header.
+  void FileChanged(clang::SourceLocation location,
+                   clang::PPCallbacks::FileChangeReason reason,
+                   clang::SrcMgr::CharacteristicKind fileType);
 
   // Called by the preprocessor for each include directive during the non-raw lexing pass.
   void InclusionDirective(clang::SourceLocation hash_loc,

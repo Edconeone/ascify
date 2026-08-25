@@ -26,12 +26,23 @@ only the load/store contract needed by the Ascify semantic matcher.
 
 ## NVIDIA CUDA Samples helper fixtures
 
-The following reduced test fixtures are derived from NVIDIA CUDA Samples
-`Common/helper_cuda.h` at commit
-`b7c5481c556c3fe98db060207ecaa41a4b9a9abc`:
+The following complete fixtures are copied byte-for-byte from NVIDIA CUDA
+Samples at commit `b7c5481c556c3fe98db060207ecaa41a4b9a9abc`:
 
 - `tests/rewrite/fixtures/nvidia_samples/Common/helper_cuda.h`
+- `tests/rewrite/fixtures/nvidia_samples/Common/helper_string.h`
+- `tests/rewrite/fixtures/mutated_dependency_nvidia_samples/Common/helper_cuda.h`
+
+The following negative-test fixtures are modified or reduced derivatives of
+`Common/helper_cuda.h` or `Common/helper_string.h` from that same commit:
+
 - `tests/rewrite/fixtures/altered_nvidia_samples/Common/helper_cuda.h`
+- `tests/rewrite/fixtures/altered_find_nvidia_samples/Common/helper_cuda.h`
+- `tests/rewrite/fixtures/mutated_find_nvidia_samples/Common/helper_cuda.h`
+- `tests/rewrite/fixtures/mutated_dependency_nvidia_samples/Common/helper_string.h`
+
+The nearby `cublas_v2.h` and `user_helpers/helper_cuda.h` files are
+project-authored stubs and are not copies of NVIDIA CUDA Samples.
 
 Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 

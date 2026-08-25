@@ -204,19 +204,43 @@ Ascify separately recognizes the proven NVIDIA CUDA Samples
 error-handling macros `checkCudaErrors(expr)` and
 `getLastCudaError(message)` only when the resolved header, active macro
 definitions, direct source tokens, and CUDA Runtime status domain all match
-the admitted contract. This proof gate is automatic when such an include is
-encountered; it is not enabled by the frontend-profile or local-header flags.
-The replacement evaluates the status expression once,
-preserves expression/file/line diagnostics, and implements
-`getLastCudaError` with consume-and-reset semantics.
+the admitted contract. It can also replace a direct host call to the official
+`findCudaDevice(int, const char **)` definition after proving its canonical
+signature, active device-selection AST, unqualified non-macro call token, and
+the version-paired SHA-256 identities of the actual `helper_cuda.h` and
+`helper_string.h` definition files. The hashes cover Clang's parsed buffers,
+every macro that affects either frozen header must be defined by that profile,
+a file that entered preprocessing as a system header, or the compiler itself,
+and every resolved direct call transitively reached from the replaced helper
+must stay inside the frozen profile or that same system-file set. Return-value
+use is preserved because only the callee token changes. This proof gate is
+automatic when such an include is encountered; it is not enabled by the
+frontend-profile or local-header flags. The frozen SHA-256 proof requires LLVM
+13 or newer; on an older LLVM build this one helper rewrite stays disabled and
+fails closed while the rest of Ascify remains available.
+
+This proof trusts the configured Ascify/Clang resources, CUDA SDK, sysroot, and
+system-header graph; an untrusted `-isystem` directory enlarges that trust and
+is outside the guarantee. Main source, `-D`, ordinary preincludes, VFS helper
+remaps, forged `#line` filenames, and ordinary headers that later apply
+`#pragma clang/GCC system_header` (including re-entry under a new `FileID`)
+remain fail-closed inputs.
+The macro replacements evaluate the status expression once, preserve
+expression/file/line diagnostics, and implement `getLastCudaError` with
+consume-and-reset semantics.
 
 This is one all-or-nothing source transaction. A duplicate or indirect
 include, residual preprocessor use in any local header, altered active macro,
 reserved output-macro collision, unsupported status domain, external helper
 declaration use, or incomplete raw-file audit keeps the original include and
-helper calls. The closure does not implement `findCudaDevice`, occupancy,
-Driver/VMM, compression, or compressible-allocation helpers. See
-[ADR-0015](docs/decisions/0015-admit-only-proven-nvidia-sample-helper-closure.md).
+helper calls. The owned device helper admits only one visible logical device:
+no selector or one exact `--device=0` binds logical zero; any other selector,
+device count, query error, or bind error fails explicitly. It does not emulate
+CUDA's GFLOPS ranking. Occupancy, Driver/VMM, compression, and
+compressible-allocation helpers remain unsupported. See
+[ADR-0015](docs/decisions/0015-admit-only-proven-nvidia-sample-helper-closure.md)
+and
+[ADR-0016](docs/decisions/0016-proof-gate-single-device-sample-selection.md).
 
 `portable` and `precise` are the defaults. The currently validated 950PR
 performance policy is explicitly opt-in:

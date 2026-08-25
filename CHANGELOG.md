@@ -19,6 +19,14 @@
 - A proof-gated, all-or-nothing NVIDIA CUDA Samples helper closure for
   `checkCudaErrors` and `getLastCudaError`, including active-macro,
   status-domain, raw-EOF, external-preprocessor, and reserved-macro gates.
+- Proven direct calls to NVIDIA's official `findCudaDevice` definition, using
+  an Ascify-owned, fail-closed single-visible-device/logical-zero contract
+  instead of CUDA GFLOPS ranking; paired versioned source identities freeze
+  every active helper dependency, a transitive direct-call closure rejects
+  user redeclarations of libc/runtime dependencies, and untrusted preinclude
+  macros or later `system_header` self-promotion fail closed, while qualified,
+  macro, alias, indirect, external, and altered-definition uses remain
+  unmodified.
 - Opt-in `dav-c310-vec + fast` AST-gated row-wise recipes for FP16 Softmax,
   RMSNorm, and LayerNorm, including affine RMSNorm.
 - Versioned dav-c310 target headers, thin CUDA-to-ACL compatibility helpers,

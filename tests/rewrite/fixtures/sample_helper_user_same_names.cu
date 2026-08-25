@@ -1,6 +1,7 @@
 #include <helper_cuda.h>
 
-int user_same_names() {
+int user_same_names(int argc, const char** argv) {
   checkCudaErrors(0);
-  return getLastCudaError("user macro");
+  getLastCudaError("user macro");
+  return findCudaDevice(argc, argv);
 }

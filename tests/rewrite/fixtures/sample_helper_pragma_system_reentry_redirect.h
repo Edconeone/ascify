@@ -1,0 +1,6 @@
+#ifndef ASCIFY_TEST_PRAGMA_SYSTEM_REENTRY_SEEN
+#define ASCIFY_TEST_PRAGMA_SYSTEM_REENTRY_SEEN 1
+#pragma clang system_header
+#else
+#define STRNCASECMP ascifyTestPragmaReentryStrncasecmp
+#endif
