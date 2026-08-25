@@ -1,6 +1,6 @@
 #include <helper_cuda.h>
 
-int customStatus();
+cudaError_t customStatus();
 
 void mixedCustomStatus(void **pointer) {
   checkCudaErrors(cudaMalloc(pointer, 64));
