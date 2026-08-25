@@ -30,7 +30,11 @@ The following complete fixtures are copied byte-for-byte from NVIDIA CUDA
 Samples at commit `b7c5481c556c3fe98db060207ecaa41a4b9a9abc`:
 
 - `tests/rewrite/fixtures/nvidia_samples/Common/helper_cuda.h`
+- `tests/rewrite/fixtures/nvidia_samples/Common/exception.h`
+- `tests/rewrite/fixtures/nvidia_samples/Common/helper_functions.h`
+- `tests/rewrite/fixtures/nvidia_samples/Common/helper_image.h`
 - `tests/rewrite/fixtures/nvidia_samples/Common/helper_string.h`
+- `tests/rewrite/fixtures/nvidia_samples/Common/helper_timer.h`
 - `tests/rewrite/fixtures/mutated_dependency_nvidia_samples/Common/helper_cuda.h`
 
 The following negative-test fixtures are modified or reduced derivatives of

@@ -27,6 +27,12 @@
   macros or later `system_header` self-promotion fail closed, while qualified,
   macro, alias, indirect, external, and altered-definition uses remain
   unmodified.
+- Exact b7c `helper_functions.h -> helper_image.h` closures may provide the
+  observed `EXIT_WAIVED=2` and `MAX(a,b)=((a>b)?a:b)` policy dependencies used
+  by frozen helper consumers. Admission is bound to frozen content, exact
+  bodies, and first physical-file identity; command-line, project-header,
+  same-name, changed-body, pragma-promotion, re-entry, and line-spoofed origins
+  remain fail-closed.
 - Opt-in `dav-c310-vec + fast` AST-gated row-wise recipes for FP16 Softmax,
   RMSNorm, and LayerNorm, including affine RMSNorm.
 - Versioned dav-c310 target headers, thin CUDA-to-ACL compatibility helpers,

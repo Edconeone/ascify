@@ -100,6 +100,12 @@ private:
       initiallyTrustedSystemFileIdentities;
   std::set<std::pair<std::uint64_t, std::uint64_t>>
       initiallyUntrustedSystemFileIdentities;
+  // Physical identities admitted on their first EnterFile callback by an
+  // exact frozen NVIDIA helper-functions closure member. This is deliberately
+  // independent of later system_header state.
+  std::set<std::pair<std::uint64_t, std::uint64_t>>
+      frozenNvidiaSampleMacroProviderIdentities;
+  bool frozenOfficialNvidiaSampleHelperFunctionsSeen = false;
   bool nvidiaSampleHelperUnsupportedMacroUse = false;
   bool nvidiaSampleHelperUnsupportedDeclarationUse = false;
   bool nvidiaSampleHelperRewriteFailed = false;

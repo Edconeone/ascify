@@ -1,0 +1,6 @@
+#ifndef ASCIFY_TEST_EXIT_WAIVED_USER_H_
+#define ASCIFY_TEST_EXIT_WAIVED_USER_H_
+
+#define EXIT_WAIVED 2
+
+#endif

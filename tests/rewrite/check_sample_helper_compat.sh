@@ -76,6 +76,16 @@ require_fixed 'hasSystemFunctionDeclarationProvenance' "$action_cpp"
 require_fixed 'directUnqualifiedSourceCallNamed' "$action_cpp"
 require_fixed '997f9ac1f8e5f8e5f45f8b11eebab5b89305dee7430b90654bafe62283cffee1' "$action_cpp"
 require_fixed '26e988c97fb3d77d498e384c685177ed7966e41d5d58ebc9b7d3d696859f5e57' "$action_cpp"
+require_fixed 'FrozenOfficialNvidiaSampleHelperFunctions' "$action_cpp"
+require_fixed 'FrozenOfficialNvidiaSampleHelperImage' "$action_cpp"
+require_fixed '3fdcd18e41ffc2a9c88ade3595384e9cd05a2d84f80b86a2d5982035ca79c426' "$action_cpp"
+require_fixed 'bc1fe7921bafad278ffa2e4bc8a99c18825208b9f5f47842a7cf7e86cae8b3f1' "$action_cpp"
+require_fixed 'activeFrozenHelperFunctionsProviderMacroBodyMatches' "$action_cpp"
+require_fixed 'name == "EXIT_WAIVED" || name == "MAX"' "$action_cpp"
+require_fixed 'admittedConsumer && useKind == "#ifndef"' "$action_cpp"
+require_fixed 'frozenNvidiaSampleMacroProviderIdentities.count' "$action_cpp"
+require_fixed 'providerRole == FrozenOfficialNvidiaSampleHelperImage' "$action_cpp"
+require_fixed '!isFrozenHelperFunctionsProviderPolicyMacro(macroName)' "$action_cpp"
 require_fixed '::ascify::sampleFindCudaDevice' "$action_cpp"
 require_fixed 'ct::Replacements staged(*replacements);' "$action_cpp"
 require_fixed '*replacements = std::move(staged);' "$action_cpp"
@@ -87,6 +97,32 @@ require_fixed 'exactly one visible logical device is required' "$compat_header"
 require_fixed 'const aclError status = cudaGetLastError();' "$compat_header"
 require_fixed '#expression, __FILE__, __LINE__' "$compat_header"
 forbid_fixed 'gpuGetMaxGflopsDeviceId' "$compat_header"
+
+official_helper_functions="$fixtures/nvidia_samples/Common/helper_functions.h"
+[ "$(wc -c <"$official_helper_functions" | tr -d ' ')" -eq 2358 ]
+if command -v sha256sum >/dev/null 2>&1; then
+  helper_functions_sha=$(sha256sum "$official_helper_functions" | awk '{print $1}')
+else
+  helper_functions_sha=$(shasum -a 256 "$official_helper_functions" | awk '{print $1}')
+fi
+[ "$helper_functions_sha" = \
+  3fdcd18e41ffc2a9c88ade3595384e9cd05a2d84f80b86a2d5982035ca79c426 ]
+for frozen_provider in \
+  'helper_image.h:28739:bc1fe7921bafad278ffa2e4bc8a99c18825208b9f5f47842a7cf7e86cae8b3f1' \
+  'helper_timer.h:16060:c48552a7c7b7a5840fcfbc176bfb5a19b501fdc56796b64a63e78e39ab547078'; do
+  provider_name=${frozen_provider%%:*}
+  provider_tail=${frozen_provider#*:}
+  provider_size=${provider_tail%%:*}
+  provider_sha=${provider_tail#*:}
+  provider_path="$fixtures/nvidia_samples/Common/$provider_name"
+  [ "$(wc -c <"$provider_path" | tr -d ' ')" -eq "$provider_size" ]
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_provider_sha=$(sha256sum "$provider_path" | awk '{print $1}')
+  else
+    actual_provider_sha=$(shasum -a 256 "$provider_path" | awk '{print $1}')
+  fi
+  [ "$actual_provider_sha" = "$provider_sha" ]
+done
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/ascify-sample-helper.XXXXXX")
 cleanup() {
@@ -249,6 +285,141 @@ require_fixed 'return ::ascify::sampleFindCudaDevice(argc, argv);' \
 forbid_fixed 'helper_cuda.h' "$test_tmp/find-direct.cpp"
 require_fixed 'find_device_rewrites=1' "$test_tmp/find-direct.stderr"
 require_fixed 'include removed' "$test_tmp/find-direct.stderr"
+
+# Reproduce simpleAtomicIntrinsics' unedited Common-header graph. The exact
+# helper_functions root enters exact helper_image first, which establishes
+# EXIT_WAIVED=2 before exact helper_string and helper_cuda consume it.
+translate "$fixtures/sample_helper_find_device_official_exit_waived.cu" \
+  "$fixtures/nvidia_samples/Common" \
+  "$test_tmp/find-official-exit-waived.cpp" \
+  "$test_tmp/find-official-exit-waived"
+require_fixed '#include <helper_functions.h>' \
+  "$test_tmp/find-official-exit-waived.cpp"
+require_fixed 'return ::ascify::sampleFindCudaDevice(argc, argv);' \
+  "$test_tmp/find-official-exit-waived.cpp"
+forbid_fixed 'helper_cuda.h' \
+  "$test_tmp/find-official-exit-waived.cpp"
+require_fixed 'find_device_rewrites=1' \
+  "$test_tmp/find-official-exit-waived.stderr"
+require_fixed 'include removed' \
+  "$test_tmp/find-official-exit-waived.stderr"
+
+assert_exit_waived_rejected() {
+  label=$1
+  output=$2
+  log=$3
+  require_fixed '#include <helper_cuda.h>' "$output"
+  require_fixed 'findCudaDevice(argc, argv)' "$output"
+  forbid_fixed 'sampleFindCudaDevice' "$output"
+  require_fixed "macro dependency 'EXIT_WAIVED'" "$log.stderr"
+  require_fixed 'include kept' "$log.stderr"
+}
+
+for origin in user pragma reentry line_spoof; do
+  translate \
+    "$fixtures/sample_helper_find_device_${origin}_exit_waived.cu" \
+    "$fixtures/nvidia_samples/Common" \
+    "$test_tmp/find-${origin}-exit-waived.cpp" \
+    "$test_tmp/find-${origin}-exit-waived"
+  assert_exit_waived_rejected "$origin" \
+    "$test_tmp/find-${origin}-exit-waived.cpp" \
+    "$test_tmp/find-${origin}-exit-waived"
+done
+
+translate "$fixtures/sample_helper_find_device_official_exit_waived.cu" \
+  "$fixtures/nvidia_samples/Common" \
+  "$test_tmp/find-command-line-exit-waived.cpp" \
+  "$test_tmp/find-command-line-exit-waived" \
+  '-DEXIT_WAIVED=2'
+assert_exit_waived_rejected command-line \
+  "$test_tmp/find-command-line-exit-waived.cpp" \
+  "$test_tmp/find-command-line-exit-waived"
+
+for mutation in value body; do
+  mutation_dir="$test_tmp/helper-image-exit-$mutation"
+  mkdir -p "$mutation_dir"
+  cp "$fixtures/nvidia_samples/Common/helper_functions.h" \
+    "$mutation_dir/helper_functions.h"
+  if [ "$mutation" = value ]; then
+    sed 's/^#define EXIT_WAIVED 2$/#define EXIT_WAIVED 3/' \
+      "$fixtures/nvidia_samples/Common/helper_image.h" \
+      >"$mutation_dir/helper_image.h"
+  else
+    sed 's/^#define EXIT_WAIVED 2$/#define EXIT_WAIVED (1 + 1)/' \
+      "$fixtures/nvidia_samples/Common/helper_image.h" \
+      >"$mutation_dir/helper_image.h"
+  fi
+  translate "$fixtures/sample_helper_find_device_official_exit_waived.cu" \
+    "$mutation_dir" \
+    "$test_tmp/find-mutated-$mutation-exit-waived.cpp" \
+    "$test_tmp/find-mutated-$mutation-exit-waived" \
+    "-I$fixtures/nvidia_samples/Common"
+  assert_exit_waived_rejected "mutated-$mutation" \
+    "$test_tmp/find-mutated-$mutation-exit-waived.cpp" \
+    "$test_tmp/find-mutated-$mutation-exit-waived"
+done
+
+shadow_dir="$test_tmp/helper-functions-shadow"
+mkdir -p "$shadow_dir"
+printf '%s\n' \
+  '#ifndef COMMON_HELPER_FUNCTIONS_H_' \
+  '#define COMMON_HELPER_FUNCTIONS_H_' \
+  '#define EXIT_WAIVED 2' \
+  '#endif' >"$shadow_dir/helper_functions.h"
+translate "$fixtures/sample_helper_find_device_official_exit_waived.cu" \
+  "$shadow_dir" \
+  "$test_tmp/find-shadow-exit-waived.cpp" \
+  "$test_tmp/find-shadow-exit-waived" \
+  "-I$fixtures/nvidia_samples/Common"
+assert_exit_waived_rejected shadow \
+  "$test_tmp/find-shadow-exit-waived.cpp" \
+  "$test_tmp/find-shadow-exit-waived"
+
+assert_max_rejected() {
+  output=$1
+  log=$2
+  require_fixed '#include <helper_cuda.h>' "$output"
+  require_fixed 'findCudaDevice(argc, argv)' "$output"
+  forbid_fixed 'sampleFindCudaDevice' "$output"
+  require_fixed "macro dependency 'MAX'" "$log.stderr"
+  require_fixed 'include kept' "$log.stderr"
+}
+
+for max_origin in user redefined; do
+  translate "$fixtures/sample_helper_find_device_${max_origin}_max.cu" \
+    "$fixtures/nvidia_samples/Common" \
+    "$test_tmp/find-${max_origin}-max.cpp" \
+    "$test_tmp/find-${max_origin}-max"
+  assert_max_rejected \
+    "$test_tmp/find-${max_origin}-max.cpp" \
+    "$test_tmp/find-${max_origin}-max"
+done
+
+translate "$fixtures/sample_helper_find_device_official_exit_waived.cu" \
+  "$fixtures/nvidia_samples/Common" \
+  "$test_tmp/find-command-line-max.cpp" \
+  "$test_tmp/find-command-line-max" \
+  '-DMAX(a,b)=((a>b)?a:b)'
+assert_max_rejected \
+  "$test_tmp/find-command-line-max.cpp" \
+  "$test_tmp/find-command-line-max"
+
+mutated_image_dir="$test_tmp/helper-image-same-size-mutation"
+mkdir -p "$mutated_image_dir"
+cp "$fixtures/nvidia_samples/Common/helper_functions.h" \
+  "$mutated_image_dir/helper_functions.h"
+sed 's/^#define MAX(a, b) ((a > b) ? a : b)$/#define MAX(a, b) ((a < b) ? a : b)/' \
+  "$fixtures/nvidia_samples/Common/helper_image.h" \
+  >"$mutated_image_dir/helper_image.h"
+[ "$(wc -c <"$mutated_image_dir/helper_image.h" | tr -d ' ')" -eq 28739 ]
+translate "$fixtures/sample_helper_find_device_mutated_image_max.cu" \
+  "$mutated_image_dir" \
+  "$test_tmp/find-mutated-image-max.cpp" \
+  "$test_tmp/find-mutated-image-max" \
+  "-I$fixtures/nvidia_samples/Common"
+assert_max_rejected \
+  "$test_tmp/find-mutated-image-max.cpp" \
+  "$test_tmp/find-mutated-image-max"
 
 translate "$fixtures/sample_helper_find_device_discarded_call.cu" \
   "$fixtures/nvidia_samples/Common" \

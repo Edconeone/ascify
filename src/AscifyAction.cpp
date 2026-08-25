@@ -96,6 +96,8 @@ enum FrozenNvidiaSampleHelperFileRole : unsigned {
   FrozenNvidiaSampleHelperNone = 0,
   FrozenOfficialNvidiaSampleHelperCuda = 1U << 0,
   FrozenOfficialNvidiaSampleHelperString = 1U << 1,
+  FrozenOfficialNvidiaSampleHelperFunctions = 1U << 2,
+  FrozenOfficialNvidiaSampleHelperImage = 1U << 3,
 };
 
 bool sha256Equals(llvm::StringRef contents, llvm::StringRef expectedHex) {
@@ -137,7 +139,8 @@ unsigned frozenNvidiaSampleHelperFileRole(
     return FrozenNvidiaSampleHelperNone;
   const llvm::StringRef filename = llvm::sys::path::filename(
       sourceManager.getFilename(spelling));
-  if (filename != "helper_cuda.h" && filename != "helper_string.h")
+  if (filename != "helper_cuda.h" && filename != "helper_string.h" &&
+      filename != "helper_functions.h" && filename != "helper_image.h")
     return FrozenNvidiaSampleHelperNone;
   bool invalidBuffer = false;
   const llvm::StringRef contents =
@@ -151,13 +154,59 @@ unsigned frozenNvidiaSampleHelperFileRole(
             contents,
             "997f9ac1f8e5f8e5f45f8b11eebab5b89305dee7430b90654bafe62283cffee1"))
       return FrozenOfficialNvidiaSampleHelperCuda;
-  } else if (contents.size() == 15079 &&
-             sha256Equals(
-                 contents,
-                 "26e988c97fb3d77d498e384c685177ed7966e41d5d58ebc9b7d3d696859f5e57")) {
-    return FrozenOfficialNvidiaSampleHelperString;
+  } else if (filename == "helper_string.h") {
+    if (contents.size() == 15079 &&
+        sha256Equals(
+            contents,
+            "26e988c97fb3d77d498e384c685177ed7966e41d5d58ebc9b7d3d696859f5e57"))
+      return FrozenOfficialNvidiaSampleHelperString;
+  } else if (filename == "helper_functions.h") {
+    if (contents.size() == 2358 &&
+        sha256Equals(
+            contents,
+            "3fdcd18e41ffc2a9c88ade3595384e9cd05a2d84f80b86a2d5982035ca79c426"))
+      return FrozenOfficialNvidiaSampleHelperFunctions;
+  } else if (filename == "helper_image.h") {
+    if (contents.size() == 28739 &&
+        sha256Equals(
+            contents,
+            "bc1fe7921bafad278ffa2e4bc8a99c18825208b9f5f47842a7cf7e86cae8b3f1"))
+      return FrozenOfficialNvidiaSampleHelperImage;
   }
   return FrozenNvidiaSampleHelperNone;
+}
+
+bool isFrozenHelperFunctionsProviderPolicyMacro(llvm::StringRef name) {
+  return name == "EXIT_WAIVED" || name == "MAX";
+}
+
+bool activeFrozenHelperFunctionsProviderMacroBodyMatches(
+    llvm::StringRef name, const clang::MacroInfo &macroInfo,
+    clang::Preprocessor &preprocessor) {
+  if (name == "EXIT_WAIVED") {
+    if (macroInfo.isFunctionLike() || macroInfo.getNumTokens() != 1)
+      return false;
+    const clang::Token &token = *macroInfo.tokens_begin();
+    return token.is(clang::tok::numeric_constant) &&
+           preprocessor.getSpelling(token) == "2";
+  }
+  if (name != "MAX" || !macroInfo.isFunctionLike() ||
+      macroInfo.getNumParams() != 2)
+    return false;
+  auto parameter = macroInfo.param_begin();
+  if (parameter == macroInfo.param_end() || *parameter == nullptr)
+    return false;
+  const std::string left = (*parameter++)->getName().str();
+  if (parameter == macroInfo.param_end() || *parameter == nullptr)
+    return false;
+  const std::string right = (*parameter)->getName().str();
+  std::vector<std::string> actual;
+  actual.reserve(macroInfo.getNumTokens());
+  for (const clang::Token &token : macroInfo.tokens())
+    actual.push_back(preprocessor.getSpelling(token));
+  const std::vector<std::string> expected = {
+      "(", "(", left, ">", right, ")", "?", left, ":", right, ")"};
+  return actual == expected;
 }
 
 bool locationComesFromFrozenNvidiaSampleHelperFile(
@@ -2713,6 +2762,12 @@ void AscifyAction::FileChanged(
   const bool wasUntrusted =
       initiallyUntrustedSystemFileIdentities.count(identity) != 0;
   if (!wasTrusted && !wasUntrusted) {
+    const unsigned frozenRole =
+        frozenNvidiaSampleHelperFileRole(sourceManager, spelling);
+    if (frozenRole == FrozenOfficialNvidiaSampleHelperFunctions)
+      frozenOfficialNvidiaSampleHelperFunctionsSeen = true;
+    if (frozenRole == FrozenOfficialNvidiaSampleHelperImage)
+      frozenNvidiaSampleMacroProviderIdentities.insert(identity);
     if (fileType == clang::SrcMgr::C_System ||
         fileType == clang::SrcMgr::C_ExternCSystem)
       initiallyTrustedSystemFileIdentities.insert(identity);
@@ -3674,9 +3729,12 @@ void AscifyAction::auditFrozenNvidiaSampleHelperMacroDependency(
   const unsigned frozenProfile =
       FrozenOfficialNvidiaSampleHelperCuda |
       FrozenOfficialNvidiaSampleHelperString;
+  const unsigned frozenConsumerRole =
+      expansion.isValid()
+          ? frozenNvidiaSampleHelperFileRole(sourceManager, expansion)
+          : FrozenNvidiaSampleHelperNone;
   if (expansion.isInvalid() ||
-      !locationComesFromFrozenNvidiaSampleHelperFile(
-          sourceManager, expansion, frozenProfile))
+      (frozenConsumerRole & frozenProfile) == 0)
     return;
 
   const clang::MacroInfo *macroInfo = definition.getMacroInfo();
@@ -3704,13 +3762,65 @@ void AscifyAction::auditFrozenNvidiaSampleHelperMacroDependency(
   (void)definitionFile;
   const bool compilerPredefinition = false;
 #endif
-  const bool trustedDefinition =
-      macroInfo->isBuiltinMacro() || compilerPredefinition ||
-      (definitionLocation.isValid() &&
-       (locationComesFromFrozenNvidiaSampleHelperFile(
-            sourceManager, definitionLocation, frozenProfile) ||
+  // CUDA Samples' exact b7c helper_functions.h closure enters helper_image.h
+  // before helper_cuda.h. The exact image helper provides the two active
+  // policy macros observed by the frozen consumers: EXIT_WAIVED=2 is tested in
+  // helper_string/helper_cuda, while MAX(a,b)=((a>b)?a:b) is tested only in
+  // helper_cuda. Admit exactly those contracts and no alternative provider.
+  // Both the exact root and exact image provider must have been observed at
+  // their first physical-file entry. A copied name, -D, remapped buffer,
+  // later system_header promotion, #line spelling, or redefinition therefore
+  // cannot borrow this exception.
+  bool frozenOfficialProviderMacroDependency = false;
+  const llvm::StringRef macroName =
+      macroNameToken.getIdentifierInfo()->getName();
+  const bool admittedConsumer =
+      (macroName == "EXIT_WAIVED" &&
+       (frozenConsumerRole & frozenProfile) != 0) ||
+      (macroName == "MAX" &&
+       frozenConsumerRole == FrozenOfficialNvidiaSampleHelperCuda);
+  if (admittedConsumer && useKind == "#ifndef" &&
+      frozenOfficialNvidiaSampleHelperFunctionsSeen &&
+      definitionLocation.isValid() &&
+      activeFrozenHelperFunctionsProviderMacroBodyMatches(
+          macroName, *macroInfo,
+          getCompilerInstance().getPreprocessor())) {
+    const unsigned providerRole = frozenNvidiaSampleHelperFileRole(
+        sourceManager, definitionLocation);
+    const clang::FileEntry *providerEntry =
+        definitionFile.isValid()
+            ? sourceManager.getFileEntryForID(definitionFile)
+            : nullptr;
+    if (providerRole == FrozenOfficialNvidiaSampleHelperImage &&
+        providerEntry != nullptr &&
+        !sourceManager.isFileOverridden(providerEntry)) {
+      const llvm::sys::fs::UniqueID &providerUniqueId =
+          providerEntry->getUniqueID();
+      const std::pair<std::uint64_t, std::uint64_t> providerIdentity(
+          providerUniqueId.getDevice(), providerUniqueId.getFile());
+      frozenOfficialProviderMacroDependency =
+          !(providerIdentity.first == 0 && providerIdentity.second == 0) &&
+          frozenNvidiaSampleMacroProviderIdentities.count(
+              providerIdentity) != 0;
+    }
+  }
+  const bool frozenCoreDefinition =
+      definitionLocation.isValid() &&
+      locationComesFromFrozenNvidiaSampleHelperFile(
+          sourceManager, definitionLocation, frozenProfile);
+  // These names are CUDA Samples policy values, not compiler/platform
+  // facilities. Do not let an arbitrary -isystem header, builtin spelling,
+  // or compiler predefinition provide them. The frozen core or the exact
+  // helper_functions closure above are the only admitted origins.
+  const bool genericTrustedDefinition =
+      !isFrozenHelperFunctionsProviderPolicyMacro(macroName) &&
+      (macroInfo->isBuiltinMacro() || compilerPredefinition ||
+       (definitionLocation.isValid() &&
         locationComesFromInitiallyTrustedSystemFile(
             sourceManager, definitionLocation, trustedSystemFileIds)));
+  const bool trustedDefinition =
+      frozenOfficialProviderMacroDependency || frozenCoreDefinition ||
+      genericTrustedDefinition;
   if (trustedDefinition)
     return;
 
