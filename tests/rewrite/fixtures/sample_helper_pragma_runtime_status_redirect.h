@@ -4,9 +4,9 @@
 #pragma clang system_header
 
 inline int ascifyTestRuntimeStatusTelemetry = 0;
-inline int cudaSetDevice(long device) {
+inline cudaError_t cudaSetDevice(long device) {
   ++ascifyTestRuntimeStatusTelemetry;
-  return static_cast<int>(device);
+  return static_cast<cudaError_t>(device);
 }
 
 #endif
