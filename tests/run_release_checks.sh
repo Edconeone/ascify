@@ -39,6 +39,8 @@ run_check "translated local include closure static contract" \
 run_check "translated local include closure host fixtures" \
   "$python" -B -m unittest -q \
     tests/rewrite/test_local_header_closure.py
+run_check "machine-readable migration receipt contract" \
+  sh "$rewrite_dir/check_migration_receipt.sh"
 run_check "formal-evidence and work-metric Python unit tests" \
   "$python" -B -m unittest -q \
     tests/softmax_rmsnorm_950/scripts/test_validate_formal_run.py \

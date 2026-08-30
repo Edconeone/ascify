@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in `--migration-receipt=<path>` output with deterministic JSON,
+  per-input source-conversion stages, explicit contract selections, and
+  fail-closed atomic publication.
 - Lazy CUDA-runtime-compatible ACL lifecycle, memory, device, stream, and
   event adapters, including ordered process-exit cleanup and parameter-root
   GM atomic compatibility.

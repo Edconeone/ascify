@@ -172,10 +172,32 @@ Where `--clang-resource-directory` specifies `lib/clang/23`, which is in the **i
 | `--target-policy=portable\|dav-c310-vec` | Select conservative output or opt in to validated dav-c310 SIMT rewrites |
 | `--simt-math=precise\|fast` | Keep precise semantics or enable guarded fast-SIMT transformations |
 | `--target-recipe=none\|dav-3510-rowwise-simd-v1` | Explicitly enable the versioned, externally linked row-wise SIMD+SIMT hybrid dispatch; default `none` |
+| `--migration-receipt=<path>` | Atomically write an opt-in, deterministic JSON result for this source-conversion invocation |
 | `--no-lower-device-double-params` | Preserve by-value scalar `double` parameters on CUDA `__global__` functions |
 | `-versions` | Print supported third-party version range |
 
 Full list: run **`ascify-clang --help`**.
+
+### Machine-readable migration receipt
+
+Use `--migration-receipt=<path>` when an experiment runner needs a stable
+source-conversion result instead of parsing diagnostics:
+
+```bash
+ascify-clang input.cu \
+  --target-policy=dav-c310-vec \
+  --target-recipe=none \
+  --migration-receipt=/tmp/input.receipt.json \
+  -o /tmp/input.cu.dpp
+```
+
+The target directory must already exist, and the receipt path must differ from
+the input, translated output, and statistics output. Ascify first publishes an
+`in_progress` receipt, then atomically replaces it with `succeeded` or
+`failed`. The JSON records the selected frontend, local-header, target, and
+output contracts plus a stable per-input stage result. It does not claim target
+compilation, linking, device execution, numerical correctness, or performance.
+Full compiler diagnostics remain on standard error.
 
 ### Frontend compatibility and local-header boundaries
 

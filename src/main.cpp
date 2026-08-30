@@ -21,7 +21,9 @@ THE SOFTWARE.
 */
 
 #include <fstream>
+#include <memory>
 #include <set>
+#include <utility>
 #include "LLVMCompat.h"
 #include "AscifyAction.h"
 #include "ArgParse.h"
@@ -45,6 +47,8 @@ THE SOFTWARE.
 #include "LocalHeader.h"
 #include "ImplicitCudaHeaders.h"
 #include "FrontendCompatibility.h"
+#include "MigrationReceipt.h"
+#include "MigrationReceiptIO.h"
 
 #if LLVM_VERSION_MAJOR < 8
 #include "llvm/Support/Path.h"
@@ -327,6 +331,44 @@ void printVersions() {
   llvm::errs() << "\n" << sAscify << "Supports cuDNN from " << Statistics::getCudaVersion(cudaVersions::CUDNN_705) << " up to " << Statistics::getCudaVersion(cudaVersions::CUDNN_LATEST) << " \n";
 }
 
+std::string migrationReceiptLocalHeaderMode() {
+  if (OptLocalHeadersRecursive)
+    return "recursive";
+  if (OptLocalHeaders)
+    return "direct";
+  return "disabled";
+}
+
+std::string migrationReceiptOutputMode() {
+  if (NoOutput)
+    return "no_output";
+  if (Inplace)
+    return "inplace";
+  if (!OutputDir.empty())
+    return "output_directory";
+  if (!OutputFilename.empty())
+    return "output_file";
+  return "side_by_side";
+}
+
+std::string normalizedPathForReceiptComparison(const std::string &path) {
+  if (path.empty())
+    return "";
+  SmallString<256> normalized(path);
+  std::error_code ec = sys::fs::make_absolute(normalized);
+  if (ec)
+    return path;
+  sys::path::remove_dots(normalized, true);
+  return normalized.str().str();
+}
+
+bool migrationReceiptPathConflicts(const std::string &receiptPath,
+                                   const std::string &artifactPath) {
+  return !receiptPath.empty() && !artifactPath.empty() &&
+         normalizedPathForReceiptComparison(receiptPath) ==
+             normalizedPathForReceiptComparison(artifactPath);
+}
+
 int main(int argc, const char **argv) {
   std::vector<const char*> new_argv(argv, argv + argc);
   std::string sCompilationDatabaseDir;
@@ -466,20 +508,144 @@ int main(int argc, const char **argv) {
     if (!OutputDir.empty()) {
       OutputStatsFilename = sOutputDirAbsPath + "/" + OutputStatsFilename;
     }
+  }
+
+  if (!MigrationReceiptPath.empty()) {
+    for (const std::string &source : fileSources) {
+      if (migrationReceiptPathConflicts(MigrationReceiptPath, source)) {
+        llvm::errs() << sAscify << sConflict
+                     << "migration receipt path and source path are the same: "
+                     << source << "\n";
+        return 1;
+      }
+
+      std::string prospectiveOutput;
+      if (!NoOutput) {
+        if (Inplace) {
+          prospectiveOutput = source;
+        } else if (!OutputFilename.empty()) {
+          prospectiveOutput = dst;
+        } else if (!OutputDir.empty()) {
+          prospectiveOutput =
+              sOutputDirAbsPath + "/" +
+              sys::path::filename(source).str() + ".dpp";
+        } else {
+          prospectiveOutput = source + ".dpp";
+        }
+      }
+      if (migrationReceiptPathConflicts(MigrationReceiptPath,
+                                        prospectiveOutput)) {
+        llvm::errs() << sAscify << sConflict
+                     << "migration receipt path and translated output path "
+                        "are the same: "
+                     << prospectiveOutput << "\n";
+        return 1;
+      }
+      if (!TemporaryDir.empty()) {
+        const std::string prospectiveTemporary =
+            sTmpDirAbsParh + "/" +
+            sys::path::filename(source).str() + ".dpp";
+        if (migrationReceiptPathConflicts(MigrationReceiptPath,
+                                          prospectiveTemporary)) {
+          llvm::errs() << sAscify << sConflict
+                       << "migration receipt path and conversion temporary "
+                          "path are the same: "
+                       << prospectiveTemporary << "\n";
+          return 1;
+        }
+      }
+      if (PrintStatsCSV && !create_csv) {
+        std::string prospectiveStatistics =
+            sys::path::filename(source).str() + ".csv";
+        if (!OutputDir.empty()) {
+          prospectiveStatistics =
+              sOutputDirAbsPath + "/" + prospectiveStatistics;
+        }
+        if (migrationReceiptPathConflicts(MigrationReceiptPath,
+                                          prospectiveStatistics)) {
+          llvm::errs() << sAscify << sConflict
+                       << "migration receipt path and statistics output path "
+                          "are the same: "
+                       << prospectiveStatistics << "\n";
+          return 1;
+        }
+      }
+    }
+    if (create_csv &&
+        migrationReceiptPathConflicts(MigrationReceiptPath,
+                                      OutputStatsFilename)) {
+      llvm::errs() << sAscify << sConflict
+                   << "migration receipt path and statistics output path are "
+                      "the same: "
+                   << OutputStatsFilename << "\n";
+      return 1;
+    }
+  }
+
+  std::unique_ptr<ascify::MigrationReceipt> migrationReceipt;
+  if (!MigrationReceiptPath.empty()) {
+    ascify::MigrationReceiptConfig receiptConfig{
+        TargetPolicy,
+        SimtMathMode,
+        TargetRecipe,
+        FrontendCompat,
+        migrationReceiptLocalHeaderMode(),
+        migrationReceiptOutputMode(),
+    };
+    migrationReceipt = std::make_unique<ascify::MigrationReceipt>(
+        std::move(receiptConfig));
+    std::string receiptError;
+    if (!ascify::publishMigrationReceiptAtomically(
+            MigrationReceiptPath, *migrationReceipt, receiptError)) {
+      llvm::errs() << sAscify << sError << receiptError << "\n";
+      return 1;
+    }
+  }
+
+  auto finishWithMigrationReceipt =
+      [&](int result, ascify::MigrationReceiptStatus status,
+          ascify::MigrationReceiptStage stage,
+          const std::string &diagnosticSummary) {
+        if (!migrationReceipt)
+          return result;
+        migrationReceipt->setInvocationResult(status, stage,
+                                              diagnosticSummary);
+        std::string receiptError;
+        if (!ascify::publishMigrationReceiptAtomically(
+                MigrationReceiptPath, *migrationReceipt, receiptError)) {
+          llvm::errs() << sAscify << sError << receiptError << "\n";
+          return 1;
+        }
+        return result;
+      };
+
+  if (create_csv) {
     csv = std::unique_ptr<std::ostream>(new std::ofstream(OutputStatsFilename, std::ios_base::trunc));
   }
   if (PrintStats) {
     statPrint = &llvm::errs();
   }
   Init(argc, argv, fileSources);
+  ascify::MigrationReceiptStage lastReceiptStage =
+      ascify::MigrationReceiptStage::Initialization;
   for (const auto &src : fileSources) {
+    ascify::MigrationReceiptInput receiptInput;
+    receiptInput.input = src;
+    lastReceiptStage = ascify::MigrationReceiptStage::InputResolution;
     // Create a copy of the file to work on. When we're done, we'll move this onto the
     // output (which may mean overwriting the input, if we're in-place).
     // Should we fail for some reason, we'll just leak this file and not corrupt the input.
     sSourceAbsPath = getAbsoluteFilePath(src, EC);
     if (EC) {
+      receiptInput.status = ascify::MigrationReceiptStatus::Failed;
+      receiptInput.stage = ascify::MigrationReceiptStage::InputResolution;
+      receiptInput.diagnosticSummary = "input path could not be resolved";
+      if (migrationReceipt)
+        migrationReceipt->addInputResult(std::move(receiptInput));
+      Result = 1;
       continue;
     }
+    receiptInput.resolvedInput = sSourceAbsPath;
     sourceFileName = sys::path::filename(sSourceAbsPath);
     if (dst.empty()) {
       if (Inplace) {
@@ -491,10 +657,18 @@ int main(int argc, const char **argv) {
         }
       }
     }
+    receiptInput.output = NoOutput ? "" : dst;
+    lastReceiptStage = ascify::MigrationReceiptStage::InputPreparation;
     if (TemporaryDir.empty()) {
       EC = sys::fs::createTemporaryFile(sourceFileName, ext, tmpFile);
       if (EC) {
         llvm::errs() << "\n" << sAscify << sError << EC.message() << ": " << tmpFile << "\n";
+        receiptInput.status = ascify::MigrationReceiptStatus::Failed;
+        receiptInput.stage = ascify::MigrationReceiptStage::InputPreparation;
+        receiptInput.diagnosticSummary =
+            "conversion temporary file could not be created";
+        if (migrationReceipt)
+          migrationReceipt->addInputResult(std::move(receiptInput));
         Result = 1;
         continue;
       }
@@ -505,6 +679,12 @@ int main(int argc, const char **argv) {
     EC = sys::fs::copy_file(src, tmpFile);
     if (EC) {
       llvm::errs() << "\n" << sAscify << sError << EC.message() << ": while copying " << src << " to " << tmpFile << "\n";
+      receiptInput.status = ascify::MigrationReceiptStatus::Failed;
+      receiptInput.stage = ascify::MigrationReceiptStage::InputPreparation;
+      receiptInput.diagnosticSummary =
+          "input could not be copied to the conversion temporary file";
+      if (migrationReceipt)
+        migrationReceipt->addInputResult(std::move(receiptInput));
       Result = 1;
       continue;
     }
@@ -522,6 +702,7 @@ int main(int argc, const char **argv) {
     // Initialise the statistics counters for this file.
     Statistics::setActive(src);
     std::string outputPath = NoOutput ? "" : dst;
+    lastReceiptStage = ascify::MigrationReceiptStage::SourceConversion;
     const bool conversionOk =
         (OptLocalHeaders || OptLocalHeadersRecursive)
             ? ascifySourceWithLocalHeaderClosure(
@@ -537,6 +718,17 @@ int main(int argc, const char **argv) {
       LLVM_DEBUG(llvm::dbgs() << "Hipification failed for: " << src << "\n");
     }
 
+    receiptInput.status = conversionOk
+                              ? ascify::MigrationReceiptStatus::Succeeded
+                              : ascify::MigrationReceiptStatus::Failed;
+    receiptInput.stage = ascify::MigrationReceiptStage::SourceConversion;
+    receiptInput.diagnosticSummary =
+        conversionOk
+            ? "source conversion completed; later pipeline stages are outside this receipt"
+            : "source conversion failed; detailed diagnostics were emitted on stderr";
+    if (migrationReceipt)
+      migrationReceipt->addInputResult(std::move(receiptInput));
+
     Statistics::current().markCompletion();
     Statistics::current().print(csv.get(), statPrint);
     dst.clear();
@@ -544,5 +736,13 @@ int main(int argc, const char **argv) {
   if (fileSources.size() > 1) {
     Statistics::printAggregate(csv.get(), statPrint);
   }
-  return Result;
+  if (Result == 0) {
+    return finishWithMigrationReceipt(
+        Result, ascify::MigrationReceiptStatus::Succeeded,
+        lastReceiptStage,
+        "all requested source conversions completed; target compilation, linking, and device validation are outside this receipt");
+  }
+  return finishWithMigrationReceipt(
+      Result, ascify::MigrationReceiptStatus::Failed, lastReceiptStage,
+      "one or more inputs failed; see per-input results and stderr diagnostics");
 }

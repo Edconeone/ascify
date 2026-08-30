@@ -63,6 +63,7 @@ extern cl::opt<std::string> TargetPolicy;
 extern cl::opt<std::string> SimtMathMode;
 extern cl::opt<std::string> TargetRecipe;
 extern cl::opt<std::string> FrontendCompat;
+extern cl::opt<std::string> MigrationReceiptPath;
 extern cl::opt<bool> CudaKernelExecutionSyntax;
 extern cl::opt<bool> DPPKernelExecutionSyntax;
 extern const std::vector<std::string> ascifyOptions;

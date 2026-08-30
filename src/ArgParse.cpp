@@ -201,6 +201,11 @@ cl::opt<std::string> FrontendCompat("frontend-compat",
   cl::init("none"),
   cl::cat(ToolTemplateCategory));
 
+cl::opt<std::string> MigrationReceiptPath("migration-receipt",
+  cl::desc("Atomically write a deterministic JSON migration receipt"),
+  cl::value_desc("filename"),
+  cl::cat(ToolTemplateCategory));
+
 cl::opt<bool> NoUndocumented("no-undocumented-features",
   cl::desc("Do not rely on undocumented features in code transformation"),
   cl::value_desc("no-undocumented-features"),
@@ -285,4 +290,5 @@ const std::vector<std::string> ascifyOptionsWithTwoArgs {
   std::string(SimtMathMode.ArgStr),
   std::string(TargetRecipe.ArgStr),
   std::string(FrontendCompat.ArgStr),
+  std::string(MigrationReceiptPath.ArgStr),
 };
