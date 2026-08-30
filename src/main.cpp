@@ -20,6 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -354,6 +355,12 @@ std::string migrationReceiptOutputMode() {
 std::string normalizedPathForReceiptComparison(const std::string &path) {
   if (path.empty())
     return "";
+  std::error_code canonicalError;
+  const std::filesystem::path canonical =
+      std::filesystem::weakly_canonical(std::filesystem::path(path),
+                                        canonicalError);
+  if (!canonicalError)
+    return canonical.string();
   SmallString<256> normalized(path);
   std::error_code ec = sys::fs::make_absolute(normalized);
   if (ec)
