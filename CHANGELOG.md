@@ -4,9 +4,9 @@
 
 ### Added
 
-- A Chinese end-to-end user guide covering Linux prerequisites, clean GitHub
-  clone, LLVM-backed build and install, first CUDA source conversion, result
-  verification, mode selection, and troubleshooting.
+- English and Chinese user guides with simple steps for Linux setup, clean
+  GitHub clone, build, install, first CUDA source conversion, result checks,
+  mode selection, and common problems.
 - Opt-in `--migration-receipt=<path>` output with deterministic JSON,
   per-input source-conversion stages, explicit contract selections, and
   fail-closed atomic publication.

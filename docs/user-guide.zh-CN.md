@@ -1,71 +1,79 @@
 # Ascify 使用手册
 
-本文面向第一次使用 Ascify、能够操作 Linux 命令行的开发者。完成本手册后，你将能够在一台新机器上：
+[English](user-guide.en.md) | 简体中文
 
-1. 从 GitHub 克隆 Ascify；
-2. 使用已有或新构建的 LLVM/Clang 编译 `ascify-clang`；
-3. 安装 Ascify 及其配套头文件；
-4. 将仓库自带的 CUDA 示例转换为面向 ACL/DPP/Ascend 兼容层的源码；
-5. 判断“源码转换成功”是否成立，并知道后续目标编译和设备运行还需要什么。
+这份手册写给第一次使用 Ascify 的开发者。你需要会使用 Linux 命令行。
 
-本手册以 Linux x86_64 或 AArch64 为主。Windows SDK 集成、Ascify 内部开发和算子性能调优不在本文范围内。
+读完后，你可以完成这些工作：
 
-## 1. 先理解 Ascify 做什么
+1. 从 GitHub 下载 Ascify。
+2. 编译并安装 `ascify-clang`。
+3. 转换仓库中的 CUDA 示例。
+4. 检查转换是否成功。
+5. 开始转换自己的 CUDA 源码。
 
-Ascify 是基于 Clang 的 CUDA C/C++ **源码转换器**。最基本的工作流是：
+这份手册主要说明 Linux x86_64 和 AArch64 环境。它不说明 Windows SDK 集成、Ascify 内部开发或算子性能调优。
+
+## 1. Ascify 是什么
+
+Ascify 是一个 CUDA C/C++ 源码转换工具。它使用 Clang 读取 CUDA 源码，再把源码改成面向 ACL、DPP 和 Ascend 兼容层的代码。
+
+完整流程有两个部分：
 
 ```text
 CUDA 源码
-  -> ascify-clang 解析并改写
-  -> 面向 ACL/DPP/Ascend 兼容层的 C/C++/CCE 源码
-  -> 使用 CANN/目标工程继续编译、链接和上板验证
+  -> ascify-clang 转换源码
+  -> ACL/DPP/Ascend 兼容源码
+  -> CANN 或目标工程编译、链接和设备测试
 ```
 
-请区分下面两个结果：
+请分清下面两个结果：
 
-| 结果 | 说明 |
+| 结果 | 含义 |
 |---|---|
-| Ascify 返回 0，并生成非空输出 | 仅说明本次源码解析和转换完成 |
-| 生成代码在目标环境编译、链接并通过设备测试 | 才说明对应程序完成了目标侧验证 |
+| Ascify 返回 0，并生成非空文件 | 源码转换完成 |
+| 生成的代码通过编译、链接和设备测试 | 目标程序通过验证 |
 
-运行 Ascify 做源码转换时不需要 NVIDIA GPU，也不需要昇腾 NPU；但机器上必须有可供 Clang 解析的完整 CUDA Toolkit 目录。编译和运行转换后的目标程序通常需要匹配的 CANN 工具链、Ascify 兼容头、目标运行库和昇腾设备。
+源码转换不需要 NVIDIA GPU，也不需要昇腾 NPU。但转换机器上要有完整的 CUDA Toolkit 目录。要编译和运行生成的代码，你还需要 CANN、Ascify 头文件、目标库和昇腾设备。
 
 ## 2. 环境要求
 
-### 2.1 必需依赖
+### 2.1 必需软件
 
-| 依赖 | 用途 | 备注 |
+| 软件 | 用途 | 说明 |
 |---|---|---|
-| Git | 克隆源码 | 任意近期版本 |
-| Bash | 执行 `build.sh` 和 `run.sh` | 脚本使用 Bash 语法 |
-| CMake | 配置 Ascify | Ascify 要求 3.16.8 或更高版本 |
-| Ninja | 默认构建生成器 | 也可用 `CMAKE_GENERATOR` 指定其他生成器 |
-| C/C++ 编译器 | 编译 Ascify | 必须能为当前主机生成程序 |
-| LLVM + Clang 开发构建 | 提供 Clang 前端、库和 CMake 配置 | 仅安装 `clang` 可执行文件通常不够 |
-| CUDA Toolkit 目录 | 解析 CUDA 头文件和内建设施 | 转换机器不要求有 NVIDIA GPU |
+| Git | 下载源码 | 使用近期版本即可 |
+| Bash | 运行 `build.sh` 和 `run.sh` | 这两个脚本使用 Bash |
+| CMake | 配置项目 | Ascify 要求 3.16.8 或更高版本 |
+| Ninja | 构建项目 | `build.sh` 默认使用 Ninja |
+| C/C++ 编译器 | 编译 Ascify | 编译器要支持当前主机 |
+| LLVM 和 Clang 开发文件 | 提供 Clang 前端、库和 CMake 配置 | 只有 `clang` 命令通常不够 |
+| CUDA Toolkit | 提供 CUDA 头文件和 `libdevice` | 不要求有 NVIDIA GPU |
 
-Python 3 不是构建 `ascify-clang` 的硬依赖，但运行仓库测试和读取 JSON 回执时建议安装。
+编译 Ascify 不需要 Python 3。但测试脚本需要 Python 3。Python 3 也方便查看 JSON 回执。
 
-已经验证过的一组参考环境如下。这是可复现参考，不表示只支持这些版本：
+下面这组环境已经通过测试：
 
-| 项目 | 已验证值 |
+| 项目 | 测试值 |
 |---|---|
-| 操作系统/架构 | Linux AArch64 |
-| LLVM/Clang | 23.0.0git，`llvm-project` commit `caf619642a6dbb216969a9450d33dbac5a8d30df` |
-| CUDA 解析目录 | CUDA Toolkit 12.8 完整布局 |
+| 系统 | Linux AArch64 |
+| LLVM/Clang | 23.0.0git，commit `caf619642a6dbb216969a9450d33dbac5a8d30df` |
+| CUDA Toolkit | 12.8 |
 | CMake | 4.3.4 |
 | Ninja | 1.13.0 |
 
+其他版本也可能可用。上表只给出已经测试过的版本。
+
 ### 2.2 安装基础工具
 
-以 Ubuntu/Debian 为例：
+Ubuntu 或 Debian 用户可以运行：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake git ninja-build python3
 ```
 
-其他发行版请安装同名或等价软件包。先检查命令是否可用：
+其他 Linux 发行版请安装同类软件包。安装后运行：
 
 ```bash
 git --version
@@ -74,13 +82,13 @@ ninja --version
 python3 --version
 ```
 
-如果发行版自带的 CMake 太旧，请按 CMake 官方方式升级。若还需要从源码编译 LLVM，应同时满足该 LLVM 版本自己的 CMake 最低版本要求。
+如果 CMake 低于 3.16.8，请先升级。LLVM 也可能要求更高版本的 CMake。请按你所用 LLVM 版本的要求准备环境。
 
-## 3. 准备 LLVM/Clang
+## 3. 准备 LLVM 和 Clang
 
-### 3.1 使用已有 LLVM 构建树
+### 3.1 使用已有的 LLVM 构建目录
 
-这是最快、也是当前验证过的方式。Ascify 需要一个已经配置并编译好的 `llvm-project`，其中至少应包含：
+最快的做法是使用已经编译好的 `llvm-project`。目录中要有这些文件：
 
 ```text
 llvm-project/
@@ -93,12 +101,16 @@ llvm-project/
     └── lib/cmake/llvm/LLVMConfig.cmake
 ```
 
-设置路径并检查：
+设置路径：
 
 ```bash
 export LLVM_PROJECT_PATH=/path/to/llvm-project
 export LLVM_BUILD_DIR="$LLVM_PROJECT_PATH/build"
+```
 
+检查文件和工具：
+
+```bash
 test -x "$LLVM_BUILD_DIR/bin/clang"
 test -x "$LLVM_BUILD_DIR/bin/clang++"
 test -f "$LLVM_BUILD_DIR/lib/cmake/llvm/LLVMConfig.cmake"
@@ -108,17 +120,17 @@ test -f "$LLVM_BUILD_DIR/lib/cmake/clang/ClangConfig.cmake"
 "$LLVM_BUILD_DIR/bin/llvm-config" --host-target
 ```
 
-最后一条命令应打印当前主机可用的 target triple。LLVM 只包含 NVPTX/AArch64 等非当前主机后端、或 `LLVM_DEFAULT_TARGET_TRIPLE` 为空时，CMake 的编译器检查可能失败。
+最后一条命令要显示当前主机的 target triple。如果没有输出，CMake 的编译器检查可能会失败。如果 LLVM 没有当前主机的后端，这项检查也可能失败。
 
-### 3.2 没有 LLVM 时从源码构建
+### 3.2 从源码编译 LLVM
 
-下面给出一个最小参考配置。LLVM 本身的编译会占用较多时间、内存和磁盘；请先阅读 [LLVM CMake 构建说明](https://llvm.org/docs/CMake.html)。
+如果机器上没有合适的 LLVM，你可以从源码编译。LLVM 的编译会使用很多时间、内存和磁盘。开始前请看 [LLVM CMake 构建说明](https://llvm.org/docs/CMake.html)。
 
 ```bash
 git clone https://github.com/llvm/llvm-project.git
 cd llvm-project
 
-# 可选：切到 Ascify 已验证过的 LLVM 快照。
+# 可选：使用 Ascify 已测试过的 LLVM commit。
 git checkout caf619642a6dbb216969a9450d33dbac5a8d30df
 
 case "$(uname -m)" in
@@ -130,7 +142,7 @@ case "$(uname -m)" in
     LLVM_HOST_TARGET=AArch64
     LLVM_HOST_TRIPLE=aarch64-unknown-linux-gnu
     ;;
-  *) echo "请为当前架构选择 LLVM target" >&2; exit 1 ;;
+  *) echo "请为当前主机选择 LLVM target" >&2; exit 1 ;;
 esac
 
 cmake -S llvm -B build -G Ninja \
@@ -143,18 +155,20 @@ cmake --build build --target clang lld --parallel 2
 cd ..
 ```
 
-构建完成后设置：
+编译完成后设置：
 
 ```bash
 export LLVM_PROJECT_PATH=/path/to/llvm-project
 export LLVM_BUILD_DIR="$LLVM_PROJECT_PATH/build"
 ```
 
-如果使用发行版提供的 LLVM 开发包，`LLVM_BUILD_DIR` 应指向同时包含 `bin/clang`、LLVM CMake 配置和 Clang CMake 配置的前缀。不同发行版会拆分这些文件；缺少 `ClangConfig.cmake` 时，请安装对应的 Clang development package，或改用完整源码构建树。
+你也可以使用 Linux 发行版提供的 LLVM 开发包。这时，`LLVM_BUILD_DIR` 要指向一个完整目录。这个目录要有 `bin/clang`、LLVM CMake 配置和 Clang CMake 配置。如果缺少 `ClangConfig.cmake`，请安装对应的 Clang 开发包，或使用完整的 LLVM 源码构建目录。
 
-## 4. 准备 CUDA 解析目录
+## 4. 准备 CUDA Toolkit
 
-安装适合当前主机架构的 CUDA Toolkit，或使用已有的完整 Toolkit 目录。安装方法参见 [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)。常见路径是 `/usr/local/cuda`：
+Ascify 使用 CUDA Toolkit 来解析 CUDA 源码。转换机器不需要 NVIDIA GPU。
+
+请安装适合当前主机的 CUDA Toolkit。你也可以使用已有的完整 Toolkit 目录。安装方法请看 [CUDA Linux 安装手册](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)。常见路径是 `/usr/local/cuda`：
 
 ```bash
 export CUDA_PATH=/usr/local/cuda
@@ -164,11 +178,11 @@ test -f "$CUDA_PATH/include/cuda_runtime.h"
 test -d "$CUDA_PATH/nvvm"
 ```
 
-只有头文件、没有 `nvvm`/`libdevice` 的裁剪目录可能无法让 Clang 完成 CUDA 检测。`CUDA_PATH` 应指向 Toolkit 根目录，而不是它的 `include` 子目录。
+`CUDA_PATH` 要指向 Toolkit 根目录，不要指向 `include` 目录。只有头文件、没有 `nvvm` 或 `libdevice` 的目录可能无法工作。
 
-## 5. 克隆并编译 Ascify
+## 5. 下载、编译和安装 Ascify
 
-### 5.1 克隆
+### 5.1 下载源码
 
 ```bash
 git clone https://github.com/Edconeone/ascify.git
@@ -178,11 +192,11 @@ git rev-parse HEAD
 git status --short --branch
 ```
 
-记录 commit 有助于复现转换结果。
+请保存 commit 值。以后可以用它重复同一次转换。
 
 ### 5.2 编译
 
-确认第 3 节中的变量仍然有效，然后执行：
+先确认第 3 节中的两个 LLVM 变量仍然有效。然后运行：
 
 ```bash
 export LLVM_PROJECT_PATH=/path/to/llvm-project
@@ -192,22 +206,23 @@ export ASCIFY_BUILD_JOBS=2
 ./build.sh
 ```
 
-`build.sh` 默认会：
+`build.sh` 默认使用下面的设置：
 
-- 使用 Ninja；
-- 生成 Release 构建；
-- 将构建目录设为仓库内的 `build/`；
-- 将默认安装目录设为仓库内的 `ascify_install/`；
-- 优先使用 LLVM 构建树中的 `clang`、`clang++` 和 `lld`。
+- 构建工具：Ninja。
+- 构建类型：Release。
+- 构建目录：`build/`。
+- 安装目录：`ascify_install/`。
+- C/C++ 编译器：LLVM 构建目录中的 `clang` 和 `clang++`。
+- 链接器：LLVM 构建目录中的 `lld`，如果该文件存在。
 
-检查二进制：
+检查生成的程序：
 
 ```bash
 test -x build/ascify-clang
 build/ascify-clang --help >/dev/null
 ```
 
-如果 LLVM 的 stage-1 编译器不能为当前主机生成程序，可显式选择系统编译器：
+如果 LLVM 中的 `clang` 不能编译当前主机程序，请使用系统编译器：
 
 ```bash
 export ASCIFY_CC=/usr/bin/clang
@@ -215,7 +230,7 @@ export ASCIFY_CXX=/usr/bin/clang++
 ./build.sh
 ```
 
-常用覆盖项：
+你也可以改构建目录、安装目录、并行任务数和生成器：
 
 ```bash
 export BUILD_DIR="$PWD/build-release"
@@ -225,11 +240,11 @@ export CMAKE_GENERATOR=Ninja
 ./build.sh
 ```
 
-后续命令要使用同一个 `BUILD_DIR` 和 `INSTALL_ROOT`。
+如果你改了这些路径，后面的命令也要使用新路径。
 
 ### 5.3 安装
 
-使用默认目录时执行：
+如果你使用默认构建目录，请运行：
 
 ```bash
 cmake --install build
@@ -239,11 +254,13 @@ test -f ascify_install/include/ascify/include/__clang_cuda_runtime_wrapper.h
 test -f ascify_install/include/ascify/ascify_cuda_compat.hpp
 ```
 
-安装步骤会复制 Ascify 二进制、兼容层头文件、frontend compatibility profile 和当前 Clang resource headers。不要只复制单个 `ascify-clang` 文件到另一台机器；二进制仍需要匹配的 resource headers，并可能依赖 LLVM 的共享库。
+安装命令会复制 Ascify 程序、兼容头文件、前端兼容文件和 Clang resource headers。
+
+不要只把 `ascify-clang` 复制到另一台机器。程序还需要匹配的 resource headers。它也可能需要 LLVM 共享库。
 
 ## 6. 完成第一次转换
 
-以下命令使用仓库自带的 `examples/vector_add.cu`，选择纯 SIMT 目标策略，并生成机器可读的迁移回执。
+下面的命令会转换 `examples/vector_add.cu`。它使用纯 SIMT 模式，并生成一个 JSON 回执。
 
 ```bash
 export CUDA_PATH=/usr/local/cuda
@@ -261,20 +278,20 @@ mkdir -p generated
   -- -std=c++17
 ```
 
-如果 CUDA Toolkit 不在 `/usr/local/cuda`，把 `CUDA_PATH` 改成实际根目录。`run.sh` 会将 `CUDA_PATH` 和 `CLANG_RESOURCE_DIRECTORY` 转换成 Ascify 参数，并调用 `ASCIFY_BINARY`。
+如果 CUDA Toolkit 不在 `/usr/local/cuda`，请改为实际路径。`run.sh` 会读取三个环境变量。然后它会调用 `ASCIFY_BINARY`。
 
-命令末尾的 `--` 用于分隔 Ascify 选项和普通 Clang 选项。上例中的 `-std=c++17` 会传给 Clang，而不会被当作 Ascify 选项。
+命令末尾的 `--` 用来分开 Ascify 选项和 Clang 选项。这里的 `-std=c++17` 会传给 Clang。
 
-### 6.1 验证结果
+### 6.1 检查结果
 
-如果转换命令没有报错退出，再检查输出文件：
+如果转换命令没有报错，请检查输出文件：
 
 ```bash
 test -s generated/vector_add.cu.dpp
 test -s generated/vector_add.receipt.json
 ```
 
-再检查关键改写和回执状态：
+再检查主要改写和回执状态：
 
 ```bash
 grep -E 'ascify_cuda_compat|acl/acl.h|aclrtMalloc' \
@@ -284,16 +301,18 @@ grep -Eq '"status"[[:space:]]*:[[:space:]]*"succeeded"' \
   generated/vector_add.receipt.json
 ```
 
-回执中的成功状态只覆盖 `source_conversion`。它不会声称目标编译、链接、设备执行、数值正确性或性能已经通过。
+回执中的 `succeeded` 只表示源码转换完成。它不表示目标编译、链接、设备运行、数值检查或性能测试已经通过。
 
-### 6.2 不安装也可以转换
+### 6.2 不安装时如何转换
 
-如果只执行了构建而没有执行 `cmake --install`，可直接使用 LLVM 的 resource directory：
+如果你只编译了 Ascify，没有运行安装命令，请使用 LLVM 的 resource directory：
 
 ```bash
 export ASCIFY_BINARY="$PWD/build/ascify-clang"
 export CLANG_RESOURCE_DIRECTORY="$("$LLVM_BUILD_DIR/bin/clang" -print-resource-dir)"
 export CUDA_PATH=/usr/local/cuda
+
+mkdir -p generated
 
 ./run.sh examples/vector_add.cu \
   --target-policy=dav-c310-vec \
@@ -303,11 +322,11 @@ export CUDA_PATH=/usr/local/cuda
   -- -std=c++17
 ```
 
-安装后的 resource 目录更适合固定和记录一次转换环境，因此正式转换建议先安装。
+安装目录更适合长期使用。它也更容易记录和检查。
 
 ## 7. 转换自己的源码
 
-### 7.1 单个源文件
+### 7.1 转换一个文件
 
 ```bash
 ./run.sh /path/to/project/kernel.cu \
@@ -318,16 +337,16 @@ export CUDA_PATH=/usr/local/cuda
   -- -std=c++17 -I/path/to/project/include -DMY_FEATURE=1
 ```
 
-传给 Clang 的 include、宏、语言标准和 sysroot 应与原项目的实际编译条件一致。源码在原工程中能由 `nvcc` 编译，不代表在缺少相同 `-I`、`-D` 或生成头文件时也能被 Ascify 解析。
+请把原项目需要的 include 路径、宏、语言标准和 sysroot 传给 Clang。把这些选项放在 `--` 后面。
 
-### 7.2 带本地头文件的源码
+原源码可以由 `nvcc` 编译，不代表 Ascify 一定能直接解析。如果缺少 `-I`、`-D` 或生成的头文件，Ascify 仍会失败。
 
-默认只转换主输入文件。要收拢双引号引用的用户本地头文件，可选择：
+### 7.2 一起转换本地头文件
 
-- `--local-headers`：只处理主文件直接包含的合格本地头；
-- `--local-headers-recursive`：递归处理合格的本地头闭包。
+Ascify 默认只转换输入文件。你可以让它一起转换双引号引用的本地头文件：
 
-示例：
+- `--local-headers`：只处理输入文件直接引用的本地头文件。
+- `--local-headers-recursive`：继续处理这些头文件引用的本地头文件。
 
 ```bash
 ./run.sh /path/to/project/kernel.cu \
@@ -338,11 +357,11 @@ export CUDA_PATH=/usr/local/cuda
   -- -std=c++17 -I/path/to/project/include
 ```
 
-转换后的头文件会发布到 `generated/kernel.cu.dpp.headers/`。该功能不处理任意系统头，也不会自动放宽 CUDA API 支持范围。完整边界见[本地头文件闭包说明](local-header-closure.md)。
+转换后的头文件会放在 `generated/kernel.cu.dpp.headers/`。这个选项不会处理所有系统头文件，也不会增加 Ascify 支持的 CUDA API。详细规则请看 [本地头文件说明](local-header-closure.md)。
 
-### 7.3 直接调用二进制
+### 7.3 直接运行 `ascify-clang`
 
-不使用 `run.sh` 时，最小形式为：
+你也可以不用 `run.sh`：
 
 ```bash
 "$ASCIFY_BINARY" /path/to/input.cu \
@@ -357,16 +376,16 @@ export CUDA_PATH=/usr/local/cuda
 
 ## 8. 选择转换模式
 
-建议第一次先使用 `dav-c310-vec + precise + target-recipe=none`，确认基础解析和转换链路正常，再按需求启用更窄的优化路径。
+第一次转换时，建议使用 `dav-c310-vec + precise + target-recipe=none`。先检查基本流程。基本流程通过后，再试其他模式。
 
-| 目标 | 关键选项 | 说明 |
+| 目标 | 选项 | 说明 |
 |---|---|---|
-| 保守默认转换 | `--target-policy=portable --simt-math=precise` | 两项都是默认值 |
-| 面向 dav-c310 的纯 SIMT 转换 | `--target-policy=dav-c310-vec --target-recipe=none` | `target-recipe=none` 是默认值 |
-| 允许已守护的 fast-SIMT 改写 | 再加 `--simt-math=fast` | 可能改变浮点转换策略，需目标验证 |
-| 950PR row-wise SIMD+SIMT Hybrid | 再加 `--target-recipe=dav-3510-rowwise-simd-v1` | 只接受已证明的 Softmax/RMSNorm/LayerNorm 结构 |
+| 保守模式 | `--target-policy=portable --simt-math=precise` | 这是默认设置 |
+| dav-c310 纯 SIMT | `--target-policy=dav-c310-vec --target-recipe=none` | 不启用 Hybrid recipe |
+| fast-SIMT | 再加 `--simt-math=fast` | 需要做目标测试 |
+| 950PR row-wise SIMD+SIMT Hybrid | 再加 `--target-recipe=dav-3510-rowwise-simd-v1` | 只处理通过内置检查的 Softmax、RMSNorm 和 LayerNorm 源码 |
 
-Hybrid 模式必须同时选择：
+Hybrid 模式需要下面三个选项：
 
 ```bash
 --target-policy=dav-c310-vec
@@ -374,48 +393,48 @@ Hybrid 模式必须同时选择：
 --target-recipe=dav-3510-rowwise-simd-v1
 ```
 
-否则 Ascify 会拒绝该组合。Hybrid 生成物还需要单独构建并链接版本化 target support；完整流程见 [SIMD+SIMT 转换指南](rowwise-simd-conversion.md)。
+如果缺少任何一项，Ascify 会拒绝这个设置。Hybrid 输出还需要单独的目标支持库。构建方法请看 [SIMD+SIMT 转换手册](rowwise-simd-conversion.md)。
 
-`--frontend-compat=ascify-admitted-v1` 是窄范围、版本化的 parser compatibility profile，不是通用的 CUDA 头文件兼容开关。普通输入应先保留默认的 `--frontend-compat=none`。
+`--frontend-compat=ascify-admitted-v1` 只支持一小组已定义的前端兼容规则。它不是通用 CUDA 兼容开关。普通输入请先使用默认值 `--frontend-compat=none`。
 
-## 9. 常用选项速查
+## 9. 常用选项
 
 | 选项 | 用途 |
 |---|---|
 | `-o <file>` | 输出一个文件 |
-| `-o-dir <dir>` | 将多个输入输出到目录 |
-| `-inplace` | 原地改写；默认保留备份 |
-| `-no-backup` | 与原地改写配合，禁止备份 |
-| `-examine` | 只检查并打印统计，不写转换输出 |
+| `-o-dir <dir>` | 把多个输入写到一个目录 |
+| `-inplace` | 改写原文件；默认会备份 |
+| `-no-backup` | 不创建备份 |
+| `-examine` | 只检查并打印统计，不写转换结果 |
 | `-print-stats` | 打印转换统计 |
-| `-print-stats-csv` | 输出 CSV 统计 |
+| `-print-stats-csv` | 写出 CSV 统计 |
 | `-o-stats <file>` | 指定统计文件 |
-| `-cuda-gpu-arch=sm_XX` | 指定 CUDA 解析架构 |
-| `--local-headers` | 转换直接引用的合格本地头 |
-| `--local-headers-recursive` | 递归转换合格本地头闭包 |
-| `--migration-receipt=<file>` | 生成确定性的 JSON 源码转换回执 |
+| `-cuda-gpu-arch=sm_XX` | 指定 CUDA 架构 |
+| `--local-headers` | 转换直接引用的本地头文件 |
+| `--local-headers-recursive` | 转换所有相连的本地头文件 |
+| `--migration-receipt=<file>` | 写出 JSON 源码转换回执 |
 | `--target-policy=portable\|dav-c310-vec` | 选择目标策略 |
-| `--simt-math=precise\|fast` | 选择 SIMT 浮点改写模式 |
-| `--target-recipe=none\|dav-3510-rowwise-simd-v1` | 选择是否启用显式 Hybrid recipe |
-| `--frontend-compat=none\|ascify-admitted-v1` | 选择前端兼容 profile |
+| `--simt-math=precise\|fast` | 选择 SIMT 浮点模式 |
+| `--target-recipe=none\|dav-3510-rowwise-simd-v1` | 选择 Hybrid recipe |
+| `--frontend-compat=none\|ascify-admitted-v1` | 选择前端兼容设置 |
 
-查看当前二进制的完整选项：
+查看所有选项：
 
 ```bash
 "$ASCIFY_BINARY" --help
 ```
 
-## 10. 运行项目检查
+## 10. 运行测试
 
-### 10.1 不依赖真实二进制的 host gate
+### 10.1 运行 host 测试
 
 ```bash
 sh tests/run_release_checks.sh
 ```
 
-该检查验证源码改写合同和 host Python 测试，适合在修改源码或文档后运行。
+这组测试不需要真实的 Ascify 程序。它会检查转换规则和 Python 测试。
 
-### 10.2 带真实转换器的 gate
+### 10.2 使用真实程序运行测试
 
 ```bash
 ASCIFY_BINARY="$PWD/build/ascify-clang" \
@@ -424,95 +443,91 @@ ASCIFY_CLANG_RESOURCE_DIRECTORY="$PWD/ascify_install/include/ascify" \
 sh tests/run_release_checks.sh
 ```
 
-这会增加真实 CUDA fixture 转换检查，耗时也更长。
+这组测试还会转换真实 CUDA fixture，所以需要更多时间。
 
-## 11. 目标编译和设备运行
+## 11. 编译和运行生成的代码
 
-Ascify 不为任意 CUDA 项目自动生成完整的 CANN 工程。源码转换之后，通常还需要：
+Ascify 不会为每个 CUDA 项目自动创建完整的 CANN 工程。源码转换后，你还要完成这些工作：
 
-1. 在目标机器安装并初始化匹配的 CANN Toolkit；
-2. 将 `ascify_install/include` 加入目标编译 include 路径；
-3. 按原工程结构补齐 host/runtime 依赖与 CANN 链接参数；
-4. 使用目标芯片对应的编译选项构建；
-5. 在隔离设备上做数值正确性、错误路径、稳定性和性能验证。
+1. 在目标机器安装并初始化 CANN Toolkit。
+2. 把 `ascify_install/include` 加到 include 路径。
+3. 加入原项目需要的 host、runtime 和 CANN 库。
+4. 使用目标芯片的编译选项构建程序。
+5. 在昇腾设备上检查数值、错误处理、稳定性和性能。
 
-如果使用 `dav-3510-rowwise-simd-v1`，还必须构建 `runtime/dav_3510/rowwise/` 下的四个版本化共享库，并确保链接名和 SONAME 文件均可用。参见 [SIMD+SIMT 转换指南](rowwise-simd-conversion.md)。
+如果你使用 `dav-3510-rowwise-simd-v1`，还要构建 `runtime/dav_3510/rowwise/` 中的四个共享库。链接名文件和 SONAME 文件都要保留。详细步骤请看 [SIMD+SIMT 转换手册](rowwise-simd-conversion.md)。
 
-不要把以下任一项单独当作设备运行成功：
+下面这些结果都不能单独证明设备运行成功：
 
-- Ascify 返回 0；
-- JSON 回执为 `succeeded`；
-- 生成文件非空；
-- 目标编译或链接单独通过；
-- 程序只运行一次但没有独立数值检查。
+- Ascify 返回 0。
+- JSON 回执显示 `succeeded`。
+- 生成文件不是空文件。
+- 编译或链接通过。
+- 程序只运行一次，而且没有单独的数值检查。
 
-## 12. 常见问题排查
+## 12. 常见问题
 
-### `LLVM_PROJECT_PATH` 未设置
+### `LLVM_PROJECT_PATH` 没有设置
 
-现象：`build.sh` 立即退出并提示设置变量。
-
-处理：
+`build.sh` 会立即退出。请运行：
 
 ```bash
 export LLVM_PROJECT_PATH=/absolute/path/to/llvm-project
 export LLVM_BUILD_DIR="$LLVM_PROJECT_PATH/build"
 ```
 
-### `missing build dependency: .../bin/clang`
+### 提示 `missing build dependency: .../bin/clang`
 
-`LLVM_BUILD_DIR` 指错了目录，或 LLVM/Clang 尚未编译。确认 `bin/clang` 和 `bin/clang++` 都存在且可执行。
+`LLVM_BUILD_DIR` 路径不对，或 LLVM 还没有编译完成。请检查 `bin/clang` 和 `bin/clang++`。
 
 ### CMake 找不到 LLVM 或 Clang
 
-现象通常包含 `LLVMConfig.cmake` 或 `ClangConfig.cmake` not found。
-
-检查：
+错误信息通常会提到 `LLVMConfig.cmake` 或 `ClangConfig.cmake`。运行：
 
 ```bash
 find "$LLVM_BUILD_DIR" -path '*/cmake/llvm/LLVMConfig.cmake' -print
 find "$LLVM_BUILD_DIR" -path '*/cmake/clang/ClangConfig.cmake' -print
 ```
 
-只有 Clang 可执行文件而没有开发库/CMake metadata 时无法构建 Ascify。
+如果这两个文件不存在，请安装开发包，或使用完整的 LLVM 构建目录。
 
-### CMake 编译器测试失败
+### CMake 的编译器检查失败
 
-确认 LLVM 包含当前主机后端，并且默认 target triple 有效：
+检查 LLVM 是否支持当前主机：
 
 ```bash
 "$LLVM_BUILD_DIR/bin/clang" --version
 "$LLVM_BUILD_DIR/bin/llvm-config" --host-target
 ```
 
-也可以通过 `ASCIFY_CC` 和 `ASCIFY_CXX` 改用能够编译本机程序的系统编译器。
+你也可以设置 `ASCIFY_CC` 和 `ASCIFY_CXX`，然后使用系统编译器。
 
 ### 找不到 Ninja
 
-安装 `ninja-build`，或指定已有生成器：
+请安装 `ninja-build`。你也可以使用 Makefiles：
 
 ```bash
 export CMAKE_GENERATOR="Unix Makefiles"
 ./build.sh
 ```
 
-### `LLVM/resource config failed`
+### 提示 `LLVM/resource config failed`
 
-`CLANG_RESOURCE_DIRECTORY` 必须是 `include/` 的父目录，且其中应有 `include/__clang_cuda_runtime_wrapper.h`：
+`CLANG_RESOURCE_DIRECTORY` 要指向 `include/` 的上一级目录。检查下面的文件：
 
 ```bash
 test -f "$CLANG_RESOURCE_DIRECTORY/include/__clang_cuda_runtime_wrapper.h"
 ```
 
-使用默认安装路径时，它应为：
+默认安装路径是：
 
 ```bash
 export CLANG_RESOURCE_DIRECTORY="$PWD/ascify_install/include/ascify"
 ```
 
-### CUDA 路径为空或 CUDA headers/libdevice 找不到
+### 找不到 CUDA 头文件或 `libdevice`
 
-确认 `CUDA_PATH` 是 Toolkit 根目录：
+检查 `CUDA_PATH`：
 
 ```bash
 test -f "$CUDA_PATH/include/cuda.h"
@@ -520,28 +535,32 @@ test -f "$CUDA_PATH/include/cuda_runtime.h"
 test -d "$CUDA_PATH/nvvm"
 ```
 
-如机器安装了多个 CUDA 版本，请显式选择一个完整目录，不要依赖模糊的系统软链接。
+如果机器上有多个 CUDA 版本，请直接设置一个完整路径。
 
-### 自有源码找不到项目头文件
+### 找不到项目头文件
 
-将原构建命令中的 include、宏和语言标准放在 `--` 后传给 Clang：
+把项目的 include 路径、宏和语言标准放在 `--` 后面：
 
 ```bash
 ./run.sh input.cu -o output.cu.dpp -- \
   -std=c++17 -I/path/to/include -DMY_MACRO=1
 ```
 
-### 生成文件不存在
+### 没有生成输出文件
 
-先检查 Ascify 的退出码和标准错误。语法错误、缺失头文件、非法输出路径、回执路径与输入/输出别名冲突，都会让转换失败或拒绝发布输出。不要只检查目录中是否残留旧文件。
+先看 Ascify 的退出码和错误输出。常见原因有语法错误、缺少头文件、输出路径无效，或回执路径与输入/输出路径相同。
+
+也要确认目录中没有旧文件。旧文件可能让你误以为本次转换成功。
 
 ### Hybrid recipe 被拒绝
 
-确认 `dav-c310-vec`、`fast` 和 `dav-3510-rowwise-simd-v1` 三项同时出现。即使组合正确，源码未通过窄 AST proof 时也不会获得 Hybrid dispatch；这属于支持边界，不应通过修改生成文件绕过。
+检查下面三个值：`dav-c310-vec`、`fast` 和 `dav-3510-rowwise-simd-v1`。三个值都要设置。
 
-## 13. 记录可复现信息
+设置正确后，源码仍要通过 Ascify 的结构检查。不支持的源码会留在 SIMT 路径。不要手动改生成文件来跳过检查。
 
-报告转换问题时，建议同时保存：
+## 13. 保存问题信息
+
+报告问题时，请运行并保存这些命令的输出：
 
 ```bash
 git rev-parse HEAD
@@ -553,4 +572,4 @@ readlink -f "$CUDA_PATH"
 "$ASCIFY_BINARY" --help > ascify-help.txt
 ```
 
-同时保留原始命令、标准输出、标准错误、输入文件哈希、生成文件哈希和 `--migration-receipt` 结果。这样才能区分源码解析失败、转换失败、目标编译失败和设备运行失败。
+也请保存原命令、标准输出、错误输出、输入文件哈希、输出文件哈希和 JSON 回执。这些信息可以帮助你找到失败的步骤。
