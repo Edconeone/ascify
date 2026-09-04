@@ -2,18 +2,6 @@
 
 English | [简体中文](user-guide.zh-CN.md)
 
-This guide is for developers who are new to Ascify. You need basic Linux command-line skills.
-
-After you finish this guide, you can:
-
-1. Download Ascify from GitHub.
-2. Build and install `ascify-clang`.
-3. Convert the CUDA example in the repository.
-4. Check that the conversion worked.
-5. Start to convert your own CUDA source files.
-
-This guide covers Linux on x86_64 and AArch64. It does not cover Windows SDK setup, Ascify development, or operator performance tuning.
-
 ## 1. What Ascify does
 
 Ascify is a source converter for CUDA C/C++. It uses Clang to read CUDA source files. It then changes the source to use the ACL, DPP, and Ascend compatibility layers.

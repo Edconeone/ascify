@@ -2,18 +2,6 @@
 
 [English](user-guide.en.md) | 简体中文
 
-这份手册写给第一次使用 Ascify 的开发者。你需要会使用 Linux 命令行。
-
-读完后，你可以完成这些工作：
-
-1. 从 GitHub 下载 Ascify。
-2. 编译并安装 `ascify-clang`。
-3. 转换仓库中的 CUDA 示例。
-4. 检查转换是否成功。
-5. 开始转换自己的 CUDA 源码。
-
-这份手册主要说明 Linux x86_64 和 AArch64 环境。它不说明 Windows SDK 集成、Ascify 内部开发或算子性能调优。
-
 ## 1. Ascify 是什么
 
 Ascify 是一个 CUDA C/C++ 源码转换工具。它使用 Clang 读取 CUDA 源码，再把源码改成面向 ACL、DPP 和 Ascend 兼容层的代码。
