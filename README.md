@@ -1,5 +1,7 @@
 # ascify-clang (ASCIFY)
 
+> 第一次使用？请从[中文使用手册](docs/user-guide.zh-CN.md)开始。手册覆盖 Linux 新机器上的依赖准备、GitHub 克隆、编译安装、首次 CUDA 源码转换、结果检查和常见故障排查。
+
 **ascify-clang** is a Clang-based source translator that takes CUDA C/C++ and rewrites it toward **DPP**-oriented APIs and headers (for example `acl/acl.h` and runtime entry points such as `aclrtMalloc`). It is built as a standalone tool (`ascify-clang`) on top of the same LLVM/Clang your project links against.
 
 The upstream Clang driver is still used for parsing and CUDA sema; ascify-specific options control the rewrite, statistics, and auxiliary outputs (Perl/Python maps, Markdown/CSV docs).

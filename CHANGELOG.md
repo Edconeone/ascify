@@ -4,6 +4,9 @@
 
 ### Added
 
+- A Chinese end-to-end user guide covering Linux prerequisites, clean GitHub
+  clone, LLVM-backed build and install, first CUDA source conversion, result
+  verification, mode selection, and troubleshooting.
 - Opt-in `--migration-receipt=<path>` output with deterministic JSON,
   per-input source-conversion stages, explicit contract selections, and
   fail-closed atomic publication.
